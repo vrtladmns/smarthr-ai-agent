@@ -449,6 +449,13 @@ docker compose up -d --build recruiter-agent
 docker compose run --rm recruiter-agent python recruiter_agent.py --list-graph-subscriptions
 ```
 
+If the container is stuck in `Restarting`, inspect the crash and rebuild after fixing dependencies:
+
+```bash
+docker compose logs --tail=100 recruiter-agent
+docker compose up -d --build recruiter-agent
+```
+
 After every new deployment, check:
 
 ```bash
