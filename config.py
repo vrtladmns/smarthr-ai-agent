@@ -1,0 +1,91 @@
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "qwen2.5:7b")
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "db")
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "3"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "160"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "2048"))
+
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "deepseek")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+DEEPSEEK_MAX_TOKENS = int(os.getenv("DEEPSEEK_MAX_TOKENS", str(OLLAMA_NUM_PREDICT)))
+
+VOICE_SAMPLE_RATE = int(os.getenv("VOICE_SAMPLE_RATE", "16000"))
+VOICE_FRAME_MS = int(os.getenv("VOICE_FRAME_MS", "30"))
+VOICE_VAD_MODE = int(os.getenv("VOICE_VAD_MODE", "2"))
+VOICE_SILENCE_SECONDS = float(os.getenv("VOICE_SILENCE_SECONDS", "0.55"))
+VOICE_MAX_UTTERANCE_SECONDS = float(os.getenv("VOICE_MAX_UTTERANCE_SECONDS", "20"))
+VOICE_MIN_SPEECH_SECONDS = float(os.getenv("VOICE_MIN_SPEECH_SECONDS", "0.25"))
+VOICE_SHOW_TIMINGS = os.getenv("VOICE_SHOW_TIMINGS", "true").lower() == "true"
+
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny.en")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+
+TTS_VOICE = os.getenv("TTS_VOICE", "en-US-JennyNeural")
+
+
+DB_PROVIDER = os.getenv("DB_PROVIDER", "postgres").lower()
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+MSSQL_CONNECTION_STRING = os.getenv("MSSQL_CONNECTION_STRING", os.getenv("DefaultConnection", ""))
+MSSQL_ODBC_DRIVER = os.getenv("MSSQL_ODBC_DRIVER", "")
+
+MAIL_PROVIDER = os.getenv("MAIL_PROVIDER", "gmail_imap")
+
+MICROSOFT_GRAPH_BASE_URL = os.getenv("MICROSOFT_GRAPH_BASE_URL", "https://graph.microsoft.com/v1.0")
+MICROSOFT_TENANT_ID = os.getenv("MICROSOFT_TENANT_ID", "")
+MICROSOFT_CLIENT_ID = os.getenv("MICROSOFT_CLIENT_ID", "")
+MICROSOFT_CLIENT_SECRET = os.getenv("MICROSOFT_CLIENT_SECRET", "")
+MICROSOFT_MAILBOX = os.getenv("MICROSOFT_MAILBOX", os.getenv("RECRUITER_EMAIL", ""))
+
+RECRUITER_IMAP_HOST = os.getenv("RECRUITER_IMAP_HOST", "")
+RECRUITER_IMAP_PORT = int(os.getenv("RECRUITER_IMAP_PORT", "993"))
+RECRUITER_EMAIL = os.getenv("RECRUITER_EMAIL", "")
+RECRUITER_EMAIL_PASSWORD = os.getenv("RECRUITER_EMAIL_PASSWORD", "")
+RECRUITER_MAILBOX = os.getenv("RECRUITER_MAILBOX", "INBOX")
+
+RECRUITER_SMTP_HOST = os.getenv("RECRUITER_SMTP_HOST", "")
+RECRUITER_SMTP_PORT = int(os.getenv("RECRUITER_SMTP_PORT", "587"))
+RECRUITER_FROM_EMAIL = os.getenv("RECRUITER_FROM_EMAIL", RECRUITER_EMAIL)
+RECRUITER_APPEND_SIGNATURE = os.getenv("RECRUITER_APPEND_SIGNATURE", "true").lower() == "true"
+RECRUITER_SIGNATURE_SIGNOFF = os.getenv("RECRUITER_SIGNATURE_SIGNOFF", "Regards,")
+RECRUITER_SIGNATURE_NAME = os.getenv("RECRUITER_SIGNATURE_NAME", "HR Team")
+RECRUITER_SIGNATURE_COMPANY = os.getenv("RECRUITER_SIGNATURE_COMPANY", "Virtual Admins")
+RECRUITER_SIGNATURE_COMPANY_URL = os.getenv("RECRUITER_SIGNATURE_COMPANY_URL", "https://virtualadmins.org")
+RECRUITER_SIGNATURE_EMAIL = os.getenv("RECRUITER_SIGNATURE_EMAIL", RECRUITER_FROM_EMAIL or RECRUITER_EMAIL)
+RECRUITER_SIGNATURE_LOGO_URL = os.getenv(
+    "RECRUITER_SIGNATURE_LOGO_URL",
+    "https://virtualadmins.org/assets/images/logos/vaadmin-logo.png",
+)
+
+RECRUITER_POLL_LIMIT = int(os.getenv("RECRUITER_POLL_LIMIT", "10"))
+RECRUITER_POLL_SECONDS = int(os.getenv("RECRUITER_POLL_SECONDS", "60"))
+RECRUITER_REPLY_ENABLED = os.getenv("RECRUITER_REPLY_ENABLED", "true").lower() == "true"
+CV_UPLOAD_API_URL_TEMPLATE = os.getenv(
+    "CV_UPLOAD_API_URL_TEMPLATE",
+    "http://smarthrai-apis.runasp.net/api/AiData/applications/{application_id}/cv",
+)
+CV_UPLOAD_TIMEOUT_SECONDS = int(os.getenv("CV_UPLOAD_TIMEOUT_SECONDS", "30"))
+
+GMAIL_PUBSUB_TOPIC = os.getenv("GMAIL_PUBSUB_TOPIC", "")
+GMAIL_CREDENTIALS_FILE = os.getenv("GMAIL_CREDENTIALS_FILE", "credentials/gmail_oauth_client.json")
+GMAIL_TOKEN_FILE = os.getenv("GMAIL_TOKEN_FILE", "credentials/gmail_token.json")
+GMAIL_WEBHOOK_HOST = os.getenv("GMAIL_WEBHOOK_HOST", "0.0.0.0")
+GMAIL_WEBHOOK_PORT = int(os.getenv("GMAIL_WEBHOOK_PORT", "8080"))
+GMAIL_WEBHOOK_PATH = os.getenv("GMAIL_WEBHOOK_PATH", "/gmail/push")
+
+GRAPH_WEBHOOK_HOST = os.getenv("GRAPH_WEBHOOK_HOST", "0.0.0.0")
+GRAPH_WEBHOOK_PORT = int(os.getenv("GRAPH_WEBHOOK_PORT", "8081"))
+GRAPH_WEBHOOK_PATH = os.getenv("GRAPH_WEBHOOK_PATH", "/graph/outlook")
+GRAPH_NOTIFICATION_URL = os.getenv("GRAPH_NOTIFICATION_URL", "")
+GRAPH_CLIENT_STATE = os.getenv("GRAPH_CLIENT_STATE", "")
+GRAPH_SUBSCRIPTION_HOURS = int(os.getenv("GRAPH_SUBSCRIPTION_HOURS", "48"))
+NGROK_API_URL = os.getenv("NGROK_API_URL", "http://127.0.0.1:4040/api/tunnels")

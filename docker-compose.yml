@@ -1,0 +1,84 @@
+services:
+  recruiter-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: company-policy-recruiter-agent
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./credentials:/app/credentials:ro
+    command: ["python", "recruiter_agent.py", "--serve-graph-webhook"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+# Disabled for AWS recruiter-agent-only deployment.
+# The agent should use the external DB configured in .env, for example:
+# DB_PROVIDER=mssql with MSSQL_CONNECTION_STRING, or an external PostgreSQL DATABASE_URL.
+#
+#  recruiter-postgres:
+#    image: postgres:16-alpine
+#    container_name: company-policy-recruiter-postgres
+#    restart: unless-stopped
+#    environment:
+#      POSTGRES_DB: recruitment
+#      POSTGRES_USER: recruiter
+#      POSTGRES_PASSWORD: recruiter_password
+#    ports:
+#      - "5432:5432"
+#    volumes:
+#      - recruiter_postgres_data:/var/lib/postgresql/data
+#    healthcheck:
+#      test: ["CMD-SHELL", "pg_isready -U recruiter -d recruitment"]
+#      interval: 5s
+#      timeout: 5s
+#      retries: 10
+#
+#  recruiter-dashboard:
+#    build:
+#      context: .
+#      dockerfile: Dockerfile
+#    container_name: company-policy-recruiter-dashboard
+#    restart: unless-stopped
+#    env_file:
+#      - .env
+#    ports:
+#      - "8090:8090"
+#    command: ["python", "recruiter_dashboard.py", "--host", "0.0.0.0", "--port", "8090"]
+#
+#  recruiter-graph-webhook:
+#    build:
+#      context: .
+#      dockerfile: Dockerfile
+#    container_name: company-policy-recruiter-graph-webhook
+#    restart: unless-stopped
+#    env_file:
+#      - .env
+#    ports:
+#      - "8081:8081"
+#    command: ["python", "recruiter_agent.py", "--serve-graph-webhook"]
+#
+#  ngrok:
+#    image: ngrok/ngrok:latest
+#    container_name: company-policy-recruiter-ngrok
+#    restart: unless-stopped
+#    env_file:
+#      - .env
+#    environment:
+#      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+#    depends_on:
+#      - recruiter-agent
+#    ports:
+#      - "4040:4040"
+#    command: ["http", "recruiter-agent:8081", "--log=stdout"]
+#
+#volumes:
+#  recruiter_postgres_data:

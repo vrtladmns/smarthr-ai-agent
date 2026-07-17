@@ -1,0 +1,24 @@
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+*.pyo
+
+venv/
+.venv/
+db/
+chroma/
+
+credentials/
+documents/
+
+*.log
+*.sqlite
+*.sqlite3
+
+recruiter_agent copy*.py
+recruiter_agent*.bak
+
+.DS_Store

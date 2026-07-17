@@ -1,0 +1,15 @@
+[Unit]
+Description=AI Recruiter Inbox Agent
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/akshay/Projects/AI/company-policy-agent
+EnvironmentFile=/home/akshay/Projects/AI/company-policy-agent/.env
+ExecStart=/home/akshay/Projects/AI/company-policy-agent/venv/bin/python recruiter_agent.py --serve-gmail-webhook
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
