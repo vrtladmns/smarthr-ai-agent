@@ -1,5 +1,3 @@
-from langchain_ollama import ChatOllama
-
 from config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
@@ -35,6 +33,8 @@ def make_chat_model(json_mode: bool = False, max_tokens: int | None = None):
         )
 
     if provider == "ollama":
+        from langchain_ollama import ChatOllama
+
         kwargs = {
             "model": OLLAMA_CHAT_MODEL,
             "temperature": 0,
