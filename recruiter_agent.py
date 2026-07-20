@@ -81,6 +81,10 @@ from llm_factory import make_chat_model
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
 
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
 CV_EXTENSIONS = {".pdf", ".doc", ".docx", ".txt"}
 
 
@@ -2526,7 +2530,7 @@ class GmailPushWebhookServer:
 
     def serve_forever(self):
         self.agent.init_schema()
-        httpd = ThreadingHTTPServer(
+        httpd = ReusableThreadingHTTPServer(
             (GMAIL_WEBHOOK_HOST, GMAIL_WEBHOOK_PORT),
             self.make_handler(),
         )
@@ -2694,7 +2698,7 @@ class GraphWebhookServer:
         return GraphWebhookHandler
 
     def serve_forever(self):
-        httpd = ThreadingHTTPServer(
+        httpd = ReusableThreadingHTTPServer(
             (GRAPH_WEBHOOK_HOST, GRAPH_WEBHOOK_PORT),
             self.make_handler(),
         )
