@@ -53,6 +53,7 @@ from config import (
     MICROSOFT_MAILBOX,
     MICROSOFT_TENANT_ID,
     MSSQL_CONNECTION_STRING,
+    MSSQL_LOGIN_TIMEOUT_SECONDS,
     MSSQL_ODBC_DRIVER,
     NGROK_API_URL,
     OLLAMA_NUM_PREDICT,
@@ -884,7 +885,10 @@ class RecruiterDatabase:
             self.pyodbc = pyodbc
             self.psycopg = None
             try:
-                self.conn = pyodbc.connect(self.mssql_connection_string(MSSQL_CONNECTION_STRING))
+                self.conn = pyodbc.connect(
+                    self.mssql_connection_string(MSSQL_CONNECTION_STRING),
+                    timeout=MSSQL_LOGIN_TIMEOUT_SECONDS,
+                )
             except Exception as exc:
                 error_text = str(exc)
                 if "Can't open lib" in error_text or "Data source name not found" in error_text:
@@ -916,6 +920,10 @@ class RecruiterDatabase:
         if "driver=" not in connection_string.lower():
             driver = MSSQL_ODBC_DRIVER.strip() or self.detect_mssql_driver()
             connection_string = f"DRIVER={{{driver}}};{connection_string}"
+        if "connection timeout=" not in connection_string.lower() and "timeout=" not in connection_string.lower():
+            connection_string += f"Connection Timeout={MSSQL_LOGIN_TIMEOUT_SECONDS};"
+        if "login timeout=" not in connection_string.lower():
+            connection_string += f"Login Timeout={MSSQL_LOGIN_TIMEOUT_SECONDS};"
         return connection_string
 
     def normalize_mssql_connection_string(self, value: str) -> str:

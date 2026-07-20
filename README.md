@@ -328,6 +328,7 @@ LANGCHAIN_API_KEY=your-langsmith-api-key
 
 DB_PROVIDER=mssql
 MSSQL_CONNECTION_STRING=Server=your-sql-server; Database=your-db; User Id=your-user; Password=your-password; Encrypt=True; TrustServerCertificate=True; MultipleActiveResultSets=True;
+MSSQL_LOGIN_TIMEOUT_SECONDS=60
 
 MAIL_PROVIDER=microsoft_graph
 MICROSOFT_TENANT_ID=your-azure-tenant-id
@@ -535,6 +536,7 @@ LANGCHAIN_API_KEY=your-langsmith-api-key
 
 DB_PROVIDER=mssql
 MSSQL_CONNECTION_STRING=Server=your-sql-server; Database=your-db; User Id=your-user; Password=your-password; Encrypt=True; TrustServerCertificate=True; MultipleActiveResultSets=True;
+MSSQL_LOGIN_TIMEOUT_SECONDS=60
 
 MAIL_PROVIDER=microsoft_graph
 MICROSOFT_TENANT_ID=your-azure-tenant-id
