@@ -1619,7 +1619,7 @@ class MicrosoftGraphProvider:
             thread_messages=thread_messages,
         )
 
-    def fetch_message_by_id(self, message_id: str) -> InboxEmail | None:
+    def fetch_message_by_id(self, message_id: str, resource_path: str | None = None) -> InboxEmail | None:
         if not message_id:
             return None
         try:
@@ -1636,8 +1636,33 @@ class MicrosoftGraphProvider:
             )
         except RuntimeError as exc:
             print(f"Could not fetch Microsoft Graph message {message_id}: {exc}")
-            return None
+            if not resource_path:
+                return None
+            message = self.fetch_message_by_resource(resource_path)
+            if not message:
+                return None
         return self.message_to_inbox_email(message)
+
+    def fetch_message_by_resource(self, resource_path: str) -> dict[str, Any] | None:
+        resource_path = (resource_path or "").strip().lstrip("/")
+        if not resource_path.lower().startswith("users/"):
+            print(f"Skipping unsupported Microsoft Graph notification resource: {resource_path}")
+            return None
+        try:
+            return self.request(
+                "GET",
+                f"/{resource_path}",
+                params={
+                    "$select": (
+                        "id,internetMessageId,conversationId,subject,body,bodyPreview,from,"
+                        "receivedDateTime,hasAttachments,internetMessageHeaders,isRead"
+                    ),
+                },
+                headers={"Prefer": 'outlook.body-content-type="text"'},
+            )
+        except RuntimeError as exc:
+            print(f"Could not fetch Microsoft Graph message from resource {resource_path}: {exc}")
+            return None
 
     def fetch_unseen(self, limit: int) -> list[InboxEmail]:
         params = {
@@ -2441,13 +2466,13 @@ class AIRecruiterAgent:
                 except Exception as log_exc:
                     print(f"Could not log processing failure: {log_exc}")
 
-    def process_one_graph_message(self, message_id: str):
+    def process_one_graph_message(self, message_id: str, resource_path: str | None = None):
         self.init_schema()
         if not isinstance(self.inbox, MicrosoftGraphProvider):
             print("Single-message Graph processing is only available with MAIL_PROVIDER=microsoft_graph.")
             return
 
-        inbox_email = self.inbox.fetch_message_by_id(message_id)
+        inbox_email = self.inbox.fetch_message_by_id(message_id, resource_path=resource_path)
         if not inbox_email:
             print(f"Microsoft Graph message not found or unavailable: {message_id}")
             return
@@ -2588,7 +2613,7 @@ class GraphWebhookServer:
         return None
 
     def process_notifications(self, notifications: list[dict[str, Any]]):
-        message_ids = []
+        message_refs = []
         for notification in notifications:
             client_state = notification.get("clientState")
             if GRAPH_CLIENT_STATE and client_state != GRAPH_CLIENT_STATE:
@@ -2615,19 +2640,19 @@ class GraphWebhookServer:
             if not message_id:
                 print(f"Microsoft Graph notification did not include a message id: {notification}")
                 continue
-            message_ids.append(message_id)
+            message_refs.append((message_id, notification.get("resource") or ""))
 
-        if not message_ids:
+        if not message_refs:
             return
 
         with self.lock:
-            unique_message_ids = list(dict.fromkeys(message_ids))
-            print(f"Microsoft Graph trigger received for {len(unique_message_ids)} message(s)")
+            unique_message_refs = list(dict.fromkeys(message_refs))
+            print(f"Microsoft Graph trigger received for {len(unique_message_refs)} message(s)")
             agent = None
             try:
                 agent = AIRecruiterAgent()
-                for message_id in unique_message_ids:
-                    agent.process_one_graph_message(message_id)
+                for message_id, resource_path in unique_message_refs:
+                    agent.process_one_graph_message(message_id, resource_path=resource_path)
             except Exception as exc:
                 print(f"Microsoft Graph notification processing failed: {exc}")
             finally:
