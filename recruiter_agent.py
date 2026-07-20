@@ -2543,7 +2543,6 @@ class GmailPushWebhookServer:
 
 class GraphWebhookServer:
     def __init__(self):
-        self.agent = AIRecruiterAgent()
         self.lock = Lock()
 
     def notification_is_for_configured_mailbox(self, notification: dict[str, Any]) -> bool:
@@ -2612,8 +2611,16 @@ class GraphWebhookServer:
         with self.lock:
             unique_message_ids = list(dict.fromkeys(message_ids))
             print(f"Microsoft Graph trigger received for {len(unique_message_ids)} message(s)")
-            for message_id in unique_message_ids:
-                self.agent.process_one_graph_message(message_id)
+            agent = None
+            try:
+                agent = AIRecruiterAgent()
+                for message_id in unique_message_ids:
+                    agent.process_one_graph_message(message_id)
+            except Exception as exc:
+                print(f"Microsoft Graph notification processing failed: {exc}")
+            finally:
+                if agent:
+                    agent.close()
 
     def make_handler(self):
         server = self
@@ -2687,7 +2694,6 @@ class GraphWebhookServer:
         return GraphWebhookHandler
 
     def serve_forever(self):
-        self.agent.init_schema()
         httpd = ThreadingHTTPServer(
             (GRAPH_WEBHOOK_HOST, GRAPH_WEBHOOK_PORT),
             self.make_handler(),
@@ -2697,10 +2703,7 @@ class GraphWebhookServer:
             f"http://{GRAPH_WEBHOOK_HOST}:{GRAPH_WEBHOOK_PORT}{GRAPH_WEBHOOK_PATH}"
         )
         print("Register the subscription with --register-graph-subscription after exposing this URL over HTTPS.")
-        try:
-            httpd.serve_forever()
-        finally:
-            self.agent.close()
+        httpd.serve_forever()
 
 
 def build_gmail_service():
@@ -2909,6 +2912,14 @@ def main():
         delete_graph_subscription(args.delete_graph_subscription)
         return
 
+    if args.serve_graph_webhook:
+        GraphWebhookServer().serve_forever()
+        return
+
+    if args.serve_gmail_webhook:
+        GmailPushWebhookServer().serve_forever()
+        return
+
     agent = AIRecruiterAgent()
     try:
         if args.run_once:
@@ -2918,16 +2929,6 @@ def main():
 
         if args.watch:
             agent.run_forever(args.poll_seconds)
-            return
-
-        if args.serve_gmail_webhook:
-            agent.close()
-            GmailPushWebhookServer().serve_forever()
-            return
-
-        if args.serve_graph_webhook:
-            agent.close()
-            GraphWebhookServer().serve_forever()
             return
 
         parser.print_help()

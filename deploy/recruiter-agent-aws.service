@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Recruiter Microsoft Graph Webhook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/company-policy-agent
+EnvironmentFile=/home/ubuntu/company-policy-agent/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/company-policy-agent/venv/bin/python /home/ubuntu/company-policy-agent/recruiter_agent.py --serve-graph-webhook
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

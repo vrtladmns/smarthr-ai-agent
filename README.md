@@ -261,7 +261,223 @@ On AWS, the recruiter container listens on port `8081` for Microsoft Graph webho
 GRAPH_NOTIFICATION_URL=https://your-domain.com/graph/outlook
 ```
 
-## AWS EC2 Deployment
+## AWS EC2 Deployment Without Docker
+
+Use this path when deploying the recruiter agent directly on an Ubuntu EC2 instance with Python, systemd, and Nginx.
+
+AWS prerequisites:
+
+- Ubuntu EC2 instance.
+- Elastic IP attached to the instance.
+- DNS `A` record pointing `hr.virtualadmins.org` to the Elastic IP.
+- Security group inbound rules for `80` and `443`.
+- External SQL Server or PostgreSQL reachable from EC2.
+- Azure app registration with Microsoft Graph application permissions: `Mail.ReadWrite`, `Mail.Send`, and `Subscriptions.ReadWrite.All`.
+
+SSH into the instance:
+
+```bash
+ssh -i your-key.pem ubuntu@YOUR_AWS_PUBLIC_IP
+```
+
+Install system packages:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git python3 python3-venv python3-pip nginx certbot python3-certbot-nginx netcat-openbsd
+```
+
+Clone the repo:
+
+```bash
+cd /home/ubuntu
+git clone your-repo-url company-policy-agent
+cd company-policy-agent
+```
+
+Install Microsoft ODBC Driver 18 for SQL Server:
+
+```bash
+sudo ./scripts/install_mssql_odbc_ubuntu.sh
+```
+
+Create the Python environment:
+
+```bash
+python3 -m venv venv
+./venv/bin/python -m pip install --upgrade pip
+./venv/bin/python -m pip install -r requirements-recruiter.txt
+```
+
+Create `.env` on the server:
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+Minimum `.env` values for Outlook/Microsoft Graph:
+
+```bash
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=your-deepseek-api-key
+
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_PROJECT=AI Recruiter Agent
+LANGCHAIN_API_KEY=your-langsmith-api-key
+
+DB_PROVIDER=mssql
+MSSQL_CONNECTION_STRING=Server=your-sql-server; Database=your-db; User Id=your-user; Password=your-password; Encrypt=True; TrustServerCertificate=True; MultipleActiveResultSets=True;
+
+MAIL_PROVIDER=microsoft_graph
+MICROSOFT_TENANT_ID=your-azure-tenant-id
+MICROSOFT_CLIENT_ID=your-azure-app-client-id
+MICROSOFT_CLIENT_SECRET=your-azure-app-client-secret
+MICROSOFT_MAILBOX=career@virtualadmins.org
+
+GRAPH_WEBHOOK_HOST=0.0.0.0
+GRAPH_WEBHOOK_PORT=8081
+GRAPH_WEBHOOK_PATH=/graph/outlook
+GRAPH_NOTIFICATION_URL=https://hr.virtualadmins.org/graph/outlook
+GRAPH_CLIENT_STATE=use-a-long-random-secret
+GRAPH_SUBSCRIPTION_HOURS=48
+
+CV_UPLOAD_API_URL_TEMPLATE=http://smarthrai-apis.runasp.net/api/AiData/applications/{application_id}/cv
+CV_UPLOAD_TIMEOUT_SECONDS=30
+
+RECRUITER_APPEND_SIGNATURE=true
+RECRUITER_SIGNATURE_SIGNOFF=Regards,
+RECRUITER_SIGNATURE_NAME=HR Team
+RECRUITER_SIGNATURE_COMPANY=Virtual Admins
+RECRUITER_SIGNATURE_COMPANY_URL=https://virtualadmins.org
+RECRUITER_SIGNATURE_EMAIL=career@virtualadmins.org
+RECRUITER_SIGNATURE_LOGO_URL=https://virtualadmins.org/assets/images/logos/vaadmin-logo.png
+```
+
+Test SQL Server reachability from EC2:
+
+```bash
+getent hosts your-sql-server
+nc -vz your-sql-server 1433
+```
+
+If port `1433` times out, allow your AWS Elastic IP in the SQL Server provider firewall/control panel.
+
+Initialize database tables:
+
+```bash
+./venv/bin/python recruiter_agent.py --init-db
+```
+
+Run the webhook once manually:
+
+```bash
+./venv/bin/python recruiter_agent.py --serve-graph-webhook
+```
+
+In another terminal, test local health:
+
+```bash
+curl -i http://127.0.0.1:8081/health
+```
+
+Stop the manual process with `Ctrl+C`, then install the systemd service:
+
+```bash
+sudo cp deploy/recruiter-agent-aws.service /etc/systemd/system/recruiter-agent.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now recruiter-agent
+sudo systemctl status recruiter-agent
+```
+
+Follow logs:
+
+```bash
+journalctl -u recruiter-agent -f
+```
+
+Configure Nginx:
+
+```bash
+sudo nano /etc/nginx/sites-available/recruiter-agent
+```
+
+Paste:
+
+```nginx
+server {
+    listen 80;
+    server_name hr.virtualadmins.org;
+
+    location /graph/outlook {
+        proxy_pass http://127.0.0.1:8081;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /health {
+        proxy_pass http://127.0.0.1:8081/health;
+    }
+}
+```
+
+Enable HTTPS:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/recruiter-agent /etc/nginx/sites-enabled/recruiter-agent
+sudo nginx -t
+sudo systemctl reload nginx
+sudo certbot --nginx -d hr.virtualadmins.org
+```
+
+Verify:
+
+```bash
+curl -i http://127.0.0.1:8081/health
+curl -i https://hr.virtualadmins.org/health
+```
+
+Register Microsoft Graph webhook:
+
+```bash
+./venv/bin/python recruiter_agent.py --reset-graph-subscription
+```
+
+Renew Graph subscription daily:
+
+```bash
+crontab -e
+```
+
+Add:
+
+```cron
+0 2 * * * cd /home/ubuntu/company-policy-agent && ./venv/bin/python recruiter_agent.py --reset-graph-subscription >> graph-subscription-renew.log 2>&1
+```
+
+Deploy future code changes:
+
+```bash
+cd /home/ubuntu/company-policy-agent
+git pull
+./venv/bin/python -m pip install -r requirements-recruiter.txt
+sudo systemctl restart recruiter-agent
+journalctl -u recruiter-agent -f
+```
+
+Useful commands:
+
+```bash
+sudo systemctl status recruiter-agent
+sudo systemctl restart recruiter-agent
+journalctl -u recruiter-agent --tail=100
+curl -i https://hr.virtualadmins.org/health
+./venv/bin/python recruiter_agent.py --list-graph-subscriptions
+```
+
+## AWS EC2 Deployment With Docker
 
 This deployment runs only the recruiter agent container. The included `docker-compose.yml` has one active service: `recruiter-agent`. Dashboard, local PostgreSQL, and ngrok are commented out.
 
