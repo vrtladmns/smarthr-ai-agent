@@ -221,6 +221,12 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         try:
+            if parsed.path != "/" and parsed.path.endswith("/"):
+                target = parsed.path.rstrip("/")
+                if parsed.query:
+                    target = f"{target}?{parsed.query}"
+                self.redirect(target)
+                return
             requirement_id = detail_path(parsed.path, "requirements")
             candidate_id = detail_path(parsed.path, "candidates")
             application_id = detail_path(parsed.path, "applications")
