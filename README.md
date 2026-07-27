@@ -198,7 +198,7 @@ MICROSOFT_CLIENT_SECRET=your-app-client-secret
 MICROSOFT_MAILBOX=hr@example.com
 ```
 
-For Microsoft Graph, create an Azure app registration and grant application permissions for `Mail.ReadWrite` and `Mail.Send`, then give admin consent. Graph mode reads unread Inbox messages, fetches attachments and conversation context, sends threaded replies through Outlook, and marks processed messages as read. IMAP/SMTP values are not required when `MAIL_PROVIDER=microsoft_graph`.
+For Microsoft Graph, create an Azure app registration and grant application permissions for `Mail.ReadWrite`, `Mail.Send`, and `Calendars.ReadWrite`, then give admin consent. Graph mode reads unread Inbox messages, fetches attachments and conversation context, sends threaded replies through Outlook, and marks processed messages as read. IMAP/SMTP values are not required when `MAIL_PROVIDER=microsoft_graph`.
 
 The HR logic is provider-agnostic, so the same recruiter decisions work with Gmail and Outlook. Gmail gets richer thread context through `X-GM-THRID`; Microsoft Graph gets Outlook conversation context through `conversationId`.
 
@@ -272,7 +272,7 @@ AWS prerequisites:
 - DNS `A` record pointing `hr.virtualadmins.org` to the Elastic IP.
 - Security group inbound rules for `80` and `443`.
 - External SQL Server or PostgreSQL reachable from EC2.
-- Azure app registration with Microsoft Graph application permissions: `Mail.ReadWrite`, `Mail.Send`, and `Subscriptions.ReadWrite.All`.
+- Azure app registration with Microsoft Graph application permissions: `Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`, and `Subscriptions.ReadWrite.All`.
 
 SSH into the instance:
 
@@ -496,7 +496,7 @@ AWS prerequisites:
 - Security group inbound rules for `80` and `443`.
 - A domain/subdomain pointing to the EC2 public IP.
 - An external database reachable from EC2, such as your SQL Server or managed PostgreSQL.
-- Azure app registration for Microsoft Graph with admin consent for `Mail.ReadWrite`, `Mail.Send`, and `Subscriptions.ReadWrite.All`.
+- Azure app registration for Microsoft Graph with admin consent for `Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`, and `Subscriptions.ReadWrite.All`.
 
 Install Docker on a fresh Ubuntu EC2 instance:
 
@@ -768,7 +768,7 @@ If you already have a fixed public HTTPS URL, set `GRAPH_NOTIFICATION_URL` and r
 ./venv/bin/python recruiter_agent.py --register-graph-subscription
 ```
 
-Microsoft Graph subscriptions expire, so renew the subscription before the printed `expirationDateTime`. The Azure app registration needs Microsoft Graph application permissions for mail processing, plus permission to create subscriptions, such as `Mail.ReadWrite`, `Mail.Send`, and `Subscriptions.ReadWrite.All`, with admin consent.
+Microsoft Graph subscriptions expire, so renew the subscription before the printed `expirationDateTime`. The Azure app registration needs Microsoft Graph application permissions for mail processing, plus permission to create subscriptions, such as `Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`, and `Subscriptions.ReadWrite.All`, with admin consent.
 
 Docker webhook service:
 
@@ -820,6 +820,124 @@ This adds or updates:
 
 - Python Developer
 - Accountant
+
+### AI interview link
+
+The recruiter agent can now send the candidate a private interview link instead of scheduling a Teams meeting. Set the public base URL for the dashboard/interview server:
+
+```bash
+RECRUITER_INTERVIEW_BASE_URL=https://hr.virtualadmins.org
+```
+
+When a candidate passes screening, the email agent sends:
+
+```text
+https://hr.virtualadmins.org/interview/<token>
+```
+
+The candidate opens the link in a browser, allows microphone access, hears the questions, answers through browser speech recognition, and submits the interview. The dashboard backend generates the HR report and saves it to `recruiter_applications.interview_report`.
+
+Send or resend an interview link manually:
+
+```bash
+./venv/bin/python recruiter_agent.py --send-interview-link APPLICATION_ID
+```
+
+Run the public interview/dashboard server:
+
+```bash
+./venv/bin/python recruiter_dashboard.py --host 0.0.0.0 --port 8090
+```
+
+On AWS/systemd, install the dashboard service so interview links keep working after the terminal is closed:
+
+```bash
+sudo cp deploy/recruiter-dashboard-aws.service /etc/systemd/system/recruiter-dashboard.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now recruiter-dashboard
+sudo systemctl status recruiter-dashboard
+```
+
+Make sure Nginx exposes the dashboard/interview server publicly. For example:
+
+```nginx
+location /interview/ {
+    proxy_pass http://127.0.0.1:8090;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+location /api/interview/ {
+    proxy_pass http://127.0.0.1:8090;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+location /applications/ {
+    proxy_pass http://127.0.0.1:8090;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+The dashboard application detail page shows the interview score, recommendation, summary, plus points, negative points, full report, interview link, Teams link, and scheduled time.
+
+Camera and eye-movement monitoring are not captured by this browser voice mode. The report marks camera monitoring as unavailable.
+
+### Local terminal voice interview
+
+You can still run the local terminal interviewer manually with the application id:
+
+```bash
+./venv/bin/python voice_agent.py --recruiter-interview APPLICATION_ID
+```
+
+### Teams meeting AI interviewer
+
+The scheduled Teams link is stored in `recruiter_applications.teams_join_url`. The current Python `voice_agent.py` runs through the local machine microphone and speaker; it does not join Microsoft Teams as a meeting participant by itself.
+
+To make the AI interviewer join the Teams meeting and interview the candidate inside Teams, create a Microsoft Teams calling/meeting bot using Microsoft Graph Cloud Communications APIs. Microsoft requires this separate bot layer for real-time Teams call audio/video. The bot then forwards candidate audio to the existing interview logic and saves the final report through `RecruiterDatabase.update_interview_report()`.
+
+Verify the stored meeting metadata for an application:
+
+```bash
+./venv/bin/python recruiter_agent.py --teams-interview-info APPLICATION_ID
+```
+
+This prints:
+
+- candidate and role
+- scheduled time in IST
+- Teams event id
+- Teams join URL
+- online meeting id and join meeting id settings, when Graph returns them
+
+Required Azure/Teams setup for the production bot:
+
+- Azure Bot registration for the AI interviewer
+- Teams app manifest with calling/meeting support
+- Microsoft Graph Cloud Communications permissions, such as `Calls.JoinGroupCall.All` or the permission set required by your chosen meeting-join flow
+- media strategy:
+  - service-hosted media for simpler prompt/record flows
+  - application-hosted media for live streaming audio into Whisper and TTS back into the meeting
+- HTTPS callback URL for call notifications, for example `https://hr.virtualadmins.org/teams/calls`
+- consent/recording disclosure flow before recording or transcribing candidate audio
+
+Add the future Teams bot values to `.env` when that bot service is created:
+
+```bash
+TEAMS_AI_INTERVIEWER_ENABLED=true
+TEAMS_AI_BOT_APP_ID=...
+TEAMS_AI_BOT_DISPLAY_NAME="Virtual Admins AI Interviewer"
+TEAMS_AI_BOT_CALLBACK_URL=https://hr.virtualadmins.org/teams/calls
+TEAMS_AI_BOT_PUBLIC_MEDIA_BASE_URL=https://hr.virtualadmins.org/media
+```
 
 If Docker says `permission denied while trying to connect to the Docker daemon socket`, run:
 

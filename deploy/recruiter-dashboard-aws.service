@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Recruiter Dashboard and Browser Interview Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/company-policy-agent
+EnvironmentFile=/home/ubuntu/company-policy-agent/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/company-policy-agent/venv/bin/python /home/ubuntu/company-policy-agent/recruiter_dashboard.py --host 127.0.0.1 --port 8090
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -26,6 +26,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 from uuid import uuid4
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langsmith import traceable
 
@@ -39,6 +40,7 @@ from config import (
     GMAIL_TOKEN_FILE,
     GRAPH_CLIENT_STATE,
     GRAPH_NOTIFICATION_URL,
+    GRAPH_PROCESSING_RETRY_SECONDS,
     GRAPH_SUBSCRIPTION_HOURS,
     GRAPH_WEBHOOK_HOST,
     GRAPH_WEBHOOK_PATH,
@@ -60,13 +62,20 @@ from config import (
     RECRUITER_EMAIL,
     RECRUITER_EMAIL_PASSWORD,
     RECRUITER_FROM_EMAIL,
+    RECRUITER_CAB_FACILITY,
+    RECRUITER_DASHBOARD_BASE_URL,
+    RECRUITER_HR_ESCALATION_EMAIL,
     RECRUITER_IMAP_HOST,
+    RECRUITER_INTERVIEW_BASE_URL,
     RECRUITER_IMAP_PORT,
     RECRUITER_MAILBOX,
+    RECRUITER_OFFICE_LOCATION,
     RECRUITER_APPEND_SIGNATURE,
     RECRUITER_POLL_LIMIT,
     RECRUITER_POLL_SECONDS,
     RECRUITER_REPLY_ENABLED,
+    RECRUITER_SCREENING_ATS_MIN,
+    RECRUITER_SCREENING_JD_MIN,
     RECRUITER_SIGNATURE_COMPANY,
     RECRUITER_SIGNATURE_COMPANY_URL,
     RECRUITER_SIGNATURE_EMAIL,
@@ -75,6 +84,10 @@ from config import (
     RECRUITER_SIGNATURE_SIGNOFF,
     RECRUITER_SMTP_HOST,
     RECRUITER_SMTP_PORT,
+    RECRUITER_TIMEZONE,
+    RECRUITER_WORKING_DAYS,
+    RECRUITER_WORK_MODE,
+    RECRUITER_WORK_SHIFT,
 )
 from llm_factory import make_chat_model
 
@@ -87,6 +100,27 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
 
 
 CV_EXTENSIONS = {".pdf", ".doc", ".docx", ".txt"}
+
+
+def recruiter_tz():
+    try:
+        return ZoneInfo(RECRUITER_TIMEZONE)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("Asia/Kolkata")
+
+
+def recruiter_now() -> datetime:
+    return datetime.now(recruiter_tz())
+
+
+def as_recruiter_time(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=recruiter_tz())
+    return value.astimezone(recruiter_tz())
+
+
+def recruiter_time_text(value: datetime) -> str:
+    return f"{as_recruiter_time(value).strftime('%d %b %Y, %I:%M %p')} IST"
 
 
 CREATE_TABLES_SQL = """
@@ -157,6 +191,23 @@ CREATE TABLE IF NOT EXISTS recruiter_applications (
     attachment_filename TEXT,
     attachment_sha256 TEXT,
     attachment_payload BYTEA,
+    screening_details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    screening_current_salary NUMERIC(12, 2),
+    screening_expected_salary NUMERIC(12, 2),
+    screening_current_location TEXT,
+    screening_joining_days INTEGER,
+    hr_escalation_reason TEXT,
+    hr_escalated_at TIMESTAMPTZ,
+    hr_approved_at TIMESTAMPTZ,
+    interview_availability TEXT,
+    interview_scheduled_at TIMESTAMPTZ,
+    teams_event_id TEXT,
+    teams_join_url TEXT,
+    interview_link_token TEXT,
+    interview_link_created_at TIMESTAMPTZ,
+    interview_started_at TIMESTAMPTZ,
+    interview_completed_at TIMESTAMPTZ,
+    interview_report JSONB NOT NULL DEFAULT '{}'::jsonb,
     received_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -175,6 +226,23 @@ ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS candidate_email TEXT
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS referrer_email TEXT;
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS submission_type TEXT NOT NULL DEFAULT 'self_application';
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS attachment_payload BYTEA;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS screening_details JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS screening_current_salary NUMERIC(12, 2);
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS screening_expected_salary NUMERIC(12, 2);
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS screening_current_location TEXT;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS screening_joining_days INTEGER;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS hr_escalation_reason TEXT;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS hr_escalated_at TIMESTAMPTZ;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS hr_approved_at TIMESTAMPTZ;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_availability TEXT;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_scheduled_at TIMESTAMPTZ;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS teams_event_id TEXT;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS teams_join_url TEXT;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_link_token TEXT;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_link_created_at TIMESTAMPTZ;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_started_at TIMESTAMPTZ;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_completed_at TIMESTAMPTZ;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_report JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS recruiter_email_events (
     id BIGSERIAL PRIMARY KEY,
@@ -259,6 +327,23 @@ CREATE TABLE recruiter_applications (
     attachment_filename NVARCHAR(1000) NULL,
     attachment_sha256 NVARCHAR(128) NULL,
     attachment_payload VARBINARY(MAX) NULL,
+    screening_details NVARCHAR(MAX) NOT NULL DEFAULT '{}',
+    screening_current_salary DECIMAL(12, 2) NULL,
+    screening_expected_salary DECIMAL(12, 2) NULL,
+    screening_current_location NVARCHAR(500) NULL,
+    screening_joining_days INT NULL,
+    hr_escalation_reason NVARCHAR(MAX) NULL,
+    hr_escalated_at DATETIMEOFFSET NULL,
+    hr_approved_at DATETIMEOFFSET NULL,
+    interview_availability NVARCHAR(MAX) NULL,
+    interview_scheduled_at DATETIMEOFFSET NULL,
+    teams_event_id NVARCHAR(1000) NULL,
+    teams_join_url NVARCHAR(2000) NULL,
+    interview_link_token NVARCHAR(200) NULL,
+    interview_link_created_at DATETIMEOFFSET NULL,
+    interview_started_at DATETIMEOFFSET NULL,
+    interview_completed_at DATETIMEOFFSET NULL,
+    interview_report NVARCHAR(MAX) NOT NULL DEFAULT '{}',
     received_at DATETIMEOFFSET NULL,
     created_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET()
 );
@@ -283,6 +368,57 @@ ON recruitment_requirements (position_title);
 
 IF COL_LENGTH('recruiter_applications', 'attachment_payload') IS NULL
 ALTER TABLE recruiter_applications ADD attachment_payload VARBINARY(MAX) NULL;
+
+IF COL_LENGTH('recruiter_applications', 'screening_details') IS NULL
+ALTER TABLE recruiter_applications ADD screening_details NVARCHAR(MAX) NOT NULL DEFAULT '{}';
+
+IF COL_LENGTH('recruiter_applications', 'screening_current_salary') IS NULL
+ALTER TABLE recruiter_applications ADD screening_current_salary DECIMAL(12, 2) NULL;
+
+IF COL_LENGTH('recruiter_applications', 'screening_expected_salary') IS NULL
+ALTER TABLE recruiter_applications ADD screening_expected_salary DECIMAL(12, 2) NULL;
+
+IF COL_LENGTH('recruiter_applications', 'screening_current_location') IS NULL
+ALTER TABLE recruiter_applications ADD screening_current_location NVARCHAR(500) NULL;
+
+IF COL_LENGTH('recruiter_applications', 'screening_joining_days') IS NULL
+ALTER TABLE recruiter_applications ADD screening_joining_days INT NULL;
+
+IF COL_LENGTH('recruiter_applications', 'hr_escalation_reason') IS NULL
+ALTER TABLE recruiter_applications ADD hr_escalation_reason NVARCHAR(MAX) NULL;
+
+IF COL_LENGTH('recruiter_applications', 'hr_escalated_at') IS NULL
+ALTER TABLE recruiter_applications ADD hr_escalated_at DATETIMEOFFSET NULL;
+
+IF COL_LENGTH('recruiter_applications', 'hr_approved_at') IS NULL
+ALTER TABLE recruiter_applications ADD hr_approved_at DATETIMEOFFSET NULL;
+
+IF COL_LENGTH('recruiter_applications', 'interview_availability') IS NULL
+ALTER TABLE recruiter_applications ADD interview_availability NVARCHAR(MAX) NULL;
+
+IF COL_LENGTH('recruiter_applications', 'interview_scheduled_at') IS NULL
+ALTER TABLE recruiter_applications ADD interview_scheduled_at DATETIMEOFFSET NULL;
+
+IF COL_LENGTH('recruiter_applications', 'teams_event_id') IS NULL
+ALTER TABLE recruiter_applications ADD teams_event_id NVARCHAR(1000) NULL;
+
+IF COL_LENGTH('recruiter_applications', 'teams_join_url') IS NULL
+ALTER TABLE recruiter_applications ADD teams_join_url NVARCHAR(2000) NULL;
+
+IF COL_LENGTH('recruiter_applications', 'interview_link_token') IS NULL
+ALTER TABLE recruiter_applications ADD interview_link_token NVARCHAR(200) NULL;
+
+IF COL_LENGTH('recruiter_applications', 'interview_link_created_at') IS NULL
+ALTER TABLE recruiter_applications ADD interview_link_created_at DATETIMEOFFSET NULL;
+
+IF COL_LENGTH('recruiter_applications', 'interview_started_at') IS NULL
+ALTER TABLE recruiter_applications ADD interview_started_at DATETIMEOFFSET NULL;
+
+IF COL_LENGTH('recruiter_applications', 'interview_completed_at') IS NULL
+ALTER TABLE recruiter_applications ADD interview_completed_at DATETIMEOFFSET NULL;
+
+IF COL_LENGTH('recruiter_applications', 'interview_report') IS NULL
+ALTER TABLE recruiter_applications ADD interview_report NVARCHAR(MAX) NOT NULL DEFAULT '{}';
 """
 
 
@@ -553,6 +689,203 @@ def candidate_email_from_cv(extracted: dict[str, Any], cv_text: str) -> str | No
     return clean_email(extracted.get("email")) or clean_email(cv_text)
 
 
+def score_number(value: Any) -> float | None:
+    if value in (None, "", "null"):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def passes_screening_threshold(evaluation: dict[str, Any], requirement: dict[str, Any] | None) -> bool:
+    if not requirement:
+        return False
+    ats_score = score_number(evaluation.get("ats_score"))
+    jd_match_score = score_number(evaluation.get("jd_match_score"))
+    return (
+        ats_score is not None
+        and jd_match_score is not None
+        and ats_score > RECRUITER_SCREENING_ATS_MIN
+        and jd_match_score > RECRUITER_SCREENING_JD_MIN
+    )
+
+
+def dashboard_application_url(application_id: int | str) -> str:
+    return f"{RECRUITER_DASHBOARD_BASE_URL.rstrip('/')}/applications/{application_id}"
+
+
+def candidate_interview_url(token: str) -> str:
+    return f"{RECRUITER_INTERVIEW_BASE_URL.rstrip('/')}/interview/{token}"
+
+
+def application_candidate_recipient(application: dict[str, Any]) -> str | None:
+    if (application.get("submission_type") or "").lower() == "referral":
+        return application.get("candidate_email") or application.get("source_email")
+    return application.get("source_email") or application.get("candidate_email")
+
+
+def screening_work_terms() -> dict[str, Any]:
+    return {
+        "shift": RECRUITER_WORK_SHIFT,
+        "work_mode": RECRUITER_WORK_MODE,
+        "office_location": RECRUITER_OFFICE_LOCATION,
+        "cab_facility": RECRUITER_CAB_FACILITY,
+        "working_days": RECRUITER_WORKING_DAYS,
+    }
+
+
+def screening_answers_complete(answers: dict[str, Any]) -> bool:
+    return all(
+        answers.get(key) not in (None, "", [])
+        for key in ["comfortable_with_terms", "current_salary", "expected_salary", "current_location", "joining_days"]
+    )
+
+
+def json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def merge_screening_answers(existing: Any, incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = json_dict(existing).copy()
+    for key, value in (incoming or {}).items():
+        if value not in (None, "", []):
+            merged[key] = value
+    return merged
+
+
+def screening_int(value: Any) -> int | None:
+    number = score_number(value)
+    return int(number) if number is not None else None
+
+
+def requirement_budget_text(requirement: dict[str, Any] | None) -> str:
+    if not requirement:
+        return "the approved budget"
+    currency = requirement.get("currency") or "INR"
+    budget_min = requirement.get("budget_min")
+    budget_max = requirement.get("budget_max")
+    if budget_min and budget_max:
+        return f"{currency} {budget_min} to {budget_max}"
+    if budget_max:
+        return f"up to {currency} {budget_max}"
+    return "the approved budget"
+
+
+def screening_fit(answers: dict[str, Any], requirement: dict[str, Any] | None) -> tuple[bool, list[str]]:
+    issues = []
+    if answers.get("comfortable_with_terms") is False:
+        issues.append("candidate is not comfortable with the shift/office terms")
+    expected_salary = score_number(answers.get("expected_salary"))
+    budget_max = score_number(requirement.get("budget_max") if requirement else None)
+    if expected_salary is not None and budget_max is not None and expected_salary > budget_max:
+        issues.append(f"expected salary is above budget ({expected_salary} > {budget_max})")
+    return not issues, issues
+
+
+def parse_iso_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def parse_time_from_text(text: str) -> tuple[int, int] | None:
+    match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", text, flags=re.I)
+    if not match:
+        match = re.search(r"\b(?:at|around|by)\s+(\d{1,2})(?::(\d{2}))?\b", text, flags=re.I)
+    if not match:
+        match = re.search(r"\b(\d{1,2}):(\d{2})\b", text, flags=re.I)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    meridiem = (match.group(3) if len(match.groups()) >= 3 and match.group(3) else "").lower()
+    if meridiem == "pm" and hour != 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+    if not meridiem and 1 <= hour <= 8:
+        hour += 12
+    if hour > 23 or minute > 59:
+        return None
+    return hour, minute
+
+
+def parse_interview_datetime_fallback(text: str) -> datetime | None:
+    normalized = normalize_position_text(text)
+    now = recruiter_now()
+    target_date = None
+    if "tomorrow" in normalized or "tommorow" in normalized or "next day" in normalized:
+        target_date = (now + timedelta(days=1)).date()
+    elif "today" in normalized:
+        target_date = now.date()
+
+    if not target_date:
+        month_names = {
+            "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+            "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+            "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+            "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+        }
+        date_match = re.search(
+            r"\b(\d{1,2})(?:st|nd|rd|th)?\s+"
+            r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+            r"aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b",
+            text,
+            flags=re.I,
+        )
+        if date_match:
+            day = int(date_match.group(1))
+            month = month_names[date_match.group(2).lower()]
+            year = now.year
+            target_date = datetime(year, month, day, tzinfo=now.tzinfo).date()
+            if target_date < now.date():
+                target_date = datetime(year + 1, month, day, tzinfo=now.tzinfo).date()
+
+    flexible = any(
+        phrase in normalized
+        for phrase in [
+            "anytime",
+            "any time",
+            "as per your convenience",
+            "your convenience",
+            "you can schedule",
+            "schedule it",
+        ]
+    )
+    time_parts = parse_time_from_text(text)
+    if not target_date and flexible:
+        target_date = (now + timedelta(days=1)).date()
+    if not target_date:
+        return None
+    if time_parts:
+        hour, minute = time_parts
+    elif flexible:
+        hour, minute = 11, 0
+    else:
+        return None
+
+    scheduled_at = datetime.combine(target_date, datetime.min.time(), tzinfo=recruiter_tz()).replace(hour=hour, minute=minute)
+    if scheduled_at <= now:
+        scheduled_at += timedelta(days=1)
+    return scheduled_at
+
+
 def is_cv_role_override_request(latest_body: str, thread_context: str) -> bool:
     latest_text = normalize_position_text(latest_body)
     thread_text = normalize_position_text(thread_context)
@@ -750,6 +1083,17 @@ def deterministic_requirement_match(
         else:
             overlap = candidate_words & title_words
             score = len(overlap) / len(title_words)
+
+        hiring_title_words = {"developer", "engineer", "programmer", "designer", "accountant", "executive", "manager"}
+        if candidate_words & title_words:
+            if "python" in candidate_words and "python" in title_words and title_words & {"developer", "engineer", "programmer"}:
+                score = max(score, 0.9)
+            elif is_design_role_text(candidate_text) and is_design_role_text(title_text):
+                score = max(score, 0.9)
+            elif "accountant" in candidate_words and "accountant" in title_words:
+                score = max(score, 0.9)
+            elif len(candidate_words) <= 2 and title_words & hiring_title_words:
+                score = max(score, 0.82)
 
         if score > best_score:
             best_score = score
@@ -1108,6 +1452,195 @@ class RecruiterDatabase:
             LIMIT 1
             """,
             (sender, sender, sender),
+        )
+
+    def application_with_requirement(self, application_id: int) -> dict[str, Any] | None:
+        return self.one(
+            """
+            SELECT
+                ra.*,
+                rc.full_name,
+                rc.phone,
+                rc.location AS candidate_profile_location,
+                rc.raw_cv_text,
+                rc.cv_summary,
+                rc.ai_evaluation AS candidate_ai_evaluation,
+                rr.position_title AS requirement_position,
+                rr.budget_min,
+                rr.budget_max,
+                rr.currency,
+                rr.needed_within_days,
+                rr.job_description
+            FROM recruiter_applications ra
+            JOIN recruiter_candidates rc ON rc.id = ra.candidate_id
+            LEFT JOIN recruitment_requirements rr ON rr.id = ra.requirement_id
+            WHERE ra.id = %s
+            """,
+            (application_id,),
+        )
+
+    def update_interview_report(self, application_id: int, report: dict[str, Any]):
+        self.execute(
+            """
+            UPDATE recruiter_applications
+            SET application_status = %s,
+                interview_report = %s::jsonb,
+                interview_completed_at = NOW()
+            WHERE id = %s
+            """,
+            ("interview_completed", json.dumps(report), application_id),
+        )
+
+    def mark_post_interview_outcome(self, application_id: int, status: str, reason: str | None = None):
+        self.execute(
+            """
+            UPDATE recruiter_applications
+            SET application_status = %s,
+                hr_escalation_reason = %s,
+                hr_escalated_at = CASE WHEN %s = 'interview_on_hold_hr_review' THEN NOW() ELSE hr_escalated_at END
+            WHERE id = %s
+            """,
+            (status, reason, status, application_id),
+        )
+
+    def ensure_interview_link(self, application_id: int, reset: bool = False) -> str:
+        application = self.one(
+            "SELECT interview_link_token FROM recruiter_applications WHERE id = %s",
+            (application_id,),
+        )
+        token = application.get("interview_link_token") if application else None
+        if token and not reset:
+            return token
+        token = uuid4().hex
+        self.execute(
+            """
+            UPDATE recruiter_applications
+            SET interview_link_token = %s,
+                interview_link_created_at = NOW(),
+                interview_started_at = NULL,
+                interview_completed_at = NULL,
+                interview_report = '{}'::jsonb,
+                application_status = %s
+            WHERE id = %s
+            """,
+            (token, "interview_link_sent", application_id),
+        )
+        return token
+
+    def application_by_interview_token(self, token: str) -> dict[str, Any] | None:
+        return self.one(
+            """
+            SELECT
+                ra.*,
+                rc.full_name,
+                rc.phone,
+                rc.location AS candidate_profile_location,
+                rc.raw_cv_text,
+                rc.cv_summary,
+                rc.ai_evaluation AS candidate_ai_evaluation,
+                rr.position_title AS requirement_position,
+                rr.budget_min,
+                rr.budget_max,
+                rr.currency,
+                rr.needed_within_days,
+                rr.job_description
+            FROM recruiter_applications ra
+            JOIN recruiter_candidates rc ON rc.id = ra.candidate_id
+            LEFT JOIN recruitment_requirements rr ON rr.id = ra.requirement_id
+            WHERE ra.interview_link_token = %s
+            """,
+            (token,),
+        )
+
+    def mark_interview_started(self, application_id: int):
+        self.execute(
+            """
+            UPDATE recruiter_applications
+            SET application_status = %s,
+                interview_started_at = COALESCE(interview_started_at, NOW())
+            WHERE id = %s
+            """,
+            ("interview_started", application_id),
+        )
+
+    def update_application_screening(
+        self,
+        application_id: int,
+        status: str,
+        screening_details: dict[str, Any] | None = None,
+        escalation_reason: str | None = None,
+    ):
+        details = screening_details or {}
+        values = (
+            status,
+            json.dumps(details),
+            score_number(details.get("current_salary")),
+            score_number(details.get("expected_salary")),
+            details.get("current_location"),
+            screening_int(details.get("joining_days")),
+        )
+        if escalation_reason:
+            self.execute(
+                """
+                UPDATE recruiter_applications
+                SET application_status = %s,
+                    screening_details = %s::jsonb,
+                    screening_current_salary = %s,
+                    screening_expected_salary = %s,
+                    screening_current_location = %s,
+                    screening_joining_days = %s,
+                    hr_escalation_reason = %s,
+                    hr_escalated_at = NOW()
+                WHERE id = %s
+                """,
+                (*values, escalation_reason, application_id),
+            )
+            return
+        self.execute(
+            """
+            UPDATE recruiter_applications
+            SET application_status = %s,
+                screening_details = %s::jsonb,
+                screening_current_salary = %s,
+                screening_expected_salary = %s,
+                screening_current_location = %s,
+                screening_joining_days = %s
+            WHERE id = %s
+            """,
+            (*values, application_id),
+        )
+
+    def mark_hr_approved_for_interview(self, application_id: int):
+        self.execute(
+            """
+            UPDATE recruiter_applications
+            SET application_status = 'interview_time_requested',
+                hr_approved_at = NOW()
+            WHERE id = %s
+            """,
+            (application_id,),
+        )
+
+    def update_interview_schedule(
+        self,
+        application_id: int,
+        status: str,
+        availability: str | None = None,
+        scheduled_at: datetime | None = None,
+        teams_event_id: str | None = None,
+        teams_join_url: str | None = None,
+    ):
+        self.execute(
+            """
+            UPDATE recruiter_applications
+            SET application_status = %s,
+                interview_availability = %s,
+                interview_scheduled_at = %s,
+                teams_event_id = %s,
+                teams_join_url = %s
+            WHERE id = %s
+            """,
+            (status, availability, scheduled_at, teams_event_id, teams_join_url, application_id),
         )
 
     def mark_latest_application_withdrawn(self, email_address: str) -> dict[str, Any] | None:
@@ -1780,6 +2313,97 @@ class MicrosoftGraphProvider:
             },
         )
 
+    def send_direct_email(self, to_email: str, subject: str, body: str):
+        if not RECRUITER_REPLY_ENABLED:
+            print(f"[direct reply disabled] To: {to_email} | Subject: {subject}\n{body}")
+            return
+        reply_html = append_signature_if_needed(email_body_to_html(body))
+        self.request(
+            "POST",
+            f"/users/{self.mailbox}/sendMail",
+            json={
+                "message": {
+                    "subject": subject,
+                    "body": {"contentType": "HTML", "content": reply_html},
+                    "toRecipients": [{"emailAddress": {"address": to_email}}],
+                },
+                "saveToSentItems": True,
+            },
+        )
+
+    def create_online_meeting(self, subject: str, start_at: datetime, end_at: datetime) -> str:
+        data = self.request(
+            "POST",
+            f"/users/{self.mailbox}/onlineMeetings",
+            json={
+                "subject": subject,
+                "startDateTime": start_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "endDateTime": end_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            },
+        )
+        return data.get("joinWebUrl") or data.get("joinUrl") or ""
+
+    def get_online_meeting_by_join_url(self, join_url: str) -> dict[str, Any] | None:
+        if not join_url:
+            return None
+        data = self.request(
+            "GET",
+            f"/users/{self.mailbox}/onlineMeetings",
+            params={"$filter": f"JoinWebUrl eq '{join_url}'"},
+        )
+        meetings = data.get("value") or []
+        return meetings[0] if meetings else None
+
+    def create_teams_calendar_event(
+        self,
+        recipient_email: str,
+        subject: str,
+        start_at: datetime,
+        end_at: datetime,
+        body: str,
+    ) -> tuple[str, str]:
+        start_local = as_recruiter_time(start_at)
+        end_local = as_recruiter_time(end_at)
+        event = self.request(
+            "POST",
+            f"/users/{self.mailbox}/events",
+            json={
+                "subject": subject,
+                "body": {
+                    "contentType": "HTML",
+                    "content": email_body_to_html(body),
+                },
+                "start": {
+                    "dateTime": start_local.replace(tzinfo=None).isoformat(timespec="seconds"),
+                    "timeZone": RECRUITER_TIMEZONE,
+                },
+                "end": {
+                    "dateTime": end_local.replace(tzinfo=None).isoformat(timespec="seconds"),
+                    "timeZone": RECRUITER_TIMEZONE,
+                },
+                "location": {"displayName": "Microsoft Teams"},
+                "attendees": [
+                    {
+                        "emailAddress": {"address": recipient_email},
+                        "type": "required",
+                    }
+                ],
+                "isOnlineMeeting": True,
+                "onlineMeetingProvider": "teamsForBusiness",
+            },
+        )
+        event_id = event.get("id") or ""
+        join_url = ((event.get("onlineMeeting") or {}).get("joinUrl") or "").strip()
+        if event_id and not join_url:
+            time.sleep(1)
+            refreshed = self.request(
+                "GET",
+                f"/users/{self.mailbox}/events/{quote(event_id, safe='')}",
+                params={"$select": "id,onlineMeeting,webLink"},
+            )
+            join_url = ((refreshed.get("onlineMeeting") or {}).get("joinUrl") or "").strip()
+        return event_id, join_url
+
     def create_inbox_subscription(self, notification_url: str, client_state: str, hours: int) -> dict[str, Any]:
         if not notification_url:
             raise RuntimeError("GRAPH_NOTIFICATION_URL is required, for example https://your-domain.com/graph/outlook")
@@ -1849,6 +2473,35 @@ def build_inbox_provider() -> RecruiterInbox:
 
 
 class RecruiterMailer:
+    def send_direct_email(self, to_email: str, subject: str, body: str):
+        if not RECRUITER_REPLY_ENABLED:
+            print(f"[direct reply disabled] To: {to_email} | Subject: {subject}\n{body}")
+            return
+
+        missing = [
+            name
+            for name, value in {
+                "RECRUITER_SMTP_HOST": RECRUITER_SMTP_HOST,
+                "RECRUITER_EMAIL": RECRUITER_EMAIL,
+                "RECRUITER_EMAIL_PASSWORD": RECRUITER_EMAIL_PASSWORD,
+            }.items()
+            if not value
+        ]
+        if missing:
+            raise RuntimeError(f"Missing SMTP settings: {', '.join(missing)}")
+
+        if RECRUITER_APPEND_SIGNATURE:
+            body = f"{body}\r\n\r\n{recruiter_plain_signature()}"
+        message = EmailMessage()
+        message["From"] = RECRUITER_FROM_EMAIL
+        message["To"] = to_email
+        message["Subject"] = subject
+        message.set_content(body)
+        with smtplib.SMTP(RECRUITER_SMTP_HOST, RECRUITER_SMTP_PORT) as smtp:
+            smtp.starttls()
+            smtp.login(RECRUITER_EMAIL, RECRUITER_EMAIL_PASSWORD)
+            smtp.send_message(message)
+
     def send_reply(self, inbox_email: InboxEmail, subject: str, body: str, to_email: str | None = None):
         recipient = to_email or inbox_email.sender
         if not RECRUITER_REPLY_ENABLED:
@@ -1893,6 +2546,7 @@ class RecruiterAI:
     def __init__(self):
         self.llm = make_chat_model(json_mode=True, max_tokens=max(OLLAMA_NUM_PREDICT, 1400))
         self.repair_llm = make_chat_model(json_mode=True, max_tokens=max(OLLAMA_NUM_PREDICT, 1400))
+        self.reply_llm = make_chat_model(json_mode=False, max_tokens=350)
 
     def json_call(self, prompt: str) -> dict[str, Any]:
         response = self.llm.invoke(
@@ -1915,6 +2569,67 @@ Do not include markdown, comments, trailing commas, or explanatory text.
         if not match:
             raise ValueError(f"LLM did not return JSON: {response}")
         return match.group(0)
+
+    @traceable(name="draft_hr_reply")
+    def draft_reply(
+        self,
+        inbox_email: InboxEmail,
+        scenario: str,
+        facts: dict[str, Any],
+        fallback_body: str,
+    ) -> str:
+        thread_context = build_thread_context(inbox_email)
+        response = self.reply_llm.invoke(
+            f"""
+You are an HR recruiter replying by email.
+Read the full thread and write the reply naturally, like a real HR person.
+
+Rules:
+- Return only the email body text.
+- Start with "Hi,".
+- Use short paragraphs with blank lines between them.
+- Be warm, concise, and professional.
+- Do not sound automated.
+- Do not mention internal systems, database, ATS, AI, LLM, logs, matching logic, or scores.
+- Do not invent interviews, shortlisting, salaries, deadlines, or openings that are not in the facts.
+- If the facts say CV is required, clearly ask for the CV as PDF, DOCX, or TXT.
+- If the facts say no active opening, say it politely and say we will keep the profile for future suitable roles.
+- If the facts say application received, acknowledge receipt and say the team will review it.
+- Do not include a signature. The mailer adds the HR signature separately.
+
+Scenario:
+{scenario}
+
+Facts:
+{json.dumps(facts, default=str)}
+
+Full email thread:
+{thread_context[:8000]}
+"""
+        ).content.strip()
+        response = self.clean_reply_body(response)
+        return response or fallback_body
+
+    def clean_reply_body(self, body: str) -> str:
+        body = re.sub(r"```(?:text|html|markdown)?", "", body, flags=re.I).replace("```", "")
+        body = body.strip().strip('"').strip()
+        body = re.sub(r"\n{3,}", "\n\n", body)
+        signature_markers = [
+            RECRUITER_SIGNATURE_EMAIL.lower(),
+            RECRUITER_SIGNATURE_COMPANY.lower(),
+            RECRUITER_SIGNATURE_NAME.lower(),
+        ]
+        lines = body.splitlines()
+        kept_lines = []
+        for line in lines:
+            lowered = line.strip().lower()
+            if lowered and any(marker and marker in lowered for marker in signature_markers):
+                break
+            kept_lines.append(line.rstrip())
+        body = "\n".join(kept_lines).strip()
+        if not body.lower().startswith("hi"):
+            body = f"Hi,\n\n{body}"
+        return body
 
     def repair_json(self, broken_json: str, error: json.JSONDecodeError) -> str:
         repaired = self.repair_llm.invoke(
@@ -2061,6 +2776,72 @@ CV text:
 """
         ))
 
+    @traceable(name="extract_screening_answers")
+    def extract_screening_answers(self, inbox_email: InboxEmail, application: dict[str, Any]) -> dict[str, Any]:
+        thread_context = build_thread_context(inbox_email)
+        return self.json_call(
+            f"""
+Return only valid JSON.
+Read the full thread and extract the latest known screening answers.
+If the candidate corrected a previous value, use the latest corrected value.
+If a value was given earlier and not changed later, keep the earlier value.
+For salary, return numeric annual amount in the same broad unit as the requirement budget when possible.
+If candidate says 6 LPA or 6 lakh, return 600000.
+If unknown, use null.
+
+JSON schema:
+{{
+  "comfortable_with_terms": true,
+  "current_salary": null,
+  "expected_salary": null,
+  "current_location": null,
+  "joining_days": null,
+  "interview_availability": null,
+  "notes": "short notes"
+}}
+
+Requirement/application:
+{json.dumps(application, default=str)}
+
+Work terms:
+{json.dumps(screening_work_terms())}
+
+Email thread:
+{thread_context[:8000]}
+"""
+        )
+
+    @traceable(name="extract_interview_schedule")
+    def extract_interview_schedule(self, inbox_email: InboxEmail, application: dict[str, Any]) -> dict[str, Any]:
+        thread_context = build_thread_context(inbox_email)
+        now_text = recruiter_now().isoformat()
+        return self.json_call(
+            f"""
+Return only valid JSON.
+The candidate is sharing interview availability. Extract one clear interview slot if possible.
+Use the current local datetime to resolve words like today/tomorrow.
+If the candidate gives multiple options, choose the earliest clear future slot.
+If no clear date and time is available, set scheduled_at to null.
+
+JSON schema:
+{{
+  "scheduled_at": null,
+  "duration_minutes": 45,
+  "availability_text": "short summary",
+  "needs_clarification": false
+}}
+
+Current local datetime:
+{now_text}
+
+Application:
+{json.dumps(application, default=str)}
+
+Email thread:
+{thread_context[:8000]}
+"""
+        )
+
 
 class AIRecruiterAgent:
     def __init__(self):
@@ -2076,92 +2857,367 @@ class AIRecruiterAgent:
         self.db.init_schema()
 
     def reply_missing_cv(self, inbox_email: InboxEmail):
+        fallback_body = recruiter_email_body(
+            "Thanks for reaching out.",
+            "Please send your updated CV as a PDF, DOCX, or TXT attachment. Once we have it, we can review your profile for the role discussed in this thread.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "candidate asked about or wants to apply for an open role, but no CV was attached",
+            {"cv_required": True, "supported_cv_formats": ["PDF", "DOCX", "TXT"]},
+            fallback_body,
+        )
         self.mailer.send_reply(
             inbox_email,
             f"CV required: {inbox_email.subject}",
-            recruiter_email_body(
-                "Thanks for reaching out.",
-                "Please send your updated CV as a PDF, DOCX, or TXT attachment. Once we have it, we can review your profile for the role discussed in this thread.",
-            ),
+            body,
+        )
+
+    def reply_followup_missing_cv(self, inbox_email: InboxEmail, requirement: dict[str, Any] | None):
+        role = requirement["position_title"] if requirement else None
+        role_text = f" for {role}" if role else ""
+        fallback_body = recruiter_email_body(
+            "Thanks for following up.",
+            f"I checked this thread. We still need your updated CV{role_text} before we can review your application properly.",
+            "Please send it as a PDF, DOCX, or TXT attachment, and we will take it from there.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "candidate followed up, but no CV has been received yet for the role discussed in the thread",
+            {"cv_required": True, "role": role, "supported_cv_formats": ["PDF", "DOCX", "TXT"]},
+            fallback_body,
+        )
+        self.mailer.send_reply(
+            inbox_email,
+            f"CV required: {inbox_email.subject}",
+            body,
         )
 
     def reply_wrong_cv(self, inbox_email: InboxEmail, requested_position: str | None, cv_position: str | None):
         requested_text = f" for {requested_position}" if requested_position else ""
         cv_text = f" The CV looks closer to a {cv_position} profile." if cv_position else ""
+        fallback_body = recruiter_email_body(
+            "Thanks for sharing the CV.",
+            f"I checked it against this email thread, and we were expecting a CV{requested_text}. This attachment does not seem to match that role.{cv_text}",
+            "Could you please verify and send the correct CV? We will review it as soon as we receive the right one.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "candidate attached a CV, but it does not match the role requested in the email thread",
+            {
+                "requested_position": requested_position,
+                "cv_position": cv_position,
+                "ask_for_correct_cv": True,
+            },
+            fallback_body,
+        )
         self.mailer.send_reply(
             inbox_email,
             f"Correct CV required: {inbox_email.subject}",
-            recruiter_email_body(
-                "Thanks for sharing the CV.",
-                f"I checked it against this email thread, and we were expecting a CV{requested_text}. This attachment does not seem to match that role.{cv_text}",
-                "Could you please verify and send the correct CV? We will review it as soon as we receive the right one.",
-            ),
+            body,
         )
 
     def reply_no_opening(self, inbox_email: InboxEmail, position: str | None):
         role_text = f" for {position}" if position else ""
+        fallback_body = recruiter_email_body(
+            "Thanks for sharing your profile.",
+            f"At the moment, we do not have an active opening{role_text}. I have saved your details, and we will reach out if a suitable role opens up.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "candidate shared or asked about a role, but there is no active opening for that position",
+            {"active_opening": False, "position": position, "profile_saved": True},
+            fallback_body,
+        )
         self.mailer.send_reply(
             inbox_email,
             f"Application update: {inbox_email.subject}",
-            recruiter_email_body(
-                "Thanks for sharing your profile.",
-                f"At the moment, we do not have an active opening{role_text}. I have saved your details, and we will reach out if a suitable role opens up.",
-            ),
+            body,
         )
 
     def reply_received(self, inbox_email: InboxEmail):
+        fallback_body = recruiter_email_body(
+            "Thanks for applying and sharing your CV.",
+            "We have received your application. Our team will review it and contact you if your profile matches the role.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "candidate applied for an active role and shared a CV",
+            {"application_received": True, "next_step": "internal review"},
+            fallback_body,
+        )
         self.mailer.send_reply(
             inbox_email,
             f"Application received: {inbox_email.subject}",
-            recruiter_email_body(
-                "Thanks for applying and sharing your CV.",
-                "We have received your application. Our team will review it and contact you if your profile matches the role.",
-            ),
+            body,
         )
+
+    def reply_screening_questions(self, inbox_email: InboxEmail, requirement: dict[str, Any] | None):
+        role = requirement["position_title"] if requirement else None
+        fallback_body = recruiter_email_body(
+            "Thanks for applying and sharing your CV.",
+            f"Your profile looks relevant for {role}. Before we move ahead, please confirm if you are comfortable with night shift, work from office in Mohali, 5 days working, and cab facility available.",
+            "Also please share your current salary, expected salary, current location, and how soon you can join.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "candidate CV passed the initial ATS/JD screen; ask pre-interview screening questions",
+            {
+                "application_received": True,
+                "role": role,
+                "work_terms": screening_work_terms(),
+                "ask_for": ["current salary", "expected salary", "current location", "joining time"],
+            },
+            fallback_body,
+        )
+        self.mailer.send_reply(
+            inbox_email,
+            f"Application next steps: {inbox_email.subject}",
+            body,
+        )
+
+    def reply_screening_missing_details(self, inbox_email: InboxEmail, answers: dict[str, Any]):
+        fallback_body = recruiter_email_body(
+            "Thanks for sharing the details.",
+            "Could you please also confirm your current salary, expected salary, current location, joining time, and whether you are comfortable with night shift and work from office in Mohali?",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "candidate replied to screening questions but some required details are still missing",
+            {"answers_received": answers, "missing_complete_screening_details": True, "work_terms": screening_work_terms()},
+            fallback_body,
+        )
+        self.mailer.send_reply(inbox_email, f"Screening details required: {inbox_email.subject}", body)
+
+    def reply_negotiate_screening(self, inbox_email: InboxEmail, requirement: dict[str, Any] | None, issues: list[str]):
+        fallback_body = recruiter_email_body(
+            "Thanks for sharing the details.",
+            f"The current budget for this role is {requirement_budget_text(requirement)}. Please let us know if this works for you, along with the joining timeline you can commit to.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "candidate screening details do not fit budget or joining timeline; negotiate politely once",
+            {"issues": issues, "budget": requirement_budget_text(requirement), "requirement": requirement},
+            fallback_body,
+        )
+        self.mailer.send_reply(inbox_email, f"Application discussion: {inbox_email.subject}", body)
+
+    def reply_interview_availability_request(self, inbox_email: InboxEmail, application: dict[str, Any] | None = None):
+        if application:
+            token = self.db.ensure_interview_link(application["id"])
+            link = candidate_interview_url(token)
+            fallback_body = recruiter_email_body(
+                "Thanks for confirming the details.",
+                "We are good to move ahead with your interview.",
+                f"You can start it here whenever you are ready: {link}",
+                "Please use a laptop or desktop with a working microphone, and choose a quiet place before starting.",
+            )
+            body = self.ai.draft_reply(
+                inbox_email,
+                "candidate screening details are acceptable; send candidate the AI interview link",
+                {"ready_for_interview": True, "application": application, "interview_link": link},
+                fallback_body,
+            )
+            self.mailer.send_reply(inbox_email, f"Interview link: {inbox_email.subject}", body)
+            self.db.log_email_event(
+                inbox_email,
+                "interview_link_sent",
+                {"application_id": application["id"], "interview_link": link},
+            )
+            return
+        fallback_body = recruiter_email_body(
+            "Thanks for confirming the details.",
+            "We are good to move ahead with an interview. Please share a few time slots when you will be available, and we will schedule it accordingly.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "candidate screening details are acceptable; ask candidate for interview availability",
+            {"ready_for_interview": True, "application": application},
+            fallback_body,
+        )
+        self.mailer.send_reply(inbox_email, f"Interview availability: {inbox_email.subject}", body)
+
+    def escalate_to_hr(self, inbox_email: InboxEmail, application: dict[str, Any], answers: dict[str, Any], issues: list[str]):
+        application_id = application["id"]
+        dashboard_url = dashboard_application_url(application_id)
+        reason = "; ".join(issues)
+        subject = f"HR approval required: {application.get('full_name') or application.get('candidate_email') or application_id}"
+        body = recruiter_email_body(
+            "Please review this candidate application.",
+            f"The candidate's screening reply needs HR approval: {reason}.",
+            f"Application: {dashboard_url}",
+            f"Candidate email: {application.get('candidate_email') or application.get('source_email') or '-'}",
+            f"Role: {application.get('requirement_position') or application.get('matched_position') or application.get('detected_position') or '-'}",
+            f"Screening details: {json.dumps(answers, default=str)}",
+        )
+        self.mailer.send_direct_email(RECRUITER_HR_ESCALATION_EMAIL, subject, body)
+        self.db.update_application_screening(application_id, "hr_escalated", answers, reason)
+        self.db.log_email_event(
+            inbox_email,
+            "hr_escalated",
+            {"application_id": application_id, "issues": issues, "answers": answers, "dashboard_url": dashboard_url},
+        )
+        self.reply_negotiate_screening(inbox_email, application, issues)
+
+    def handle_interview_availability_reply(self, inbox_email: InboxEmail, application: dict[str, Any]) -> bool:
+        schedule = self.ai.extract_interview_schedule(inbox_email, application)
+        availability = schedule.get("availability_text") or inbox_email.body.strip()
+        scheduled_at = parse_iso_datetime(schedule.get("scheduled_at"))
+        if not scheduled_at:
+            scheduled_at = parse_interview_datetime_fallback(inbox_email.body)
+        if not scheduled_at:
+            self.db.update_interview_schedule(
+                application["id"],
+                "interview_time_requested",
+                availability=availability,
+            )
+            self.mailer.send_reply(
+                inbox_email,
+                f"Interview timing required: {inbox_email.subject}",
+                self.ai.draft_reply(
+                    inbox_email,
+                    "candidate replied about interview but did not provide a clear date and time; ask for clear slots",
+                    {"availability_text": availability, "needs_clear_datetime": True},
+                    recruiter_email_body(
+                        "Thanks for sharing this.",
+                        "Could you please share a clear date and time slot for the interview? Once we have that, we will schedule it and share the Teams link.",
+                    ),
+                ),
+            )
+            return True
+
+        duration_minutes = safe_int(schedule.get("duration_minutes")) or 45
+        end_at = scheduled_at + timedelta(minutes=duration_minutes)
+        recipient = application_candidate_recipient(application) or inbox_email.sender
+        role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
+        subject = f"Interview - {role or 'Candidate'}"
+        event_body = recruiter_email_body(
+            "Your interview has been scheduled.",
+            f"Role: {role or 'Candidate'}",
+            f"Time: {recruiter_time_text(scheduled_at)}",
+        )
+        teams_event_id = ""
+        teams_join_url = ""
+        try:
+            if isinstance(self.mailer, MicrosoftGraphProvider):
+                teams_event_id, teams_join_url = self.mailer.create_teams_calendar_event(
+                    recipient,
+                    subject,
+                    scheduled_at,
+                    end_at,
+                    event_body,
+                )
+                if not teams_join_url:
+                    teams_join_url = self.mailer.create_online_meeting(subject, scheduled_at, end_at)
+        except Exception as exc:
+            self.db.log_email_event(
+                inbox_email,
+                "teams_meeting_create_failed",
+                {"application_id": application["id"], "recipient": recipient, "error": str(exc), "schedule": schedule},
+            )
+
+        status = "interview_scheduled" if teams_join_url else "interview_availability_received"
+        self.db.update_interview_schedule(
+            application["id"],
+            status,
+            availability=availability,
+            scheduled_at=scheduled_at,
+            teams_event_id=teams_event_id or None,
+            teams_join_url=teams_join_url or None,
+        )
+        if teams_join_url:
+            fallback = recruiter_email_body(
+                "Thanks for sharing your availability.",
+                f"Your interview has been scheduled for {recruiter_time_text(scheduled_at)}.",
+                f"Teams link: {teams_join_url}",
+            )
+            scenario = "Teams interview has been scheduled; share the meeting link"
+            facts = {"scheduled_at": scheduled_at.isoformat(), "teams_join_url": teams_join_url}
+        else:
+            fallback = recruiter_email_body(
+                "Thanks for sharing your availability.",
+                "We have noted the timing and will share the Teams link shortly.",
+            )
+            scenario = "candidate shared clear interview availability, but Teams link is not created yet"
+            facts = {"scheduled_at": scheduled_at.isoformat(), "teams_link_pending": True}
+        self.mailer.send_reply(
+            inbox_email,
+            f"Interview schedule: {inbox_email.subject}",
+            self.ai.draft_reply(inbox_email, scenario, facts, fallback),
+        )
+        return True
 
     def reply_referral_received(self, inbox_email: InboxEmail, candidate_email: str, position: str | None):
         role_text = f" for {position}" if position else ""
+        fallback_body = recruiter_email_body(
+            f"Your CV has been shared with us{role_text}.",
+            "We have received it and will review your profile. If it matches the role, our team will contact you with the next steps.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "someone referred or shared a candidate CV; reply directly to the candidate email from the CV",
+            {"candidate_email": candidate_email, "position": position, "application_received": True},
+            fallback_body,
+        )
         self.mailer.send_reply(
             inbox_email,
             f"Application received: {inbox_email.subject}",
-            recruiter_email_body(
-                f"Your CV has been shared with us{role_text}.",
-                "We have received it and will review your profile. If it matches the role, our team will contact you with the next steps.",
-            ),
+            body,
             to_email=candidate_email,
         )
 
     def reply_referral_missing_candidate_email(self, inbox_email: InboxEmail, position: str | None):
         role_text = f" for {position}" if position else ""
+        fallback_body = recruiter_email_body(
+            f"Thanks for sharing your friend's CV{role_text}.",
+            "I could not find the candidate's email address in the CV. Please share their email address, or ask them to send the CV directly, so we can continue the review.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "sender shared a friend's CV, but candidate email is missing from the CV",
+            {"position": position, "candidate_email_required": True},
+            fallback_body,
+        )
         self.mailer.send_reply(
             inbox_email,
             f"Candidate email required: {inbox_email.subject}",
-            recruiter_email_body(
-                f"Thanks for sharing your friend's CV{role_text}.",
-                "I could not find the candidate's email address in the CV. Please share their email address, or ask them to send the CV directly, so we can continue the review.",
-            ),
+            body,
         )
 
     def reply_status_followup(self, inbox_email: InboxEmail, application: dict[str, Any] | None):
         if application:
             position = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
             position_text = f" for {position}" if position else ""
+            fallback_body = recruiter_email_body(
+                "Thanks for following up.",
+                f"We have your application{position_text} in our records. It is still under review, and our team will contact you if your profile is shortlisted.",
+            )
+            body = self.ai.draft_reply(
+                inbox_email,
+                "candidate is asking for an update on an application already in our records",
+                {"application_found": True, "position": position, "status": application.get("application_status")},
+                fallback_body,
+            )
             self.mailer.send_reply(
                 inbox_email,
                 f"Application status: {inbox_email.subject}",
-                recruiter_email_body(
-                    "Thanks for following up.",
-                    f"We have your application{position_text} in our records. It is still under review, and our team will contact you if your profile is shortlisted.",
-                ),
+                body,
             )
         else:
+            fallback_body = recruiter_email_body(
+                "Thanks for following up.",
+                "I could not find a previous application linked to this email address. Please share your CV and the role you are interested in, and we will review it.",
+            )
+            body = self.ai.draft_reply(
+                inbox_email,
+                "candidate is asking for an update, but no application is found in our records",
+                {"application_found": False, "ask_for_cv_and_role": True},
+                fallback_body,
+            )
             self.mailer.send_reply(
                 inbox_email,
                 f"Application status: {inbox_email.subject}",
-                recruiter_email_body(
-                    "Thanks for following up.",
-                    "I could not find a previous application linked to this email address. Please share your CV and the role you are interested in, and we will review it.",
-                ),
+                body,
             )
 
     def reply_withdrawal_confirmed(self, inbox_email: InboxEmail, application: dict[str, Any] | None):
@@ -2169,23 +3225,37 @@ class AIRecruiterAgent:
         if application:
             position = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
         position_text = f" for {position}" if position else ""
+        fallback_body = recruiter_email_body(
+            "Thanks for letting us know.",
+            f"We have noted your request and marked your application{position_text} as withdrawn. Wishing you all the best.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "candidate wants to withdraw their application",
+            {"application_found": application is not None, "position": position, "withdrawn": True},
+            fallback_body,
+        )
         self.mailer.send_reply(
             inbox_email,
             f"Application withdrawn: {inbox_email.subject}",
-            recruiter_email_body(
-                "Thanks for letting us know.",
-                f"We have noted your request and marked your application{position_text} as withdrawn. Wishing you all the best.",
-            ),
+            body,
         )
 
     def reply_supported_cv_required(self, inbox_email: InboxEmail):
+        fallback_body = recruiter_email_body(
+            "Thanks for your message.",
+            "I could not find a readable CV attachment. Please send the CV as a PDF, DOCX, or TXT file, and we will review it.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "candidate sent an attachment, but it was not a supported/readable CV file",
+            {"supported_cv_formats": ["PDF", "DOCX", "TXT"], "ask_for_readable_cv": True},
+            fallback_body,
+        )
         self.mailer.send_reply(
             inbox_email,
             f"CV attachment required: {inbox_email.subject}",
-            recruiter_email_body(
-                "Thanks for your message.",
-                "I could not find a readable CV attachment. Please send the CV as a PDF, DOCX, or TXT file, and we will review it.",
-            ),
+            body,
         )
 
     @traceable(name="process_recruiting_email")
@@ -2193,6 +3263,11 @@ class AIRecruiterAgent:
         thread_context = build_thread_context(inbox_email)
         classification = self.ai.classify_email(inbox_email)
         latest_application = self.db.latest_application_for_email(inbox_email.sender)
+        active_application = (
+            self.db.application_with_requirement(latest_application["id"])
+            if latest_application
+            else None
+        )
 
         if is_withdrawal_request(inbox_email.body):
             withdrawn_application = self.db.mark_latest_application_withdrawn(inbox_email.sender)
@@ -2207,6 +3282,58 @@ class AIRecruiterAgent:
             )
             self.reply_withdrawal_confirmed(inbox_email, withdrawn_application)
             return True
+
+        if active_application and not inbox_email.attachments:
+            current_status = (active_application.get("application_status") or "").lower()
+            if current_status in {"screening_questions_sent", "screening_under_review", "screening_negotiation"}:
+                extracted_answers = self.ai.extract_screening_answers(inbox_email, active_application)
+                answers = merge_screening_answers(active_application.get("screening_details"), extracted_answers)
+                self.db.log_email_event(
+                    inbox_email,
+                    "screening_reply_received",
+                    {
+                        "application_id": active_application["id"],
+                        "extracted_answers": extracted_answers,
+                        "merged_answers": answers,
+                    },
+                )
+                if not screening_answers_complete(answers):
+                    self.db.update_application_screening(active_application["id"], "screening_questions_sent", answers)
+                    self.reply_screening_missing_details(inbox_email, answers)
+                    return True
+
+                is_fit, issues = screening_fit(answers, active_application)
+                if is_fit:
+                    self.db.update_application_screening(active_application["id"], "interview_link_pending", answers)
+                    self.reply_interview_availability_request(inbox_email, active_application)
+                    return True
+
+                expected_salary = score_number(answers.get("expected_salary"))
+                budget_max = score_number(active_application.get("budget_max"))
+                if (
+                    current_status == "screening_negotiation"
+                    and expected_salary is not None
+                    and budget_max is not None
+                    and expected_salary > budget_max
+                ):
+                    self.escalate_to_hr(inbox_email, active_application, answers, issues)
+                    return True
+
+                self.db.update_application_screening(
+                    active_application["id"],
+                    "screening_negotiation",
+                    {**answers, "issues": issues},
+                )
+                self.reply_negotiate_screening(inbox_email, active_application, issues)
+                return True
+
+            if current_status in {"interview_time_requested", "interview_link_pending"}:
+                self.reply_interview_availability_request(inbox_email, active_application)
+                return True
+
+            if current_status == "hr_round_time_requested":
+                self.handle_interview_availability_reply(inbox_email, active_application)
+                return True
 
         if not classification.get("is_employment_related"):
             self.db.log_email_event(inbox_email, "ignored_non_employment", classification)
@@ -2234,19 +3361,6 @@ class AIRecruiterAgent:
                 self.reply_supported_cv_required(inbox_email)
                 return True
 
-            if is_status_followup(inbox_email.body):
-                self.db.log_email_event(
-                    inbox_email,
-                    "status_followup",
-                    {
-                        **classification,
-                        "application_found": latest_application is not None,
-                        "application_id": latest_application["id"] if latest_application else None,
-                    },
-                )
-                self.reply_status_followup(inbox_email, latest_application)
-                return True
-
             match = (
                 deterministic_requirement_match(
                     {"target_position": classification.get("detected_position")},
@@ -2259,6 +3373,26 @@ class AIRecruiterAgent:
             )
             matched_requirement_id = safe_int(match.get("requirement_id"))
             requirement = next((row for row in requirements if row["id"] == matched_requirement_id), None)
+
+            if is_status_followup(inbox_email.body):
+                self.db.log_email_event(
+                    inbox_email,
+                    "status_followup",
+                    {
+                        **classification,
+                        "application_found": latest_application is not None,
+                        "application_id": latest_application["id"] if latest_application else None,
+                        "match": match,
+                        "matched_requirement": requirement["position_title"] if requirement else None,
+                    },
+                )
+                if latest_application:
+                    self.reply_status_followup(inbox_email, latest_application)
+                elif requirement:
+                    self.reply_followup_missing_cv(inbox_email, requirement)
+                else:
+                    self.reply_status_followup(inbox_email, None)
+                return True
             self.db.log_email_event(
                 inbox_email,
                 "missing_cv",
@@ -2427,6 +3561,18 @@ class AIRecruiterAgent:
                     )
 
             if requirement:
+                if application_id and passes_screening_threshold(evaluation, requirement):
+                    self.db.update_application_screening(
+                        application_id,
+                        "screening_questions_sent",
+                        {
+                            "ats_score": evaluation.get("ats_score"),
+                            "jd_match_score": evaluation.get("jd_match_score"),
+                            "work_terms": screening_work_terms(),
+                        },
+                    )
+                    self.reply_screening_questions(inbox_email, requirement)
+                    continue
                 if is_referral and candidate_email:
                     self.reply_referral_received(inbox_email, candidate_email, requirement["position_title"])
                 elif is_referral:
@@ -2466,27 +3612,33 @@ class AIRecruiterAgent:
                 except Exception as log_exc:
                     print(f"Could not log processing failure: {log_exc}")
 
-    def process_one_graph_message(self, message_id: str, resource_path: str | None = None):
+    def process_one_graph_message(self, message_id: str, resource_path: str | None = None) -> bool:
         self.init_schema()
         if not isinstance(self.inbox, MicrosoftGraphProvider):
             print("Single-message Graph processing is only available with MAIL_PROVIDER=microsoft_graph.")
-            return
+            return False
 
         inbox_email = self.inbox.fetch_message_by_id(message_id, resource_path=resource_path)
         if not inbox_email:
             print(f"Microsoft Graph message not found or unavailable: {message_id}")
-            return
+            return False
 
         try:
             should_mark_seen = self.process_email(inbox_email)
             if should_mark_seen:
                 self.inbox.mark_seen(inbox_email.uid)
                 print(f"Processed Graph message only: {inbox_email.subject} from {inbox_email.sender}")
+                return True
             else:
                 self.inbox.mark_unseen(inbox_email.uid)
                 print(f"Ignored non-recruitment Graph message and left unread: {inbox_email.subject} from {inbox_email.sender}")
+                return True
         except Exception as exc:
             print(f"Failed to process Graph message {message_id}: {exc}")
+            try:
+                self.inbox.mark_unseen(inbox_email.uid)
+            except Exception as mark_exc:
+                print(f"Could not mark failed Graph message unread: {mark_exc}")
             try:
                 self.db.log_email_event(
                     inbox_email,
@@ -2495,6 +3647,7 @@ class AIRecruiterAgent:
                 )
             except Exception as log_exc:
                 print(f"Could not log processing failure: {log_exc}")
+            return False
 
     def run_forever(self, poll_seconds: int):
         self.init_schema()
@@ -2513,6 +3666,306 @@ class AIRecruiterAgent:
         history_id = notification.get("historyId")
         print(f"Gmail trigger received for {email_address} historyId={history_id}")
         self.run_once()
+
+
+def send_interview_request_after_hr_approval(application_id: int):
+    db = RecruiterDatabase()
+    mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
+    try:
+        db.init_schema()
+        application = db.application_with_requirement(application_id)
+        if not application:
+            raise RuntimeError(f"Application not found: {application_id}")
+        recipient = application_candidate_recipient(application)
+        if not recipient:
+            raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
+        db.mark_hr_approved_for_interview(application_id)
+        token = db.ensure_interview_link(application_id)
+        link = candidate_interview_url(token)
+        role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
+        body = recruiter_email_body(
+            "Thanks for confirming the details.",
+            f"We are good to move ahead with the interview{f' for {role}' if role else ''}.",
+            f"You can start it here whenever you are ready: {link}",
+            "Please use a laptop or desktop with a working microphone, and choose a quiet place before starting.",
+        )
+        if hasattr(mailer, "send_direct_email"):
+            mailer.send_direct_email(recipient, "Interview link", body)
+        else:
+            RecruiterMailer().send_direct_email(recipient, "Interview link", body)
+    finally:
+        db.close()
+
+
+def send_interview_link_for_application(application_id: int):
+    db = RecruiterDatabase()
+    mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
+    try:
+        db.init_schema()
+        application = db.application_with_requirement(application_id)
+        if not application:
+            raise RuntimeError(f"Application not found: {application_id}")
+        recipient = application_candidate_recipient(application)
+        if not recipient:
+            raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
+        token = db.ensure_interview_link(application_id)
+        link = candidate_interview_url(token)
+        role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
+        body = recruiter_email_body(
+            "We are good to move ahead with your interview.",
+            f"Role: {role or 'Candidate'}",
+            f"You can start it here whenever you are ready: {link}",
+            "Please use a laptop or desktop with a working microphone, and choose a quiet place before starting.",
+        )
+        mailer.send_direct_email(recipient, "Interview link", body)
+        print(f"Interview link sent for application {application_id}: {link}")
+    finally:
+        db.close()
+
+
+def create_interview_link_for_application(application_id: int, reset: bool = False):
+    db = RecruiterDatabase()
+    try:
+        db.init_schema()
+        application = db.application_with_requirement(application_id)
+        if not application:
+            raise RuntimeError(f"Application not found: {application_id}")
+        token = db.ensure_interview_link(application_id, reset=reset)
+        link = candidate_interview_url(token)
+        print(link)
+    finally:
+        db.close()
+
+
+def interview_report_recommendation(report: dict[str, Any]) -> str:
+    recommendation = str(report.get("recommendation") or "").strip().lower()
+    if recommendation in {"strong_hire", "hire", "hold", "reject"}:
+        return recommendation
+    overall_score = score_number(report.get("overall_score"))
+    if overall_score is not None and overall_score >= 70:
+        return "hire"
+    if overall_score is not None and overall_score < 45:
+        return "reject"
+    return "hold"
+
+
+def interview_feedback_summary(report: dict[str, Any]) -> str:
+    summary = str(report.get("summary") or "").strip()
+    negatives = report.get("negative_points") or []
+    if isinstance(negatives, str):
+        negatives = [negatives]
+    if summary:
+        return summary
+    if negatives:
+        return "Areas noted during the interview: " + "; ".join(str(item) for item in negatives[:3])
+    return "Based on the interview, we are not moving ahead with the next round at this time."
+
+
+def send_final_hr_round_request(application_id: int, approved_by_hr: bool = False):
+    db = RecruiterDatabase()
+    mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
+    try:
+        db.init_schema()
+        application = db.application_with_requirement(application_id)
+        if not application:
+            raise RuntimeError(f"Application not found: {application_id}")
+        recipient = application_candidate_recipient(application)
+        if not recipient:
+            raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
+        role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
+        db.mark_post_interview_outcome(application_id, "hr_round_time_requested")
+        intro = (
+            "Thank you for your patience while we reviewed your interview."
+            if approved_by_hr
+            else "Congratulations, you have cleared the AI technical interview round."
+        )
+        body = recruiter_email_body(
+            intro,
+            f"We would like to move ahead with the final round with our HR Manager{f' for the {role} role' if role else ''}.",
+            "Could you please share two or three date and time slots that work for you?",
+            "Once you share your availability, I will schedule the meeting and send you the Teams link.",
+        )
+        mailer.send_direct_email(recipient, f"Final HR round availability{f' - {role}' if role else ''}", body)
+        print(f"Final HR round request sent for application {application_id}.")
+    finally:
+        db.close()
+
+
+def send_interview_rejection(application_id: int, reason: str | None = None):
+    db = RecruiterDatabase()
+    mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
+    try:
+        db.init_schema()
+        application = db.application_with_requirement(application_id)
+        if not application:
+            raise RuntimeError(f"Application not found: {application_id}")
+        recipient = application_candidate_recipient(application)
+        if not recipient:
+            raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
+        role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
+        db.mark_post_interview_outcome(application_id, "interview_rejected", reason)
+        body = recruiter_email_body(
+            f"Thank you for taking the time to interview with me{f' for the {role} role' if role else ''}.",
+            "I appreciate the effort you put into the conversation and the experience you shared.",
+            "You did well in the discussion, but at the moment we have decided to move forward with another candidate whose profile is a closer match for this opening.",
+            "Thank you again for your interest, and I wish you the very best in your job search.",
+        )
+        mailer.send_direct_email(recipient, f"Interview feedback{f' - {role}' if role else ''}", body)
+        print(f"Interview rejection sent for application {application_id}.")
+    finally:
+        db.close()
+
+
+def notify_post_interview_outcome(application_id: int, report: dict[str, Any]):
+    recommendation = interview_report_recommendation(report)
+    if recommendation in {"strong_hire", "hire"}:
+        send_final_hr_round_request(application_id)
+        return
+
+    if recommendation == "reject":
+        send_interview_rejection(application_id, interview_feedback_summary(report))
+        return
+
+    db = RecruiterDatabase()
+    mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
+    try:
+        db.init_schema()
+        application = db.application_with_requirement(application_id)
+        if not application:
+            raise RuntimeError(f"Application not found: {application_id}")
+        dashboard_url = dashboard_application_url(application_id)
+        role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
+        reason = interview_feedback_summary(report)
+        db.mark_post_interview_outcome(application_id, "interview_on_hold_hr_review", reason)
+        candidate_email = application.get("candidate_email") or application.get("source_email") or "-"
+        mailer.send_direct_email(
+            RECRUITER_HR_ESCALATION_EMAIL,
+            f"Interview review required: {application.get('full_name') or candidate_email}",
+            recruiter_email_body(
+                "Please review this completed AI interview.",
+                f"Candidate: {application.get('full_name') or '-'}",
+                f"Email: {candidate_email}",
+                f"Role: {role or '-'}",
+                f"Recommendation: {recommendation}",
+                f"Overall score: {report.get('overall_score', '-')}",
+                f"Reason: {reason}",
+                f"Application dashboard: {dashboard_url}",
+                "Please approve the candidate for the final HR round or reject the application from the dashboard.",
+            ),
+        )
+        recipient = application_candidate_recipient(application)
+        if recipient:
+            mailer.send_direct_email(
+                recipient,
+                f"Interview update{f' - {role}' if role else ''}",
+                recruiter_email_body(
+                    "Thank you for completing the interview.",
+                    "I am reviewing your interview details and will update you soon with the next step.",
+                ),
+            )
+        print(f"Post-interview hold escalation sent for application {application_id}.")
+    finally:
+        db.close()
+
+
+def send_teams_link_for_application(application_id: int):
+    db = RecruiterDatabase()
+    mailer = MicrosoftGraphProvider()
+    try:
+        db.init_schema()
+        application = db.application_with_requirement(application_id)
+        if not application:
+            raise RuntimeError(f"Application not found: {application_id}")
+        recipient = application_candidate_recipient(application)
+        if not recipient:
+            raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
+
+        scheduled_at = parse_iso_datetime(application.get("interview_scheduled_at"))
+        if not scheduled_at:
+            scheduled_at = parse_interview_datetime_fallback(application.get("interview_availability") or "")
+        if not scheduled_at:
+            raise RuntimeError(
+                f"Application {application_id} does not have a clear interview_scheduled_at or availability."
+            )
+
+        role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
+        subject = f"Interview - {role or 'Candidate'}"
+        end_at = scheduled_at + timedelta(minutes=45)
+        body = recruiter_email_body(
+            "Your interview has been scheduled.",
+            f"Role: {role or 'Candidate'}",
+            f"Time: {recruiter_time_text(scheduled_at)}",
+        )
+        event_id, join_url = mailer.create_teams_calendar_event(
+            recipient,
+            subject,
+            scheduled_at,
+            end_at,
+            body,
+        )
+        if not join_url:
+            join_url = mailer.create_online_meeting(subject, scheduled_at, end_at)
+        if not join_url:
+            raise RuntimeError("Microsoft Graph created no Teams join URL.")
+
+        db.update_interview_schedule(
+            application_id,
+            "interview_scheduled",
+            availability=application.get("interview_availability"),
+            scheduled_at=scheduled_at,
+            teams_event_id=event_id or None,
+            teams_join_url=join_url,
+        )
+        mailer.send_direct_email(
+            recipient,
+            "Microsoft Teams interview link",
+            recruiter_email_body(
+                "Thank you for confirming your availability.",
+                f"Your interview has been scheduled for {recruiter_time_text(scheduled_at)}.",
+                f"Teams link: {join_url}",
+            ),
+        )
+        print(f"Teams link sent for application {application_id}: {join_url}")
+    finally:
+        db.close()
+
+
+def show_teams_interview_info(application_id: int):
+    db = RecruiterDatabase()
+    try:
+        db.init_schema()
+        application = db.application_with_requirement(application_id)
+        if not application:
+            raise RuntimeError(f"Application not found: {application_id}")
+        join_url = application.get("teams_join_url")
+        if not join_url:
+            raise RuntimeError(f"Application {application_id} does not have a Teams join URL yet.")
+
+        scheduled_at = parse_iso_datetime(application.get("interview_scheduled_at"))
+        provider = MicrosoftGraphProvider()
+        meeting = provider.get_online_meeting_by_join_url(join_url)
+        output = {
+            "application_id": application_id,
+            "candidate_email": application.get("candidate_email") or application.get("source_email"),
+            "role": application.get("requirement_position") or application.get("matched_position") or application.get("detected_position"),
+            "scheduled_at": scheduled_at.isoformat() if scheduled_at else application.get("interview_scheduled_at"),
+            "scheduled_at_ist": recruiter_time_text(scheduled_at) if scheduled_at else None,
+            "teams_event_id": application.get("teams_event_id"),
+            "teams_join_url": join_url,
+            "online_meeting": {
+                "id": meeting.get("id") if meeting else None,
+                "subject": meeting.get("subject") if meeting else None,
+                "joinMeetingIdSettings": meeting.get("joinMeetingIdSettings") if meeting else None,
+                "participants": meeting.get("participants") if meeting else None,
+            },
+            "next_step": (
+                "Use this meeting metadata from a Teams calling/meeting bot. "
+                "The terminal voice interviewer cannot directly join Teams as a participant."
+            ),
+        }
+        print(json.dumps(output, indent=2, default=str))
+    finally:
+        db.close()
 
 
 class GmailPushWebhookServer:
@@ -2581,6 +4034,8 @@ class GmailPushWebhookServer:
 class GraphWebhookServer:
     def __init__(self):
         self.lock = Lock()
+        self.retry_lock = Lock()
+        self.pending_retries: set[tuple[str, str]] = set()
 
     def notification_is_for_configured_mailbox(self, notification: dict[str, Any]) -> bool:
         resource = (notification.get("resource") or "").lower()
@@ -2645,6 +4100,7 @@ class GraphWebhookServer:
         if not message_refs:
             return
 
+        failed_refs = []
         with self.lock:
             unique_message_refs = list(dict.fromkeys(message_refs))
             print(f"Microsoft Graph trigger received for {len(unique_message_refs)} message(s)")
@@ -2652,12 +4108,57 @@ class GraphWebhookServer:
             try:
                 agent = AIRecruiterAgent()
                 for message_id, resource_path in unique_message_refs:
-                    agent.process_one_graph_message(message_id, resource_path=resource_path)
+                    processed = agent.process_one_graph_message(message_id, resource_path=resource_path)
+                    if not processed:
+                        failed_refs.append((message_id, resource_path))
             except Exception as exc:
                 print(f"Microsoft Graph notification processing failed: {exc}")
+                failed_refs.extend(unique_message_refs)
             finally:
                 if agent:
                     agent.close()
+
+        for message_id, resource_path in failed_refs:
+            self.schedule_retry(message_id, resource_path)
+
+    def schedule_retry(self, message_id: str, resource_path: str):
+        retry_key = (message_id, resource_path or "")
+        with self.retry_lock:
+            if retry_key in self.pending_retries:
+                print(f"Microsoft Graph retry already scheduled for message {message_id}")
+                return
+            self.pending_retries.add(retry_key)
+
+        print(
+            f"Scheduling Microsoft Graph retry for message {message_id} "
+            f"in {GRAPH_PROCESSING_RETRY_SECONDS} seconds."
+        )
+        Thread(
+            target=self.retry_message_after_delay,
+            args=(message_id, resource_path or ""),
+            daemon=True,
+        ).start()
+
+    def retry_message_after_delay(self, message_id: str, resource_path: str):
+        try:
+            time.sleep(GRAPH_PROCESSING_RETRY_SECONDS)
+            with self.lock:
+                agent = None
+                try:
+                    agent = AIRecruiterAgent()
+                    processed = agent.process_one_graph_message(message_id, resource_path=resource_path)
+                    if processed:
+                        print(f"Retried and processed Microsoft Graph message: {message_id}")
+                    else:
+                        print(f"Microsoft Graph retry failed; message was left unread: {message_id}")
+                except Exception as exc:
+                    print(f"Microsoft Graph retry crashed; message was left unread: {message_id}: {exc}")
+                finally:
+                    if agent:
+                        agent.close()
+        finally:
+            with self.retry_lock:
+                self.pending_retries.discard((message_id, resource_path or ""))
 
     def make_handler(self):
         server = self
@@ -2904,6 +4405,11 @@ def main():
     parser.add_argument("--reset-graph-ngrok", action="store_true", help="Delete old Outlook Inbox subscriptions and register a fresh ngrok subscription")
     parser.add_argument("--list-graph-subscriptions", action="store_true", help="List Microsoft Graph subscriptions for this app")
     parser.add_argument("--delete-graph-subscription", help="Delete a Microsoft Graph subscription by id")
+    parser.add_argument("--create-interview-link", type=int, help="Create/print the browser AI interview link without sending email")
+    parser.add_argument("--reset-interview-link", action="store_true", help="With --create-interview-link, clear previous interview completion and create a fresh token")
+    parser.add_argument("--send-interview-link", type=int, help="Send the browser AI interview link for an application id")
+    parser.add_argument("--send-teams-link", type=int, help="Create/send Teams interview link for an application id")
+    parser.add_argument("--teams-interview-info", type=int, help="Show Teams meeting metadata for a scheduled application")
     parser.add_argument(
         "--poll-seconds",
         type=int,
@@ -2947,6 +4453,22 @@ def main():
 
     if args.delete_graph_subscription:
         delete_graph_subscription(args.delete_graph_subscription)
+        return
+
+    if args.create_interview_link:
+        create_interview_link_for_application(args.create_interview_link, reset=args.reset_interview_link)
+        return
+
+    if args.send_interview_link:
+        send_interview_link_for_application(args.send_interview_link)
+        return
+
+    if args.send_teams_link:
+        send_teams_link_for_application(args.send_teams_link)
+        return
+
+    if args.teams_interview_info:
+        show_teams_interview_info(args.teams_interview_info)
         return
 
     if args.serve_graph_webhook:

@@ -1,0 +1,21 @@
+services:
+  recruiter-postgres:
+    image: postgres:16-alpine
+    container_name: company-policy-recruiter-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: recruitment
+      POSTGRES_USER: recruiter
+      POSTGRES_PASSWORD: recruiter_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - recruiter_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recruiter -d recruitment"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  recruiter_postgres_data:
