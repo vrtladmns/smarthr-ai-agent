@@ -3,6 +3,7 @@ import json
 import mimetypes
 import random
 import re
+import time
 from datetime import datetime
 from decimal import Decimal
 from html import escape
@@ -15,7 +16,12 @@ from llm_factory import make_chat_model
 from recruiter_agent import (
     RecruiterDatabase,
     candidate_interview_url,
+    hold_candidate_after_hr_round,
+    mark_due_final_hr_rounds_pending,
     notify_post_interview_outcome,
+    reject_candidate_after_hr_round,
+    request_hr_round_reschedule,
+    select_candidate_after_hr_round,
     send_final_hr_round_request,
     send_interview_link_for_application,
     send_interview_rejection,
@@ -27,6 +33,7 @@ from recruiter_agent import (
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8090
 WEB_INTERVIEW_SESSIONS: dict[str, dict] = {}
+FINAL_HR_CHECK_SECONDS = 600
 
 
 def notify_post_interview_outcome_async(application_id: int, report: dict):
@@ -35,6 +42,20 @@ def notify_post_interview_outcome_async(application_id: int, report: dict):
             notify_post_interview_outcome(application_id, report)
         except Exception as exc:
             print(f"Post-interview notification failed for application {application_id}: {exc}")
+
+    Thread(target=run, daemon=True).start()
+
+
+def start_final_hr_round_monitor():
+    def run():
+        while True:
+            try:
+                marked = mark_due_final_hr_rounds_pending()
+                if marked:
+                    print(f"Marked {marked} final HR round(s) pending decision.")
+            except Exception as exc:
+                print(f"Final HR round monitor failed: {exc}")
+            time.sleep(FINAL_HR_CHECK_SECONDS)
 
     Thread(target=run, daemon=True).start()
 
@@ -309,6 +330,30 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
                 if application_id is None:
                     raise RuntimeError("Application id is required.")
                 send_interview_rejection(application_id, "After HR review of the interview, we will not be moving ahead with the next round at this time.")
+                self.redirect(f"/applications/{application_id}")
+            elif parsed.path == "/applications/final-select":
+                application_id = parse_int(form.get("id"))
+                if application_id is None:
+                    raise RuntimeError("Application id is required.")
+                select_candidate_after_hr_round(application_id)
+                self.redirect(f"/applications/{application_id}")
+            elif parsed.path == "/applications/final-reject":
+                application_id = parse_int(form.get("id"))
+                if application_id is None:
+                    raise RuntimeError("Application id is required.")
+                reject_candidate_after_hr_round(application_id)
+                self.redirect(f"/applications/{application_id}")
+            elif parsed.path == "/applications/final-hold":
+                application_id = parse_int(form.get("id"))
+                if application_id is None:
+                    raise RuntimeError("Application id is required.")
+                hold_candidate_after_hr_round(application_id)
+                self.redirect(f"/applications/{application_id}")
+            elif parsed.path == "/applications/final-reschedule":
+                application_id = parse_int(form.get("id"))
+                if application_id is None:
+                    raise RuntimeError("Application id is required.")
+                request_hr_round_reschedule(application_id)
                 self.redirect(f"/applications/{application_id}")
             elif parsed.path == "/applications/send-interview-link":
                 application_id = parse_int(form.get("id"))
@@ -1509,7 +1554,7 @@ Previous transcript:
         hr_approve_form = ""
         if (row["application_status"] or "").lower() == "hr_escalated":
             hr_approve_form = f"""
-            <form method="post" action="/applications/hr-approve" class="inline-form">
+            <form method="post" action="/applications/hr-approve" class="inline-form" onsubmit="return confirm('Approve this candidate and send the interview email?');">
                 <input type="hidden" name="id" value="{html_escape(application_id)}">
                 <button type="submit">Approve For Interview</button>
             </form>
@@ -1517,25 +1562,45 @@ Previous transcript:
         post_interview_review_forms = ""
         if (row["application_status"] or "").lower() == "interview_on_hold_hr_review":
             post_interview_review_forms = f"""
-            <form method="post" action="/applications/post-interview-approve" class="inline-form">
+            <form method="post" action="/applications/post-interview-approve" class="inline-form" onsubmit="return confirm('Approve this candidate for the final HR round and email the candidate?');">
                 <input type="hidden" name="id" value="{html_escape(application_id)}">
                 <button type="submit">Approve For HR Round</button>
             </form>
-            <form method="post" action="/applications/post-interview-reject" class="inline-form">
+            <form method="post" action="/applications/post-interview-reject" class="inline-form" onsubmit="return confirm('Reject this candidate and send the rejection email?');">
                 <input type="hidden" name="id" value="{html_escape(application_id)}">
                 <button type="submit" class="danger">Reject Candidate</button>
+            </form>
+            """
+        final_hr_decision_forms = ""
+        if (row["application_status"] or "").lower() == "final_hr_round_completed_pending_decision":
+            final_hr_decision_forms = f"""
+            <form method="post" action="/applications/final-select" class="inline-form" onsubmit="return confirm('Select this candidate and send the onboarding documents email?');">
+                <input type="hidden" name="id" value="{html_escape(application_id)}">
+                <button type="submit">Select Candidate</button>
+            </form>
+            <form method="post" action="/applications/final-reject" class="inline-form" onsubmit="return confirm('Reject this candidate after the final HR round and send the rejection email?');">
+                <input type="hidden" name="id" value="{html_escape(application_id)}">
+                <button type="submit" class="danger">Reject Candidate</button>
+            </form>
+            <form method="post" action="/applications/final-hold" class="inline-form" onsubmit="return confirm('Put this candidate on hold and send the update email?');">
+                <input type="hidden" name="id" value="{html_escape(application_id)}">
+                <button type="submit" class="secondary">Put On Hold</button>
+            </form>
+            <form method="post" action="/applications/final-reschedule" class="inline-form" onsubmit="return confirm('Ask this candidate to reschedule the final HR round?');">
+                <input type="hidden" name="id" value="{html_escape(application_id)}">
+                <button type="submit" class="secondary">Reschedule HR Round</button>
             </form>
             """
         send_teams_form = ""
         if row.get("interview_scheduled_at") and not row.get("teams_join_url"):
             send_teams_form = f"""
-            <form method="post" action="/applications/send-teams-link" class="inline-form">
+            <form method="post" action="/applications/send-teams-link" class="inline-form" onsubmit="return confirm('Create or send the Teams meeting link to this candidate?');">
                 <input type="hidden" name="id" value="{html_escape(application_id)}">
                 <button type="submit">Send Teams Link</button>
             </form>
             """
         send_interview_form = f"""
-            <form method="post" action="/applications/send-interview-link" class="inline-form">
+            <form method="post" action="/applications/send-interview-link" class="inline-form" onsubmit="return confirm('Send the AI interview link to this candidate?');">
                 <input type="hidden" name="id" value="{html_escape(application_id)}">
                 <button type="submit">Send Interview Link</button>
             </form>
@@ -1550,6 +1615,7 @@ Previous transcript:
                     <a class="link-button" href="/applications/{html_escape(application_id)}/cv">Download CV</a>
                     {hr_approve_form}
                     {post_interview_review_forms}
+                    {final_hr_decision_forms}
                     {send_interview_form}
                     {send_teams_form}
                 </div>
@@ -1850,7 +1916,13 @@ Previous transcript:
     let flowVersion = 0;
     let interviewClosed = false;
     let clientTurnId = 0;
+    let audioContext = null;
+    let audioMonitorId = null;
+    let lastSpeechResultAt = 0;
+    let lastMicActivityAt = 0;
     const ANSWER_SILENCE_MS = 2800;
+    const LONG_ANSWER_SILENCE_MS = 5200;
+    const MIC_ACTIVITY_THRESHOLD = 0.018;
 
     const questionEl = document.getElementById('question');
     const answerEl = document.getElementById('answer');
@@ -1930,6 +2002,72 @@ Previous transcript:
       }}
     }}
 
+    function answerWordCount() {{
+      return answerEl.value.trim().split(/\\s+/).filter(Boolean).length;
+    }}
+
+    function currentSilenceMs() {{
+      const now = Date.now();
+      const lastActivity = Math.max(lastSpeechResultAt || 0, lastMicActivityAt || 0);
+      return lastActivity ? now - lastActivity : 0;
+    }}
+
+    function answerSilenceThresholdMs() {{
+      return answerWordCount() >= 45 ? LONG_ANSWER_SILENCE_MS : ANSWER_SILENCE_MS;
+    }}
+
+    function scheduleAutoAdvance() {{
+      clearAutoAdvanceTimer();
+      autoAdvanceTimer = window.setTimeout(() => {{
+        const words = answerWordCount();
+        const threshold = answerSilenceThresholdMs();
+        const silentFor = currentSilenceMs();
+        if (
+          isRecording &&
+          !isSubmitting &&
+          !interviewClosed &&
+          silentFor >= threshold &&
+          (words >= 3 || (interviewPhase === 'greeting' && words >= 1))
+        ) {{
+          stopListeningAndAdvance();
+          return;
+        }}
+        if (isRecording && !isSubmitting && !interviewClosed) {{
+          scheduleAutoAdvance();
+        }}
+      }}, Math.max(700, Math.min(answerSilenceThresholdMs(), 1200)));
+    }}
+
+    function startAudioActivityMonitor() {{
+      if (!mediaStream || audioMonitorId) return;
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContext) return;
+      try {{
+        audioContext = audioContext || new AudioContext();
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 512;
+        source.connect(analyser);
+        const data = new Uint8Array(analyser.fftSize);
+        const tick = () => {{
+          analyser.getByteTimeDomainData(data);
+          let sum = 0;
+          for (let i = 0; i < data.length; i++) {{
+            const value = (data[i] - 128) / 128;
+            sum += value * value;
+          }}
+          const rms = Math.sqrt(sum / data.length);
+          if (rms >= MIC_ACTIVITY_THRESHOLD) {{
+            lastMicActivityAt = Date.now();
+          }}
+          audioMonitorId = window.requestAnimationFrame(tick);
+        }};
+        tick();
+      }} catch (error) {{
+        audioMonitorId = null;
+      }}
+    }}
+
     function processingNudge() {{
       const options = [
         'Give me a moment, I am reviewing that.',
@@ -1952,6 +2090,8 @@ Previous transcript:
 
     function closeInterviewScreen() {{
       if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+      if (audioMonitorId) window.cancelAnimationFrame(audioMonitorId);
+      audioMonitorId = null;
       if (interviewBox) interviewBox.classList.add('hidden');
       setCallStatus('Completed', false);
       setMessage('Interview completed. Thank you for your time today. I will get back to you with feedback soon.');
@@ -1985,6 +2125,7 @@ Previous transcript:
         candidateVideo.srcObject = mediaStream;
         permissionOverlay.classList.add('hidden');
       }}
+      if (hasAudio) startAudioActivityMonitor();
       return hasAudio;
     }}
 
@@ -1999,6 +2140,7 @@ Previous transcript:
       rec.interimResults = true;
       rec.continuous = true;
       rec.onresult = (event) => {{
+        lastSpeechResultAt = Date.now();
         let interim = '';
         for (let i = event.resultIndex; i < event.results.length; i++) {{
           const text = event.results[i][0].transcript;
@@ -2010,23 +2152,32 @@ Previous transcript:
           speechStarted = true;
           nextBtn.disabled = false;
           setMessage('Listening. Please continue naturally.');
-          clearAutoAdvanceTimer();
-          autoAdvanceTimer = window.setTimeout(() => {{
-            const words = answerEl.value.trim().split(/\\s+/).filter(Boolean).length;
-            if (isRecording && (words >= 3 || (interviewPhase === 'greeting' && words >= 1))) {{
-              stopListeningAndAdvance();
-            }}
-          }}, ANSWER_SILENCE_MS);
+          scheduleAutoAdvance();
         }}
       }};
       rec.onerror = (event) => {{
+        const reason = event && event.error ? event.error : 'unknown error';
+        if (isRecording && !isSubmitting && !interviewClosed && reason === 'no-speech') {{
+          setMessage('Listening. Please continue naturally.');
+          return;
+        }}
         isRecording = false;
         listenBtn.textContent = 'Answer';
         nextBtn.disabled = false;
-        const reason = event && event.error ? event.error : 'unknown error';
         setMessage(`Speech recognition issue: ${{reason}}. You can type the answer and continue.`, true);
       }};
       rec.onend = () => {{
+        if (isRecording && !isSubmitting && !interviewClosed) {{
+          window.setTimeout(() => {{
+            if (isRecording && !isSubmitting && !interviewClosed) {{
+              try {{
+                recognition.start();
+                setMessage('Listening. Please continue naturally.');
+              }} catch (error) {{}}
+            }}
+          }}, 150);
+          return;
+        }}
         isRecording = false;
         listenBtn.textContent = 'Answer';
         aiStatus.textContent = 'Ready';
@@ -2106,8 +2257,12 @@ Previous transcript:
       listenBtn.textContent = 'Stop Recording';
       nextBtn.disabled = true;
       isRecording = true;
+      const now = Date.now();
+      lastSpeechResultAt = now;
+      lastMicActivityAt = now;
       aiStatus.textContent = 'Listening';
       setMessage('Listening. Please answer now.');
+      scheduleAutoAdvance();
       try {{
         recognition.start();
       }} catch (error) {{
@@ -2360,6 +2515,10 @@ Previous transcript:
             "hr_round_time_requested",
             "interview_on_hold_hr_review",
             "interview_rejected",
+            "final_hr_round_completed_pending_decision",
+            "selected_documents_requested",
+            "rejected_after_hr_round",
+            "hold_after_hr_round",
             "no_open_requirement",
             "reviewed",
             "shortlisted",
@@ -2862,6 +3021,7 @@ code {
 
 
 def run(host: str, port: int):
+    start_final_hr_round_monitor()
     server = ThreadingHTTPServer((host, port), RecruiterDashboardHandler)
     print(f"Recruiter dashboard running at http://{host}:{port}")
     try:

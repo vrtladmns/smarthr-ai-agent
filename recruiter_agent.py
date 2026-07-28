@@ -611,12 +611,43 @@ def recruiter_email_body(*paragraphs: str) -> str:
     return "\r\n\r\n".join(["Hi,", *clean_paragraphs])
 
 
+def linkify_html_text(value: str) -> str:
+    escaped = html_escape(value)
+
+    def link_url(match: re.Match) -> str:
+        url = match.group(0)
+        trailing = ""
+        while url and url[-1] in ".,);]":
+            trailing = url[-1] + trailing
+            url = url[:-1]
+        href = url
+        return (
+            f'<a href="{href}" style="color:#0563c1;text-decoration:underline;">{url}</a>'
+            f"{trailing}"
+        )
+
+    escaped = re.sub(r"https?://[^\s<]+", link_url, escaped)
+
+    def link_email(match: re.Match) -> str:
+        email_address = match.group(0)
+        return (
+            f'<a href="mailto:{email_address}" style="color:#0563c1;text-decoration:underline;">'
+            f"{email_address}</a>"
+        )
+
+    return re.sub(
+        r"(?<![:/>])\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+        link_email,
+        escaped,
+    )
+
+
 def email_body_to_html(body: str) -> str:
     paragraphs = [part.strip() for part in re.split(r"\r?\n\r?\n", body) if part.strip()]
     html_parts = []
     for paragraph in paragraphs:
         normalized = paragraph.replace("\r\n", "\n").replace("\r", "\n")
-        html_parts.append(f"<p>{html_escape(normalized).replace(chr(10), '<br>')}</p>")
+        html_parts.append(f"<p>{linkify_html_text(normalized).replace(chr(10), '<br>')}</p>")
     return "".join(html_parts)
 
 
@@ -634,7 +665,11 @@ def recruiter_html_signature() -> str:
         return ""
     signoff = html_escape(RECRUITER_SIGNATURE_SIGNOFF.strip())
     name = html_escape(RECRUITER_SIGNATURE_NAME.strip())
-    parts = [f"<p>{signoff}</p>", f"<p>{name}"]
+    parts = [
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;">',
+        f'<tr><td style="font-family:Arial,sans-serif;font-size:14px;line-height:20px;color:#111827;padding:0 0 12px 0;">{signoff}</td></tr>',
+        f'<tr><td style="font-family:Arial,sans-serif;font-size:14px;line-height:20px;color:#111827;padding:0;">{name}',
+    ]
     if RECRUITER_SIGNATURE_COMPANY:
         company = html_escape(RECRUITER_SIGNATURE_COMPANY.strip())
         if RECRUITER_SIGNATURE_COMPANY_URL:
@@ -651,11 +686,18 @@ def recruiter_html_signature() -> str:
             '<br><span style="font-size:15px;">&#9993;&#65039;</span> '
             f'<a href="mailto:{email_address}" style="color:#111827;text-decoration:none;">{email_address}</a>'
         )
-    parts.append("</p>")
+    parts.append("</td></tr>")
     if RECRUITER_SIGNATURE_LOGO_URL:
         logo_url = html_escape(RECRUITER_SIGNATURE_LOGO_URL.strip(), quote=True)
         alt = html_escape(RECRUITER_SIGNATURE_COMPANY.strip() or "Company logo", quote=True)
-        parts.append(f'<p><img src="{logo_url}" alt="{alt}" width="180" style="width:180px;max-width:180px;height:auto;border:0;display:block;"></p>')
+        parts.append(
+            '<tr><td style="padding:8px 0 0 0;">'
+            f'<a href="{html_escape(RECRUITER_SIGNATURE_COMPANY_URL.strip() or "#", quote=True)}" style="text-decoration:none;border:0;">'
+            f'<img src="{logo_url}" alt="{alt}" width="180" border="0" '
+            'style="display:block;width:180px;max-width:180px;height:auto;border:0;outline:none;text-decoration:none;-ms-interpolation-mode:bicubic;">'
+            "</a></td></tr>"
+        )
+    parts.append("</table>")
     return "".join(parts)
 
 
@@ -1501,6 +1543,17 @@ class RecruiterDatabase:
             WHERE id = %s
             """,
             (status, reason, status, application_id),
+        )
+
+    def scheduled_hr_rounds_for_decision_check(self) -> list[dict[str, Any]]:
+        return self.rows(
+            """
+            SELECT id, interview_scheduled_at
+            FROM recruiter_applications
+            WHERE application_status = %s
+              AND interview_scheduled_at IS NOT NULL
+            """,
+            ("interview_scheduled",),
         )
 
     def ensure_interview_link(self, application_id: int, reset: bool = False) -> str:
@@ -2354,6 +2407,21 @@ class MicrosoftGraphProvider:
         meetings = data.get("value") or []
         return meetings[0] if meetings else None
 
+    def cancel_calendar_event(self, event_id: str, comment: str = "This interview has been rescheduled.") -> bool:
+        if not event_id:
+            return False
+        try:
+            self.request(
+                "POST",
+                f"/users/{self.mailbox}/events/{quote(event_id, safe='')}/cancel",
+                json={"Comment": comment},
+            )
+            return True
+        except RuntimeError as exc:
+            if "404" in str(exc) or "ErrorItemNotFound" in str(exc):
+                return False
+            raise
+
     def create_teams_calendar_event(
         self,
         recipient_email: str,
@@ -2490,13 +2558,14 @@ class RecruiterMailer:
         if missing:
             raise RuntimeError(f"Missing SMTP settings: {', '.join(missing)}")
 
-        if RECRUITER_APPEND_SIGNATURE:
-            body = f"{body}\r\n\r\n{recruiter_plain_signature()}"
+        plain_body = f"{body}\r\n\r\n{recruiter_plain_signature()}" if RECRUITER_APPEND_SIGNATURE else body
+        html_body = append_signature_if_needed(email_body_to_html(body))
         message = EmailMessage()
         message["From"] = RECRUITER_FROM_EMAIL
         message["To"] = to_email
         message["Subject"] = subject
-        message.set_content(body)
+        message.set_content(plain_body)
+        message.add_alternative(html_body, subtype="html")
         with smtplib.SMTP(RECRUITER_SMTP_HOST, RECRUITER_SMTP_PORT) as smtp:
             smtp.starttls()
             smtp.login(RECRUITER_EMAIL, RECRUITER_EMAIL_PASSWORD)
@@ -2532,9 +2601,10 @@ class RecruiterMailer:
                 if value
             )
             message["References"] = references
-        if RECRUITER_APPEND_SIGNATURE:
-            body = f"{body}\r\n\r\n{recruiter_plain_signature()}"
-        message.set_content(body)
+        plain_body = f"{body}\r\n\r\n{recruiter_plain_signature()}" if RECRUITER_APPEND_SIGNATURE else body
+        html_body = append_signature_if_needed(email_body_to_html(body))
+        message.set_content(plain_body)
+        message.add_alternative(html_body, subtype="html")
 
         with smtplib.SMTP(RECRUITER_SMTP_HOST, RECRUITER_SMTP_PORT) as smtp:
             smtp.starttls()
@@ -3098,6 +3168,7 @@ class AIRecruiterAgent:
         )
         teams_event_id = ""
         teams_join_url = ""
+        old_teams_event_id = application.get("teams_event_id")
         try:
             if isinstance(self.mailer, MicrosoftGraphProvider):
                 teams_event_id, teams_join_url = self.mailer.create_teams_calendar_event(
@@ -3109,6 +3180,21 @@ class AIRecruiterAgent:
                 )
                 if not teams_join_url:
                     teams_join_url = self.mailer.create_online_meeting(subject, scheduled_at, end_at)
+                if teams_event_id and old_teams_event_id and old_teams_event_id != teams_event_id:
+                    cancelled = self.mailer.cancel_calendar_event(
+                        old_teams_event_id,
+                        f"This interview has been rescheduled to {recruiter_time_text(scheduled_at)}.",
+                    )
+                    self.db.log_email_event(
+                        inbox_email,
+                        "previous_teams_meeting_cancelled" if cancelled else "previous_teams_meeting_not_found",
+                        {
+                            "application_id": application["id"],
+                            "old_teams_event_id": old_teams_event_id,
+                            "new_teams_event_id": teams_event_id,
+                            "scheduled_at": scheduled_at.isoformat(),
+                        },
+                    )
         except Exception as exc:
             self.db.log_email_event(
                 inbox_email,
@@ -3907,6 +3993,16 @@ def send_teams_link_for_application(application_id: int):
             join_url = mailer.create_online_meeting(subject, scheduled_at, end_at)
         if not join_url:
             raise RuntimeError("Microsoft Graph created no Teams join URL.")
+        old_event_id = application.get("teams_event_id")
+        if event_id and old_event_id and old_event_id != event_id:
+            cancelled = mailer.cancel_calendar_event(
+                old_event_id,
+                f"This interview has been rescheduled to {recruiter_time_text(scheduled_at)}.",
+            )
+            print(
+                "Previous Teams calendar event "
+                f"{'cancelled' if cancelled else 'not found'} for application {application_id}: {old_event_id}"
+            )
 
         db.update_interview_schedule(
             application_id,
@@ -3926,6 +4022,174 @@ def send_teams_link_for_application(application_id: int):
             ),
         )
         print(f"Teams link sent for application {application_id}: {join_url}")
+    finally:
+        db.close()
+
+
+def final_hr_round_due(application: dict[str, Any], grace_minutes: int = 60) -> bool:
+    scheduled_at = parse_iso_datetime(application.get("interview_scheduled_at"))
+    if not scheduled_at and isinstance(application.get("interview_scheduled_at"), datetime):
+        scheduled_at = application.get("interview_scheduled_at")
+    if not scheduled_at:
+        return False
+    return as_recruiter_time(scheduled_at) + timedelta(minutes=grace_minutes) <= recruiter_now()
+
+
+def mark_due_final_hr_rounds_pending(grace_minutes: int = 60) -> int:
+    db = RecruiterDatabase()
+    mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
+    marked = 0
+    try:
+        db.init_schema()
+        for row in db.scheduled_hr_rounds_for_decision_check():
+            if not final_hr_round_due(row, grace_minutes=grace_minutes):
+                continue
+            application = db.application_with_requirement(row["id"])
+            if not application:
+                continue
+            dashboard_url = dashboard_application_url(application["id"])
+            role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
+            scheduled_at = parse_iso_datetime(application.get("interview_scheduled_at"))
+            scheduled_text = recruiter_time_text(scheduled_at) if scheduled_at else str(application.get("interview_scheduled_at") or "-")
+            db.mark_post_interview_outcome(
+                application["id"],
+                "final_hr_round_completed_pending_decision",
+                "Final HR Manager round is complete; HR decision is pending.",
+            )
+            mailer.send_direct_email(
+                RECRUITER_HR_ESCALATION_EMAIL,
+                f"Final HR decision required: {application.get('full_name') or application.get('candidate_email') or application['id']}",
+                recruiter_email_body(
+                    "The final HR Manager round appears to be completed.",
+                    f"Candidate: {application.get('full_name') or '-'}",
+                    f"Role: {role or '-'}",
+                    f"Scheduled time: {scheduled_text}",
+                    f"Application dashboard: {dashboard_url}",
+                    "Please open the dashboard and select, reject, hold, or reschedule the candidate.",
+                ),
+            )
+            marked += 1
+    finally:
+        db.close()
+    return marked
+
+
+def select_candidate_after_hr_round(application_id: int):
+    db = RecruiterDatabase()
+    mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
+    try:
+        db.init_schema()
+        application = db.application_with_requirement(application_id)
+        if not application:
+            raise RuntimeError(f"Application not found: {application_id}")
+        recipient = application_candidate_recipient(application)
+        if not recipient:
+            raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
+        role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
+        db.mark_post_interview_outcome(application_id, "selected_documents_requested")
+        mailer.send_direct_email(
+            recipient,
+            f"Selection update{f' - {role}' if role else ''}",
+            recruiter_email_body(
+                "Congratulations, you have been selected for the next onboarding step.",
+                f"We are happy to move ahead with your profile{f' for the {role} role' if role else ''}.",
+                "Please share the required joining documents so I can proceed with the onboarding formalities.",
+                "Documents required: PAN card, Aadhaar card, address proof, latest salary slips, relieving letter if applicable, bank details, and emergency contact details.",
+            ),
+        )
+        print(f"Selection email sent for application {application_id}.")
+    finally:
+        db.close()
+
+
+def reject_candidate_after_hr_round(application_id: int):
+    db = RecruiterDatabase()
+    mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
+    try:
+        db.init_schema()
+        application = db.application_with_requirement(application_id)
+        if not application:
+            raise RuntimeError(f"Application not found: {application_id}")
+        recipient = application_candidate_recipient(application)
+        if not recipient:
+            raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
+        role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
+        db.mark_post_interview_outcome(
+            application_id,
+            "rejected_after_hr_round",
+            "Rejected after final HR Manager round.",
+        )
+        mailer.send_direct_email(
+            recipient,
+            f"Interview update{f' - {role}' if role else ''}",
+            recruiter_email_body(
+                f"Thank you for taking the time to speak with us{f' for the {role} role' if role else ''}.",
+                "You did well in the discussion, but at the moment we have decided to move forward with another candidate whose profile is a closer match for this opening.",
+                "I appreciate your time and interest, and I wish you the very best in your job search.",
+            ),
+        )
+        print(f"Final HR rejection email sent for application {application_id}.")
+    finally:
+        db.close()
+
+
+def hold_candidate_after_hr_round(application_id: int):
+    db = RecruiterDatabase()
+    mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
+    try:
+        db.init_schema()
+        application = db.application_with_requirement(application_id)
+        if not application:
+            raise RuntimeError(f"Application not found: {application_id}")
+        recipient = application_candidate_recipient(application)
+        if not recipient:
+            raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
+        role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
+        db.mark_post_interview_outcome(
+            application_id,
+            "hold_after_hr_round",
+            "Candidate is on hold after final HR Manager round.",
+        )
+        mailer.send_direct_email(
+            recipient,
+            f"Interview update{f' - {role}' if role else ''}",
+            recruiter_email_body(
+                "Thank you for your time in the final discussion.",
+                "We are still reviewing internally and will update you soon with the next step.",
+            ),
+        )
+        print(f"Final HR hold email sent for application {application_id}.")
+    finally:
+        db.close()
+
+
+def request_hr_round_reschedule(application_id: int):
+    db = RecruiterDatabase()
+    mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
+    try:
+        db.init_schema()
+        application = db.application_with_requirement(application_id)
+        if not application:
+            raise RuntimeError(f"Application not found: {application_id}")
+        recipient = application_candidate_recipient(application)
+        if not recipient:
+            raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
+        role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
+        db.mark_post_interview_outcome(
+            application_id,
+            "hr_round_time_requested",
+            "Final HR round reschedule requested.",
+        )
+        mailer.send_direct_email(
+            recipient,
+            f"Reschedule final HR round{f' - {role}' if role else ''}",
+            recruiter_email_body(
+                "We need to reschedule your final HR Manager round.",
+                "Could you please share two or three date and time slots that work for you?",
+                "Once you share your availability, I will schedule the meeting and send you the Teams link.",
+            ),
+        )
+        print(f"Final HR reschedule request sent for application {application_id}.")
     finally:
         db.close()
 
@@ -4410,6 +4674,7 @@ def main():
     parser.add_argument("--send-interview-link", type=int, help="Send the browser AI interview link for an application id")
     parser.add_argument("--send-teams-link", type=int, help="Create/send Teams interview link for an application id")
     parser.add_argument("--teams-interview-info", type=int, help="Show Teams meeting metadata for a scheduled application")
+    parser.add_argument("--mark-due-hr-rounds", action="store_true", help="Mark completed final HR rounds pending HR decision and notify HR")
     parser.add_argument(
         "--poll-seconds",
         type=int,
@@ -4469,6 +4734,11 @@ def main():
 
     if args.teams_interview_info:
         show_teams_interview_info(args.teams_interview_info)
+        return
+
+    if args.mark_due_hr_rounds:
+        marked = mark_due_final_hr_rounds_pending()
+        print(f"Marked {marked} final HR round(s) pending decision.")
         return
 
     if args.serve_graph_webhook:
