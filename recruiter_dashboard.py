@@ -987,6 +987,7 @@ Previous transcript:
                 LIMIT 6
                 """
             )
+            notifications = self.pending_operator_notifications(database)
         finally:
             database.close()
 
@@ -1039,8 +1040,11 @@ Previous transcript:
             for row in recent
         ) or '<tr><td colspan="7" class="empty">No applications processed yet.</td></tr>'
 
+        notification_html = self.render_notifications_panel(notifications)
+
         return f"""
         <section class="metrics">{card_html}</section>
+        {notification_html}
         <section class="grid-two">
             <div class="panel">
                 <div class="panel-head">
@@ -1073,6 +1077,116 @@ Previous transcript:
                 <thead><tr><th>Candidate</th><th>Role</th><th>Status</th><th>ATS</th><th>JD</th><th>AI Summary</th><th>Created</th></tr></thead>
                 <tbody>{recent_html}</tbody>
             </table>
+        </section>
+        """
+
+    def pending_operator_notifications(self, database: DashboardDB) -> list[dict]:
+        tasks = [
+            {
+                "status": "hr_escalated",
+                "title": "HR approval required",
+                "detail": "Screening needs HR review before moving forward.",
+                "action": "Review",
+            },
+            {
+                "status": "interview_on_hold_hr_review",
+                "title": "AI interview on hold",
+                "detail": "AI interview report needs HR approval or rejection.",
+                "action": "Decide",
+            },
+            {
+                "status": "final_hr_round_completed_pending_decision",
+                "title": "Final HR decision pending",
+                "detail": "Final HR round is complete. Select, reject, hold, or reschedule.",
+                "action": "Decide",
+            },
+            {
+                "status": "interview_availability_received",
+                "title": "Teams link pending",
+                "detail": "Candidate shared timing but no Teams link has been sent yet.",
+                "action": "Schedule",
+            },
+            {
+                "status": "hr_round_time_requested",
+                "title": "Waiting for HR round availability",
+                "detail": "Candidate needs to share final HR round slots.",
+                "action": "Track",
+            },
+            {
+                "status": "screening_negotiation",
+                "title": "Screening negotiation active",
+                "detail": "Salary or joining details need follow-up.",
+                "action": "Review",
+            },
+        ]
+        notifications = []
+        for task in tasks:
+            row = database.one(
+                """
+                SELECT COUNT(*) AS count
+                FROM recruiter_applications
+                WHERE application_status = %s
+                """,
+                (task["status"],),
+            )
+            count = int(row["count"] or 0) if row else 0
+            if count:
+                notifications.append({**task, "count": count, "href": f"/applications?status={task['status']}"})
+        return notifications
+
+    def pending_operator_count(self) -> int:
+        database = self.db()
+        try:
+            row = database.one(
+                """
+                SELECT COUNT(*) AS count
+                FROM recruiter_applications
+                WHERE application_status IN (
+                    'hr_escalated',
+                    'interview_on_hold_hr_review',
+                    'final_hr_round_completed_pending_decision',
+                    'interview_availability_received',
+                    'hr_round_time_requested',
+                    'screening_negotiation'
+                )
+                """
+            )
+            return int(row["count"] or 0) if row else 0
+        except Exception:
+            return 0
+        finally:
+            database.close()
+
+    def render_notifications_panel(self, notifications: list[dict]) -> str:
+        if not notifications:
+            return """
+            <section class="panel notice-panel notice-panel-ok">
+                <div class="panel-head">
+                    <h2>Operator Notifications</h2>
+                    <span>All clear</span>
+                </div>
+                <p class="muted">No pending recruiter actions right now.</p>
+            </section>
+            """
+        items = "".join(
+            f"""
+            <a class="notification-card" href="{html_escape(item["href"])}">
+                <strong>{html_escape(item["title"])}</strong>
+                <span>{html_escape(item["count"])} pending</span>
+                <small>{html_escape(item["detail"])}</small>
+                <em>{html_escape(item["action"])}</em>
+            </a>
+            """
+            for item in notifications
+        )
+        total = sum(int(item["count"]) for item in notifications)
+        return f"""
+        <section class="panel notice-panel">
+            <div class="panel-head">
+                <h2>Operator Notifications</h2>
+                <span>{html_escape(total)} pending</span>
+            </div>
+            <div class="notification-grid">{items}</div>
         </section>
         """
 
@@ -1216,18 +1330,29 @@ Previous transcript:
 
     def render_applications(self, query: dict[str, list[str]]) -> str:
         q = (query.get("q", [""])[0] or "").strip()
-        params: tuple = ()
-        where = ""
+        status_filter = (query.get("status", [""])[0] or "").strip()
+        conditions = []
+        params_list = []
         if q:
-            where = """
-            WHERE LOWER(COALESCE(rc.full_name, '')) LIKE %s
-               OR LOWER(COALESCE(ra.candidate_email, '')) LIKE %s
-               OR LOWER(COALESCE(ra.detected_position, '')) LIKE %s
-               OR LOWER(COALESCE(ra.matched_position, '')) LIKE %s
-               OR LOWER(COALESCE(ra.application_status, '')) LIKE %s
-            """
+            conditions.append(
+                """
+                (
+                    LOWER(COALESCE(rc.full_name, '')) LIKE %s
+                    OR LOWER(COALESCE(ra.candidate_email, '')) LIKE %s
+                    OR LOWER(COALESCE(ra.source_email, '')) LIKE %s
+                    OR LOWER(COALESCE(ra.detected_position, '')) LIKE %s
+                    OR LOWER(COALESCE(ra.matched_position, '')) LIKE %s
+                    OR LOWER(COALESCE(ra.application_status, '')) LIKE %s
+                )
+                """
+            )
             term = f"%{q.lower()}%"
-            params = (term, term, term, term, term)
+            params_list.extend([term, term, term, term, term, term])
+        if status_filter:
+            conditions.append("ra.application_status = %s")
+            params_list.append(status_filter)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params = tuple(params_list)
 
         database = self.db()
         try:
@@ -1276,8 +1401,10 @@ Previous transcript:
             for row in rows
         ) or '<tr><td colspan="9" class="empty">No applications found.</td></tr>'
 
+        filter_label = f'<p class="filter-note">Filtered by status: {status_badge(status_filter)} <a href="/applications">Clear</a></p>' if status_filter else ""
         return f"""
         {self.search_form("/applications", q, "Search application, role, email, or status")}
+        {filter_label}
         <section class="panel">
             <div class="panel-head"><h2>Applications</h2><span>{len(rows)} shown</span></div>
             <table>
@@ -2598,6 +2725,8 @@ Previous transcript:
         """
 
     def render_page(self, active: str, content: str):
+        pending_count = self.pending_operator_count()
+        overview_label = f"Overview ({pending_count})" if pending_count else "Overview"
         body = f"""
         <!doctype html>
         <html lang="en">
@@ -2614,7 +2743,7 @@ Previous transcript:
                     <div><strong>Recruiter</strong><small>AI mailbox dashboard</small></div>
                 </div>
                 <nav>
-                    {self.nav_link("/", "Overview", active == "overview")}
+                    {self.nav_link("/", overview_label, active == "overview")}
                     {self.nav_link("/requirements", "Requirements", active == "requirements")}
                     {self.nav_link("/applications", "Applications", active == "applications")}
                     {self.nav_link("/candidates", "Candidates", active == "candidates")}
@@ -2811,6 +2940,49 @@ h2 { font-size: 16px; }
     border-bottom: 1px solid var(--line);
 }
 .panel-head span { color: var(--muted); }
+.notice-panel {
+    border-color: #f2c94c;
+}
+.notice-panel-ok {
+    border-color: var(--line);
+}
+.notification-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    padding: 16px;
+}
+.notification-card {
+    display: grid;
+    gap: 6px;
+    padding: 14px;
+    border: 1px solid #f2c94c;
+    border-radius: 8px;
+    background: #fffbeb;
+    text-decoration: none;
+}
+.notification-card strong {
+    color: #7a4b00;
+}
+.notification-card span {
+    font-weight: 800;
+    color: #b42318;
+}
+.notification-card small {
+    color: #627084;
+}
+.notification-card em {
+    font-style: normal;
+    font-weight: 700;
+    color: var(--accent);
+}
+.filter-note {
+    margin: 0 0 12px;
+}
+.filter-note a {
+    margin-left: 8px;
+    color: var(--accent);
+}
 table {
     width: 100%;
     border-collapse: collapse;
@@ -3005,7 +3177,7 @@ code {
         height: auto;
     }
     nav { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-    .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .metrics, .notification-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .grid-two, .requirement-form, .detail-grid { grid-template-columns: 1fr; }
     .field, .field:nth-child(3n) { border-right: 0; }
     main { padding: 16px; }
@@ -3015,7 +3187,7 @@ code {
 @media (max-width: 640px) {
     nav { grid-template-columns: 1fr 1fr; }
     .topbar, .search { align-items: stretch; flex-direction: column; }
-    .metrics { grid-template-columns: 1fr; }
+    .metrics, .notification-grid { grid-template-columns: 1fr; }
 }
 """
 
