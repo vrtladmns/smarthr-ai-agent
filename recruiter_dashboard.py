@@ -33,7 +33,7 @@ from recruiter_agent import (
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8090
 WEB_INTERVIEW_SESSIONS: dict[str, dict] = {}
-FINAL_HR_CHECK_SECONDS = 600
+FINAL_HR_CHECK_SECONDS = 300
 
 
 def notify_post_interview_outcome_async(application_id: int, report: dict):

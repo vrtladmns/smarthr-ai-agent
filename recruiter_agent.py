@@ -4026,7 +4026,7 @@ def send_teams_link_for_application(application_id: int):
         db.close()
 
 
-def final_hr_round_due(application: dict[str, Any], grace_minutes: int = 60) -> bool:
+def final_hr_round_due(application: dict[str, Any], grace_minutes: int = 5) -> bool:
     scheduled_at = parse_iso_datetime(application.get("interview_scheduled_at"))
     if not scheduled_at and isinstance(application.get("interview_scheduled_at"), datetime):
         scheduled_at = application.get("interview_scheduled_at")
@@ -4035,7 +4035,7 @@ def final_hr_round_due(application: dict[str, Any], grace_minutes: int = 60) -> 
     return as_recruiter_time(scheduled_at) + timedelta(minutes=grace_minutes) <= recruiter_now()
 
 
-def mark_due_final_hr_rounds_pending(grace_minutes: int = 60) -> int:
+def mark_due_final_hr_rounds_pending(grace_minutes: int = 5) -> int:
     db = RecruiterDatabase()
     mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
     marked = 0
