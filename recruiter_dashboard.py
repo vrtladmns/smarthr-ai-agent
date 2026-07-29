@@ -60,6 +60,49 @@ def start_final_hr_round_monitor():
     Thread(target=run, daemon=True).start()
 
 
+def normalize_camera_monitoring(value, fallback=None) -> dict:
+    source = value if isinstance(value, dict) else fallback if isinstance(fallback, dict) else {}
+    unusual = source.get("unusual_activity") or []
+    if not isinstance(unusual, list):
+        unusual = []
+    unusual = unusual[-25:]
+    sample_count = int(source.get("sample_count") or 0)
+    face_present_samples = int(source.get("face_present_samples") or 0)
+    no_face_samples = int(source.get("no_face_samples") or 0)
+    low_light_samples = int(source.get("low_light_samples") or 0)
+    high_motion_events = int(source.get("high_motion_events") or 0)
+    multiple_face_samples = int(source.get("multiple_face_samples") or 0)
+    available = bool(source.get("available"))
+    if not available:
+        eye_summary = "Camera was not available or permission was not granted."
+    elif source.get("face_detection_supported"):
+        visible_ratio = round((face_present_samples / sample_count) * 100, 1) if sample_count else 0
+        eye_summary = (
+            f"Camera active. Face visible in about {visible_ratio}% of sampled frames. "
+            "Exact eye-gaze tracking is not enabled in this browser mode."
+        )
+    else:
+        eye_summary = (
+            "Camera active. Browser did not support built-in face detection, "
+            "so monitoring used video activity and lighting checks only."
+        )
+    return {
+        "available": available,
+        "started_at": source.get("started_at"),
+        "ended_at": source.get("ended_at"),
+        "method": source.get("method") or "browser_camera_sampling",
+        "face_detection_supported": bool(source.get("face_detection_supported")),
+        "sample_count": sample_count,
+        "face_present_samples": face_present_samples,
+        "no_face_samples": no_face_samples,
+        "multiple_face_samples": multiple_face_samples,
+        "low_light_samples": low_light_samples,
+        "high_motion_events": high_motion_events,
+        "eye_movement_summary": eye_summary,
+        "unusual_activity": unusual,
+    }
+
+
 def html_escape(value) -> str:
     return escape("" if value is None else str(value))
 
@@ -440,13 +483,15 @@ Context:
         questions = [" ".join(str(question).split()) for question in questions if str(question).strip()]
         return (questions or fallback)[:RECRUITER_INTERVIEW_QUESTION_COUNT]
 
-    def web_interview_report(self, application: dict, transcript: list[dict]) -> dict:
+    def web_interview_report(self, application: dict, transcript: list[dict], camera_monitoring: dict | None = None) -> dict:
+        normalized_camera_monitoring = normalize_camera_monitoring(camera_monitoring)
         llm = make_chat_model(json_mode=True, max_tokens=max(OLLAMA_NUM_PREDICT, 1800))
         response = llm.invoke(
             f"""
 Return one valid JSON object only.
 You are an HR technical interviewer. Evaluate this browser voice interview fairly.
 Use only the candidate answers, CV, and JD context provided.
+Camera monitoring is a browser-side signal only. Do not over-penalize camera issues unless unusual activity is repeated.
 
 JSON schema:
 {{
@@ -463,7 +508,7 @@ JSON schema:
   ],
   "camera_monitoring": {{
     "available": false,
-    "eye_movement_summary": "Not captured in this browser voice interview mode.",
+    "eye_movement_summary": "short summary of camera visibility and activity",
     "unusual_activity": []
   }},
   "final_notes_for_hr": "string"
@@ -483,6 +528,9 @@ Application context:
 
 Interview transcript:
 {json.dumps(transcript, default=str)}
+
+Camera monitoring:
+{json.dumps(normalized_camera_monitoring, default=str)}
 """
         ).content
         try:
@@ -498,13 +546,10 @@ Interview transcript:
                 "plus_points": [],
                 "negative_points": ["Report parsing failed."],
                 "question_reviews": [],
-                "camera_monitoring": {
-                    "available": False,
-                    "eye_movement_summary": "Not captured in this browser voice interview mode.",
-                    "unusual_activity": [],
-                },
+                "camera_monitoring": normalized_camera_monitoring,
                 "final_notes_for_hr": "Please review the transcript manually.",
             }
+        report["camera_monitoring"] = normalize_camera_monitoring(camera_monitoring, report.get("camera_monitoring"))
         report["application_id"] = application.get("id")
         report["question_count"] = len(transcript)
         report["transcript"] = transcript
@@ -660,6 +705,7 @@ Previous transcript:
             "current_index": 0,
             "current_question": questions[0] if questions else "",
             "transcript": [],
+            "camera_monitoring": {},
             "followup_for_current": False,
             "last_client_turn_id": 0,
         }
@@ -688,11 +734,15 @@ Previous transcript:
                 "current_index": 0,
                 "current_question": questions[0] if questions else "",
                 "transcript": [],
+                "camera_monitoring": {},
                 "followup_for_current": False,
                 "last_client_turn_id": 0,
             }
             WEB_INTERVIEW_SESSIONS[token] = session
         answer = str(payload.get("answer") or "").strip()
+        camera_monitoring = payload.get("camera_monitoring")
+        if isinstance(camera_monitoring, dict):
+            session["camera_monitoring"] = normalize_camera_monitoring(camera_monitoring, session.get("camera_monitoring"))
         try:
             client_turn_id = int(payload.get("turn_id") or 0)
         except (TypeError, ValueError):
@@ -729,7 +779,9 @@ Previous transcript:
         elif action == "follow_up":
             session["current_question"] = decision.get("question") or session["current_question"]
         elif action == "complete":
-            report = self.web_interview_report(application, session["transcript"])
+            if isinstance(session.get("camera_monitoring"), dict) and not session["camera_monitoring"].get("ended_at"):
+                session["camera_monitoring"]["ended_at"] = datetime.utcnow().isoformat() + "Z"
+            report = self.web_interview_report(application, session["transcript"], session.get("camera_monitoring"))
             database = self.db()
             try:
                 database.db.update_interview_report(application["id"], report)
@@ -746,6 +798,7 @@ Previous transcript:
             self.send_json({"error": "Interview link not found."}, status=404)
             return
         transcript = payload.get("transcript") or []
+        camera_monitoring = payload.get("camera_monitoring")
         if not isinstance(transcript, list) or not transcript:
             self.send_json({"error": "Interview transcript is required."}, status=400)
             return
@@ -761,7 +814,14 @@ Previous transcript:
                     "status": "answered" if str(item.get("answer") or "").strip() else "empty",
                 }
             )
-        report = self.web_interview_report(application, cleaned)
+        normalized_camera_monitoring = normalize_camera_monitoring(camera_monitoring) if isinstance(camera_monitoring, dict) else None
+        if isinstance(normalized_camera_monitoring, dict) and not normalized_camera_monitoring.get("ended_at"):
+            normalized_camera_monitoring["ended_at"] = datetime.utcnow().isoformat() + "Z"
+        report = self.web_interview_report(
+            application,
+            cleaned,
+            normalized_camera_monitoring,
+        )
         database = self.db()
         try:
             database.db.update_interview_report(application["id"], report)
@@ -1667,6 +1727,7 @@ Previous transcript:
             ("Interview Summary", interview_report.get("summary"), "pre-wide"),
             ("Interview Plus Points", interview_report.get("plus_points"), "json"),
             ("Interview Negative Points", interview_report.get("negative_points"), "json"),
+            ("Camera Monitoring", interview_report.get("camera_monitoring"), "json"),
             ("Interview Report", row.get("interview_report"), "json-wide"),
             ("Received At", date_text(row["received_at"])),
             ("Created", date_text(row["created_at"])),
@@ -2047,6 +2108,28 @@ Previous transcript:
     let audioMonitorId = null;
     let lastSpeechResultAt = 0;
     let lastMicActivityAt = 0;
+    let cameraCanvas = null;
+    let cameraContext = null;
+    let cameraMonitorTimer = null;
+    let faceDetector = null;
+    let faceDetectionSupported = false;
+    let lastCameraFrame = null;
+    let noFaceStreak = 0;
+    let lowLightStreak = 0;
+    let cameraMonitoring = {{
+      available: false,
+      started_at: null,
+      ended_at: null,
+      method: 'browser_camera_sampling',
+      face_detection_supported: false,
+      sample_count: 0,
+      face_present_samples: 0,
+      no_face_samples: 0,
+      multiple_face_samples: 0,
+      low_light_samples: 0,
+      high_motion_events: 0,
+      unusual_activity: []
+    }};
     const ANSWER_SILENCE_MS = 2800;
     const LONG_ANSWER_SILENCE_MS = 5200;
     const MIC_ACTIVITY_THRESHOLD = 0.018;
@@ -2195,6 +2278,106 @@ Previous transcript:
       }}
     }}
 
+    function pushCameraActivity(type, detail) {{
+      const last = cameraMonitoring.unusual_activity[cameraMonitoring.unusual_activity.length - 1];
+      if (last && last.type === type && Date.now() - new Date(last.at).getTime() < 12000) return;
+      cameraMonitoring.unusual_activity.push({{
+        at: new Date().toISOString(),
+        type,
+        detail
+      }});
+      if (cameraMonitoring.unusual_activity.length > 25) {{
+        cameraMonitoring.unusual_activity = cameraMonitoring.unusual_activity.slice(-25);
+      }}
+    }}
+
+    async function sampleCameraFrame() {{
+      if (!mediaStream || !candidateVideo || candidateVideo.readyState < 2 || interviewClosed) return;
+      try {{
+        cameraCanvas = cameraCanvas || document.createElement('canvas');
+        cameraCanvas.width = 160;
+        cameraCanvas.height = 90;
+        cameraContext = cameraContext || cameraCanvas.getContext('2d', {{willReadFrequently: true}});
+        if (!cameraContext) return;
+        cameraContext.drawImage(candidateVideo, 0, 0, cameraCanvas.width, cameraCanvas.height);
+        const frame = cameraContext.getImageData(0, 0, cameraCanvas.width, cameraCanvas.height).data;
+        let brightnessSum = 0;
+        let diffSum = 0;
+        for (let i = 0; i < frame.length; i += 4) {{
+          const brightness = (frame[i] + frame[i + 1] + frame[i + 2]) / 3;
+          brightnessSum += brightness;
+          if (lastCameraFrame) {{
+            diffSum += Math.abs(frame[i] - lastCameraFrame[i]);
+            diffSum += Math.abs(frame[i + 1] - lastCameraFrame[i + 1]);
+            diffSum += Math.abs(frame[i + 2] - lastCameraFrame[i + 2]);
+          }}
+        }}
+        const pixels = frame.length / 4;
+        const avgBrightness = brightnessSum / pixels;
+        const avgMotion = lastCameraFrame ? diffSum / (pixels * 3) : 0;
+        lastCameraFrame = new Uint8ClampedArray(frame);
+        cameraMonitoring.sample_count += 1;
+
+        if (avgBrightness < 28) {{
+          cameraMonitoring.low_light_samples += 1;
+          lowLightStreak += 1;
+          if (lowLightStreak >= 3) pushCameraActivity('low_light', 'Candidate video was too dark for several samples.');
+        }} else {{
+          lowLightStreak = 0;
+        }}
+        if (avgMotion > 42) {{
+          cameraMonitoring.high_motion_events += 1;
+          pushCameraActivity('high_motion', 'Large camera movement or visual change detected.');
+        }}
+
+        if (faceDetector) {{
+          const faces = await faceDetector.detect(candidateVideo);
+          if (faces.length === 0) {{
+            cameraMonitoring.no_face_samples += 1;
+            noFaceStreak += 1;
+            if (noFaceStreak >= 3) pushCameraActivity('no_face_visible', 'No face was visible for several consecutive samples.');
+          }} else {{
+            cameraMonitoring.face_present_samples += 1;
+            noFaceStreak = 0;
+            if (faces.length > 1) {{
+              cameraMonitoring.multiple_face_samples += 1;
+              pushCameraActivity('multiple_faces', 'More than one face was visible in the camera frame.');
+            }}
+          }}
+        }}
+      }} catch (error) {{
+        pushCameraActivity('camera_monitor_error', 'Camera monitoring sample failed in the browser.');
+      }}
+    }}
+
+    function startCameraMonitoring() {{
+      const hasVideo = mediaStream && mediaStream.getVideoTracks().some(track => track.readyState === 'live');
+      cameraMonitoring.available = Boolean(hasVideo);
+      cameraMonitoring.started_at = cameraMonitoring.started_at || new Date().toISOString();
+      if (!hasVideo || cameraMonitorTimer) return;
+      const BrowserFaceDetector = window.FaceDetector;
+      faceDetectionSupported = Boolean(BrowserFaceDetector);
+      cameraMonitoring.face_detection_supported = faceDetectionSupported;
+      cameraMonitoring.method = faceDetectionSupported ? 'browser_face_detector_and_video_sampling' : 'browser_video_sampling';
+      if (faceDetectionSupported && !faceDetector) {{
+        try {{
+          faceDetector = new BrowserFaceDetector({{fastMode: true, maxDetectedFaces: 3}});
+        }} catch (error) {{
+          faceDetector = null;
+          cameraMonitoring.face_detection_supported = false;
+          cameraMonitoring.method = 'browser_video_sampling';
+        }}
+      }}
+      sampleCameraFrame();
+      cameraMonitorTimer = window.setInterval(sampleCameraFrame, 2500);
+    }}
+
+    function stopCameraMonitoring() {{
+      if (cameraMonitorTimer) window.clearInterval(cameraMonitorTimer);
+      cameraMonitorTimer = null;
+      cameraMonitoring.ended_at = new Date().toISOString();
+    }}
+
     function processingNudge() {{
       const options = [
         'Give me a moment, I am reviewing that.',
@@ -2216,6 +2399,7 @@ Previous transcript:
     }}
 
     function closeInterviewScreen() {{
+      stopCameraMonitoring();
       if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
       if (audioMonitorId) window.cancelAnimationFrame(audioMonitorId);
       audioMonitorId = null;
@@ -2251,6 +2435,7 @@ Previous transcript:
       if (hasVideo) {{
         candidateVideo.srcObject = mediaStream;
         permissionOverlay.classList.add('hidden');
+        startCameraMonitoring();
       }}
       if (hasAudio) startAudioActivityMonitor();
       return hasAudio;
@@ -2493,7 +2678,7 @@ Previous transcript:
         response = await fetch(`/api/interview/${{token}}/turn`, {{
           method: 'POST',
           headers: {{'Content-Type': 'application/json'}},
-          body: JSON.stringify({{answer, turn_id: turnId}})
+          body: JSON.stringify({{answer, turn_id: turnId, camera_monitoring: cameraMonitoring}})
         }});
         data = await response.json();
       }} catch (error) {{
@@ -2585,6 +2770,7 @@ Previous transcript:
     nextBtn.addEventListener('click', submitTurn);
     endBtn.addEventListener('click', () => {{
       if (recognition && isRecording) recognition.stop();
+      stopCameraMonitoring();
       if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
       setCallStatus('Ended', false);
       setMessage('The interview has been ended in this browser window.');
