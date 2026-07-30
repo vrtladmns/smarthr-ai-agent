@@ -917,8 +917,8 @@ def passes_screening_threshold(evaluation: dict[str, Any], requirement: dict[str
     return (
         ats_score is not None
         and jd_match_score is not None
-        and ats_score > RECRUITER_SCREENING_ATS_MIN
-        and jd_match_score > RECRUITER_SCREENING_JD_MIN
+        and ats_score >= RECRUITER_SCREENING_ATS_MIN
+        and jd_match_score >= RECRUITER_SCREENING_JD_MIN
     )
 
 
