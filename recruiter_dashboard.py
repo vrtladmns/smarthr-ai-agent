@@ -1,26 +1,39 @@
 import argparse
+import hashlib
+import hmac
 import json
 import mimetypes
 import random
 import re
+import secrets
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
-from config import DB_PROVIDER, OLLAMA_NUM_PREDICT, RECRUITER_INTERVIEW_QUESTION_COUNT
+from config import (
+    DB_PROVIDER,
+    OLLAMA_NUM_PREDICT,
+    RECRUITER_DASHBOARD_LOGIN_EMAIL,
+    RECRUITER_DASHBOARD_LOGIN_PASSWORD,
+    RECRUITER_DASHBOARD_SESSION_SECRET,
+    RECRUITER_INTERVIEW_QUESTION_COUNT,
+)
 from llm_factory import make_chat_model
 from recruiter_agent import (
     RecruiterDatabase,
     candidate_interview_url,
+    final_hr_interviewers,
     hold_candidate_after_hr_round,
     mark_due_final_hr_rounds_pending,
     notify_post_interview_outcome,
     reject_candidate_after_hr_round,
     request_hr_round_reschedule,
+    recruiter_tz,
+    revoke_jd_score_rejection,
     select_candidate_after_hr_round,
     send_final_hr_round_request,
     send_interview_link_for_application,
@@ -34,6 +47,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8090
 WEB_INTERVIEW_SESSIONS: dict[str, dict] = {}
 FINAL_HR_CHECK_SECONDS = 300
+DASHBOARD_SESSION_COOKIE = "recruiter_dashboard_session"
+DASHBOARD_SESSION_SECONDS = 12 * 60 * 60
 
 
 def notify_post_interview_outcome_async(application_id: int, report: dict):
@@ -119,6 +134,19 @@ def parse_decimal(value: str | None):
 def parse_int(value: str | None):
     value = (value or "").strip()
     return int(value) if value else None
+
+
+def parse_dashboard_datetime(value: str | None) -> datetime | None:
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=recruiter_tz())
+    return parsed
 
 
 def money(value, currency="INR") -> str:
@@ -260,6 +288,47 @@ def safe_download_name(value: str | None, fallback: str) -> str:
     return name[:160] or fallback
 
 
+def dashboard_auth_enabled() -> bool:
+    return bool(RECRUITER_DASHBOARD_LOGIN_EMAIL and RECRUITER_DASHBOARD_LOGIN_PASSWORD)
+
+
+def dashboard_session_secret() -> str:
+    return (
+        RECRUITER_DASHBOARD_SESSION_SECRET
+        or RECRUITER_DASHBOARD_LOGIN_PASSWORD
+        or "recruiter-dashboard-local-secret"
+    )
+
+
+def sign_dashboard_session(email_address: str, expires_at: int) -> str:
+    payload = f"{email_address}|{expires_at}"
+    signature = hmac.new(
+        dashboard_session_secret().encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload}|{signature}"
+
+
+def verify_dashboard_session(value: str | None) -> bool:
+    if not value:
+        return False
+    parts = value.split("|")
+    if len(parts) != 3:
+        return False
+    email_address, expires_text, signature = parts
+    if email_address.lower() != RECRUITER_DASHBOARD_LOGIN_EMAIL.lower():
+        return False
+    try:
+        expires_at = int(expires_text)
+    except ValueError:
+        return False
+    if expires_at < int(time.time()):
+        return False
+    expected = sign_dashboard_session(email_address, expires_at).rsplit("|", 1)[-1]
+    return hmac.compare_digest(signature, expected)
+
+
 class DashboardDB:
     def __init__(self):
         self.db = RecruiterDatabase()
@@ -285,6 +354,12 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         try:
+            if parsed.path == "/login":
+                self.render_login()
+                return
+            if parsed.path == "/logout":
+                self.clear_session()
+                return
             if parsed.path != "/" and parsed.path.endswith("/"):
                 target = parsed.path.rstrip("/")
                 if parsed.query:
@@ -299,10 +374,12 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
             application_cv_id = download_path(parsed.path, "applications")
             interview_token = interview_token_path(parsed.path)
 
-            if parsed.path == "/":
-                self.render_page("overview", self.render_overview())
-            elif interview_token:
+            if interview_token:
                 self.render_public_interview(interview_token)
+            elif not self.require_dashboard_login():
+                return
+            elif parsed.path == "/":
+                self.render_page("overview", self.render_overview())
             elif candidate_cv_id is not None:
                 self.download_candidate_cv(candidate_cv_id)
             elif application_cv_id is not None:
@@ -343,6 +420,13 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
                     self.api_interview_complete(token, payload)
                 return
 
+            if parsed.path == "/login":
+                self.handle_login()
+                return
+
+            if not self.require_dashboard_login():
+                return
+
             length = int(self.headers.get("Content-Length", "0"))
             payload = self.rfile.read(length).decode("utf-8")
             form = {key: values[0] if values else "" for key, values in parse_qs(payload).items()}
@@ -350,12 +434,48 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/requirements":
                 self.create_requirement(form)
                 self.redirect("/requirements")
+            elif parsed.path == "/requirements/update":
+                requirement_id = parse_int(form.get("id"))
+                if requirement_id is None:
+                    raise RuntimeError("Requirement id is required.")
+                self.update_requirement(form)
+                self.redirect(f"/requirements/{requirement_id}")
             elif parsed.path == "/requirements/status":
                 self.update_requirement_status(form)
                 self.redirect("/requirements")
+            elif parsed.path == "/requirements/delete":
+                self.delete_requirement(form)
+                self.redirect("/requirements")
+            elif parsed.path == "/candidates/update":
+                candidate_id = parse_int(form.get("id"))
+                if candidate_id is None:
+                    raise RuntimeError("Candidate id is required.")
+                self.update_candidate(form)
+                self.redirect(f"/candidates/{candidate_id}")
+            elif parsed.path == "/candidates/delete":
+                self.delete_candidate(form)
+                self.redirect("/candidates")
             elif parsed.path == "/applications/status":
                 self.update_application_status(form)
                 self.redirect("/applications")
+            elif parsed.path == "/applications/update":
+                application_id = parse_int(form.get("id"))
+                if application_id is None:
+                    raise RuntimeError("Application id is required.")
+                self.update_application(form)
+                self.redirect(f"/applications/{application_id}")
+            elif parsed.path == "/applications/delete":
+                self.delete_application(form)
+                self.redirect("/applications")
+            elif parsed.path == "/events/update":
+                event_id = parse_int(form.get("id"))
+                if event_id is None:
+                    raise RuntimeError("Event id is required.")
+                self.update_event(form)
+                self.redirect(f"/events/{event_id}")
+            elif parsed.path == "/events/delete":
+                self.delete_event(form)
+                self.redirect("/events")
             elif parsed.path == "/applications/hr-approve":
                 application_id = parse_int(form.get("id"))
                 if application_id is None:
@@ -373,6 +493,12 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
                 if application_id is None:
                     raise RuntimeError("Application id is required.")
                 send_interview_rejection(application_id, "After HR review of the interview, we will not be moving ahead with the next round at this time.")
+                self.redirect(f"/applications/{application_id}")
+            elif parsed.path == "/applications/revoke-jd-rejection":
+                application_id = parse_int(form.get("id"))
+                if application_id is None:
+                    raise RuntimeError("Application id is required.")
+                revoke_jd_score_rejection(application_id)
                 self.redirect(f"/applications/{application_id}")
             elif parsed.path == "/applications/final-select":
                 application_id = parse_int(form.get("id"))
@@ -396,7 +522,15 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
                 application_id = parse_int(form.get("id"))
                 if application_id is None:
                     raise RuntimeError("Application id is required.")
-                request_hr_round_reschedule(application_id)
+                reschedule_mode = (form.get("reschedule_mode") or "ask_candidate").strip()
+                scheduled_at = parse_dashboard_datetime(form.get("scheduled_at"))
+                interviewer_email = (form.get("interviewer_email") or "").strip() or None
+                request_hr_round_reschedule(
+                    application_id,
+                    scheduled_at=scheduled_at,
+                    interviewer_email=interviewer_email,
+                    ask_candidate=reschedule_mode != "schedule_now",
+                )
                 self.redirect(f"/applications/{application_id}")
             elif parsed.path == "/applications/send-interview-link":
                 application_id = parse_int(form.get("id"))
@@ -417,6 +551,101 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
 
     def db(self) -> DashboardDB:
         return DashboardDB()
+
+    def dashboard_cookie_value(self) -> str | None:
+        cookie_header = self.headers.get("Cookie", "")
+        for part in cookie_header.split(";"):
+            if "=" not in part:
+                continue
+            name, value = part.strip().split("=", 1)
+            if name == DASHBOARD_SESSION_COOKIE:
+                return value
+        return None
+
+    def is_dashboard_logged_in(self) -> bool:
+        if not dashboard_auth_enabled():
+            return True
+        return verify_dashboard_session(self.dashboard_cookie_value())
+
+    def require_dashboard_login(self) -> bool:
+        if self.is_dashboard_logged_in():
+            return True
+        self.redirect(f"/login?next={quote(self.path or '/', safe='')}")
+        return False
+
+    def set_session(self, email_address: str):
+        expires_at = int(time.time()) + DASHBOARD_SESSION_SECONDS
+        session_value = sign_dashboard_session(email_address, expires_at)
+        self.send_header(
+            "Set-Cookie",
+            (
+                f"{DASHBOARD_SESSION_COOKIE}={session_value}; "
+                f"Max-Age={DASHBOARD_SESSION_SECONDS}; Path=/; HttpOnly; SameSite=Lax"
+            ),
+        )
+
+    def clear_session(self):
+        self.send_response(303)
+        self.send_header("Set-Cookie", f"{DASHBOARD_SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
+        self.send_header("Location", "/login")
+        self.end_headers()
+
+    def render_login(self, error: str = ""):
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        next_path = query.get("next", ["/"])[0] or "/"
+        body = f"""
+        <!doctype html>
+        <html lang="en">
+        <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Recruiter Dashboard Login</title>
+            <style>{CSS}</style>
+        </head>
+        <body class="login-page">
+            <main class="login-wrap">
+                <section class="login-card">
+                    <div class="brand login-brand">
+                        <span class="mark">HR</span>
+                        <div><strong>Recruiter</strong><small>Dashboard login</small></div>
+                    </div>
+                    <h1>Sign In</h1>
+                    <p class="muted">Use your dashboard credentials to continue.</p>
+                    {f'<p class="error">{html_escape(error)}</p>' if error else ''}
+                    <form method="post" action="/login" class="login-form">
+                        <input type="hidden" name="next" value="{html_escape(next_path)}">
+                        <label>Email<input name="email" type="email" required autofocus></label>
+                        <label>Password<input name="password" type="password" required></label>
+                        <button type="submit">Sign In</button>
+                    </form>
+                </section>
+            </main>
+        </body>
+        </html>
+        """
+        self.send_html(body)
+
+    def handle_login(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = self.rfile.read(length).decode("utf-8")
+        form = {key: values[0] if values else "" for key, values in parse_qs(payload).items()}
+        email_address = (form.get("email") or "").strip()
+        password = form.get("password") or ""
+        next_path = form.get("next") or "/"
+        if not next_path.startswith("/") or next_path.startswith("//"):
+            next_path = "/"
+        if (
+            dashboard_auth_enabled()
+            and hmac.compare_digest(email_address.lower(), RECRUITER_DASHBOARD_LOGIN_EMAIL.lower())
+            and hmac.compare_digest(password, RECRUITER_DASHBOARD_LOGIN_PASSWORD)
+        ):
+            self.send_response(303)
+            self.set_session(email_address)
+            self.send_header("Location", next_path)
+            self.end_headers()
+            return
+        self.render_login("Invalid email or password.")
 
     def read_json_body(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
@@ -925,6 +1154,102 @@ Previous transcript:
         finally:
             database.close()
 
+    def update_requirement(self, form: dict[str, str]):
+        database = self.db()
+        try:
+            database.execute(
+                """
+                UPDATE recruitment_requirements
+                SET position_title = %s,
+                    experience_min_years = %s,
+                    experience_max_years = %s,
+                    budget_min = %s,
+                    budget_max = %s,
+                    currency = %s,
+                    job_description = %s,
+                    urgently_required = %s,
+                    needed_within_days = %s,
+                    status = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    form.get("position_title", "").strip(),
+                    parse_decimal(form.get("experience_min_years")),
+                    parse_decimal(form.get("experience_max_years")),
+                    parse_decimal(form.get("budget_min")),
+                    parse_decimal(form.get("budget_max")),
+                    form.get("currency", "INR").strip() or "INR",
+                    form.get("job_description", "").strip(),
+                    parse_bool(form.get("urgently_required")),
+                    parse_int(form.get("needed_within_days")),
+                    form.get("status", "open").strip() or "open",
+                    parse_int(form.get("id")),
+                ),
+            )
+        finally:
+            database.close()
+
+    def delete_requirement(self, form: dict[str, str]):
+        requirement_id = parse_int(form.get("id"))
+        database = self.db()
+        try:
+            database.execute("UPDATE recruiter_applications SET requirement_id = NULL WHERE requirement_id = %s", (requirement_id,))
+            database.execute("DELETE FROM recruitment_requirements WHERE id = %s", (requirement_id,))
+        finally:
+            database.close()
+
+    def update_candidate(self, form: dict[str, str]):
+        database = self.db()
+        try:
+            database.execute(
+                """
+                UPDATE recruiter_candidates
+                SET full_name = %s,
+                    candidate_email = %s,
+                    source_email = %s,
+                    referrer_email = %s,
+                    submission_type = %s,
+                    phone = %s,
+                    location = %s,
+                    linkedin_url = %s,
+                    portfolio_url = %s,
+                    current_title = %s,
+                    current_company = %s,
+                    total_experience_years = %s,
+                    cv_summary = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    form.get("full_name", "").strip() or None,
+                    form.get("candidate_email", "").strip() or None,
+                    form.get("source_email", "").strip() or None,
+                    form.get("referrer_email", "").strip() or None,
+                    form.get("submission_type", "self_application").strip() or "self_application",
+                    form.get("phone", "").strip() or None,
+                    form.get("location", "").strip() or None,
+                    form.get("linkedin_url", "").strip() or None,
+                    form.get("portfolio_url", "").strip() or None,
+                    form.get("current_title", "").strip() or None,
+                    form.get("current_company", "").strip() or None,
+                    parse_decimal(form.get("total_experience_years")),
+                    form.get("cv_summary", "").strip() or None,
+                    parse_int(form.get("id")),
+                ),
+            )
+        finally:
+            database.close()
+
+    def delete_candidate(self, form: dict[str, str]):
+        candidate_id = parse_int(form.get("id"))
+        database = self.db()
+        try:
+            database.execute("DELETE FROM recruiter_applications WHERE candidate_id = %s", (candidate_id,))
+            database.execute("DELETE FROM recruiter_candidates WHERE id = %s", (candidate_id,))
+        finally:
+            database.close()
+
     def update_application_status(self, form: dict[str, str]):
         database = self.db()
         try:
@@ -936,6 +1261,101 @@ Previous transcript:
                 """,
                 (form.get("application_status", "reviewed"), parse_int(form.get("id"))),
             )
+        finally:
+            database.close()
+
+    def update_application(self, form: dict[str, str]):
+        database = self.db()
+        try:
+            database.execute(
+                """
+                UPDATE recruiter_applications
+                SET candidate_email = %s,
+                    source_email = %s,
+                    referrer_email = %s,
+                    submission_type = %s,
+                    requirement_id = %s,
+                    detected_position = %s,
+                    matched_position = %s,
+                    application_status = %s,
+                    ats_score = %s,
+                    jd_match_score = %s,
+                    ai_short_description = %s,
+                    screening_current_salary = %s,
+                    screening_expected_salary = %s,
+                    screening_current_location = %s,
+                    screening_joining_days = %s,
+                    hr_escalation_reason = %s,
+                    interview_availability = %s,
+                    hr_interviewer_email = %s,
+                    hr_interviewer_name = %s
+                WHERE id = %s
+                """,
+                (
+                    form.get("candidate_email", "").strip() or None,
+                    form.get("source_email", "").strip() or None,
+                    form.get("referrer_email", "").strip() or None,
+                    form.get("submission_type", "self_application").strip() or "self_application",
+                    parse_int(form.get("requirement_id")),
+                    form.get("detected_position", "").strip() or None,
+                    form.get("matched_position", "").strip() or None,
+                    form.get("application_status", "reviewed").strip() or "reviewed",
+                    parse_decimal(form.get("ats_score")),
+                    parse_decimal(form.get("jd_match_score")),
+                    form.get("ai_short_description", "").strip() or None,
+                    parse_decimal(form.get("screening_current_salary")),
+                    parse_decimal(form.get("screening_expected_salary")),
+                    form.get("screening_current_location", "").strip() or None,
+                    parse_int(form.get("screening_joining_days")),
+                    form.get("hr_escalation_reason", "").strip() or None,
+                    form.get("interview_availability", "").strip() or None,
+                    form.get("hr_interviewer_email", "").strip() or None,
+                    form.get("hr_interviewer_name", "").strip() or None,
+                    parse_int(form.get("id")),
+                ),
+            )
+        finally:
+            database.close()
+
+    def delete_application(self, form: dict[str, str]):
+        database = self.db()
+        try:
+            database.execute("DELETE FROM recruiter_applications WHERE id = %s", (parse_int(form.get("id")),))
+        finally:
+            database.close()
+
+    def update_event(self, form: dict[str, str]):
+        raw_details = form.get("details", "").strip() or "{}"
+        try:
+            details = json.dumps(json.loads(raw_details))
+        except json.JSONDecodeError:
+            details = json.dumps({"note": raw_details})
+        database = self.db()
+        try:
+            database.execute(
+                """
+                UPDATE recruiter_email_events
+                SET event_type = %s,
+                    source_email = %s,
+                    email_subject = %s,
+                    details = %s::jsonb
+                WHERE id = %s
+                """,
+                (
+                    form.get("event_type", "").strip() or "manual_event",
+                    form.get("source_email", "").strip() or None,
+                    form.get("email_subject", "").strip() or None,
+                    details,
+                    parse_int(form.get("id")),
+                ),
+            )
+        finally:
+            database.close()
+
+    def delete_event(self, form: dict[str, str]):
+        database = self.db()
+        try:
+            database.execute("DELETE FROM recruiter_email_events WHERE id = %s", (parse_int(form.get("id")),))
         finally:
             database.close()
 
@@ -1048,6 +1468,9 @@ Previous transcript:
                 """
             )
             notifications = self.pending_operator_notifications(database)
+            schedule_start = datetime.now(recruiter_tz()).replace(second=0, microsecond=0)
+            schedule_end = schedule_start + timedelta(days=7)
+            hr_meetings = database.db.final_hr_scheduled_applications(schedule_start, schedule_end)
         finally:
             database.close()
 
@@ -1101,10 +1524,12 @@ Previous transcript:
         ) or '<tr><td colspan="7" class="empty">No applications processed yet.</td></tr>'
 
         notification_html = self.render_notifications_panel(notifications)
+        hr_schedule_html = self.render_hr_schedule_summary(hr_meetings)
 
         return f"""
         <section class="metrics">{card_html}</section>
         {notification_html}
+        {hr_schedule_html}
         <section class="grid-two">
             <div class="panel">
                 <div class="panel-head">
@@ -1140,6 +1565,53 @@ Previous transcript:
         </section>
         """
 
+    def render_hr_schedule_summary(self, meetings: list[dict]) -> str:
+        interviewers = final_hr_interviewers()
+        grouped = {interviewer["email"].lower(): {"interviewer": interviewer, "meetings": []} for interviewer in interviewers}
+        unassigned = {"interviewer": {"name": "Unassigned", "email": ""}, "meetings": []}
+        for meeting in meetings:
+            email_address = (meeting.get("hr_interviewer_email") or "").lower()
+            if email_address in grouped:
+                grouped[email_address]["meetings"].append(meeting)
+            else:
+                unassigned["meetings"].append(meeting)
+
+        cards = []
+        for group in list(grouped.values()) + ([unassigned] if unassigned["meetings"] else []):
+            interviewer = group["interviewer"]
+            rows = group["meetings"]
+            next_rows = "".join(
+                f"""
+                <li>
+                    <a href="/applications/{html_escape(row["id"])}">{html_escape(row["full_name"] or "Candidate")}</a>
+                    <span>{html_escape(row.get("role") or "-")} · {date_text(row.get("interview_scheduled_at"))}</span>
+                    {status_badge(row.get("application_status"))}
+                </li>
+                """
+                for row in rows[:4]
+            ) or '<li class="empty">No meetings scheduled.</li>'
+            cards.append(
+                f"""
+                <article class="schedule-card">
+                    <div>
+                        <strong>{html_escape(interviewer["name"])}</strong>
+                        <small>{html_escape(interviewer["email"] or "Not assigned")}</small>
+                    </div>
+                    <b>{len(rows)}</b>
+                    <ul>{next_rows}</ul>
+                </article>
+                """
+            )
+        return f"""
+        <section class="panel">
+            <div class="panel-head">
+                <h2>Final HR Schedule</h2>
+                <span>Next 7 days · Mon-Fri, 6 PM-1 AM IST</span>
+            </div>
+            <div class="schedule-grid">{"".join(cards)}</div>
+        </section>
+        """
+
     def pending_operator_notifications(self, database: DashboardDB) -> list[dict]:
         tasks = [
             {
@@ -1153,6 +1625,18 @@ Previous transcript:
                 "title": "AI interview on hold",
                 "detail": "AI interview report needs HR approval or rejection.",
                 "action": "Decide",
+            },
+            {
+                "status": "rejected_jd_score",
+                "title": "JD-score rejection",
+                "detail": "AI rejected a CV based on low JD match. HR can revoke and continue.",
+                "action": "Review",
+            },
+            {
+                "status": "manual_hr_review",
+                "title": "Manual HR review",
+                "detail": "The agent stopped replying because the thread needs human handling.",
+                "action": "Review",
             },
             {
                 "status": "final_hr_round_completed_pending_decision",
@@ -1204,6 +1688,8 @@ Previous transcript:
                 WHERE application_status IN (
                     'hr_escalated',
                     'interview_on_hold_hr_review',
+                    'rejected_jd_score',
+                    'manual_hr_review',
                     'final_hr_round_completed_pending_decision',
                     'interview_availability_received',
                     'hr_round_time_requested',
@@ -1292,6 +1778,7 @@ Previous transcript:
                         <input type="hidden" name="status" value="{'closed' if row["status"] == 'open' else 'open'}">
                         <button type="submit">{'Close' if row["status"] == 'open' else 'Open'}</button>
                     </form>
+                    {self.delete_form("/requirements/delete", row["id"], "Delete", "Delete this requirement? Linked applications will stay, but will be detached from this role.")}
                     </div>
                 </td>
             </tr>
@@ -1370,6 +1857,7 @@ Previous transcript:
                     <div class="action-stack">
                         <a class="link-button" href="/candidates/{html_escape(row["id"])}">View</a>
                         <a class="link-button" href="/candidates/{html_escape(row["id"])}/cv">Download CV</a>
+                        {self.delete_form("/candidates/delete", row["id"], "Delete", "Delete this candidate and all linked applications?")}
                     </div>
                 </td>
             </tr>
@@ -1454,6 +1942,7 @@ Previous transcript:
                         </select>
                         <button type="submit">Update</button>
                     </form>
+                    {self.delete_form("/applications/delete", row["id"], "Delete", "Delete this application?")}
                     </div>
                 </td>
             </tr>
@@ -1510,7 +1999,12 @@ Previous transcript:
                 <td>{html_escape(row["source_email"] or "-")}</td>
                 <td>{html_escape(row["email_subject"] or "-")}</td>
                 <td><pre>{html_escape(json.dumps(row["details"], indent=2, default=str))}</pre></td>
-                <td><a class="link-button" href="/events/{html_escape(row["id"])}">View</a></td>
+                <td>
+                    <div class="action-stack">
+                        <a class="link-button" href="/events/{html_escape(row["id"])}">View</a>
+                        {self.delete_form("/events/delete", row["id"], "Delete", "Delete this email event log?")}
+                    </div>
+                </td>
             </tr>
             """
             for row in rows
@@ -1573,12 +2067,38 @@ Previous transcript:
             ("Updated", date_text(row["updated_at"])),
             ("Job Description", row["job_description"], "pre-wide"),
         ]
+        edit_form = f"""
+        <section class="panel">
+            <div class="panel-head"><h2>Edit Requirement</h2></div>
+            <form method="post" action="/requirements/update" class="requirement-form">
+                <input type="hidden" name="id" value="{html_escape(requirement_id)}">
+                <label>Position<input name="position_title" required value="{html_escape(row["position_title"])}"></label>
+                <label>Min Exp<input name="experience_min_years" type="number" step="0.1" value="{html_escape(row["experience_min_years"] or "")}"></label>
+                <label>Max Exp<input name="experience_max_years" type="number" step="0.1" value="{html_escape(row["experience_max_years"] or "")}"></label>
+                <label>Budget Min<input name="budget_min" type="number" value="{html_escape(row["budget_min"] or "")}"></label>
+                <label>Budget Max<input name="budget_max" type="number" value="{html_escape(row["budget_max"] or "")}"></label>
+                <label>Currency<input name="currency" value="{html_escape(row["currency"] or "INR")}"></label>
+                <label>Needed Days<input name="needed_within_days" type="number" value="{html_escape(row["needed_within_days"] or "")}"></label>
+                <label>Status<select name="status"><option value="open" {"selected" if row["status"] == "open" else ""}>Open</option><option value="closed" {"selected" if row["status"] == "closed" else ""}>Closed</option></select></label>
+                <label class="check"><input name="urgently_required" type="checkbox" {"checked" if row["urgently_required"] else ""}> Urgent</label>
+                <label class="wide">Job Description<textarea name="job_description" required rows="6">{html_escape(row["job_description"] or "")}</textarea></label>
+                <button type="submit">Save Changes</button>
+            </form>
+        </section>
+        """
         return f"""
         {self.back_link("/requirements", "Back to requirements")}
         <section class="panel">
-            <div class="panel-head"><h2>{html_escape(row["position_title"])}</h2>{status_badge(row["status"])}</div>
+            <div class="panel-head">
+                <h2>{html_escape(row["position_title"])}</h2>
+                <div class="action-stack">
+                    {status_badge(row["status"])}
+                    {self.delete_form("/requirements/delete", requirement_id, "Delete Requirement", "Delete this requirement? Linked applications will stay, but will be detached from this role.")}
+                </div>
+            </div>
             {self.detail_grid(fields)}
         </section>
+        {edit_form}
         <section class="panel">
             <div class="panel-head"><h2>Linked Applications</h2><span>{len(applications)} shown</span></div>
             <table>
@@ -1647,6 +2167,28 @@ Previous transcript:
             ("Raw CV Text", row["raw_cv_text"], "pre-wide"),
         ]
         title = row["full_name"] or row["candidate_email"] or row["source_email"] or "Candidate"
+        edit_form = f"""
+        <section class="panel">
+            <div class="panel-head"><h2>Edit Candidate</h2></div>
+            <form method="post" action="/candidates/update" class="requirement-form">
+                <input type="hidden" name="id" value="{html_escape(candidate_id)}">
+                <label>Full Name<input name="full_name" value="{html_escape(row["full_name"] or "")}"></label>
+                <label>Candidate Email<input name="candidate_email" type="email" value="{html_escape(row["candidate_email"] or "")}"></label>
+                <label>Source Email<input name="source_email" type="email" value="{html_escape(row["source_email"] or "")}"></label>
+                <label>Referrer Email<input name="referrer_email" type="email" value="{html_escape(row["referrer_email"] or "")}"></label>
+                <label>Submission Type<select name="submission_type"><option value="self_application" {"selected" if row["submission_type"] == "self_application" else ""}>Self Application</option><option value="referral" {"selected" if row["submission_type"] == "referral" else ""}>Referral</option></select></label>
+                <label>Phone<input name="phone" value="{html_escape(row["phone"] or "")}"></label>
+                <label>Location<input name="location" value="{html_escape(row["location"] or "")}"></label>
+                <label>LinkedIn<input name="linkedin_url" value="{html_escape(row["linkedin_url"] or "")}"></label>
+                <label>Portfolio<input name="portfolio_url" value="{html_escape(row["portfolio_url"] or "")}"></label>
+                <label>Current Title<input name="current_title" value="{html_escape(row["current_title"] or "")}"></label>
+                <label>Current Company<input name="current_company" value="{html_escape(row["current_company"] or "")}"></label>
+                <label>Total Experience<input name="total_experience_years" type="number" step="0.1" value="{html_escape(row["total_experience_years"] or "")}"></label>
+                <label class="wide">CV Summary<textarea name="cv_summary" rows="4">{html_escape(row["cv_summary"] or "")}</textarea></label>
+                <button type="submit">Save Changes</button>
+            </form>
+        </section>
+        """
         return f"""
         {self.back_link("/candidates", "Back to candidates")}
         <section class="panel">
@@ -1655,10 +2197,12 @@ Previous transcript:
                 <div class="action-stack">
                     {status_badge(row["submission_type"])}
                     <a class="link-button" href="/candidates/{html_escape(candidate_id)}/cv">Download CV</a>
+                    {self.delete_form("/candidates/delete", candidate_id, "Delete Candidate", "Delete this candidate and all linked applications?")}
                 </div>
             </div>
             {self.detail_grid(fields)}
         </section>
+        {edit_form}
         <section class="panel">
             <div class="panel-head"><h2>Applications</h2><span>{len(applications)} shown</span></div>
             <table>
@@ -1686,6 +2230,14 @@ Previous transcript:
             )
             if not row:
                 return self.not_found_panel("Application", "/applications")
+            requirements = database.rows(
+                """
+                SELECT id, position_title, status
+                FROM recruitment_requirements
+                ORDER BY LOWER(status) = 'open' DESC, position_title ASC
+                LIMIT 200
+                """
+            )
         finally:
             database.close()
 
@@ -1720,6 +2272,8 @@ Previous transcript:
             ("Interview Link", interview_link),
             ("Interview Started At", date_text(row.get("interview_started_at"))),
             ("Interview Completed At", date_text(row.get("interview_completed_at"))),
+            ("HR Interviewer", row.get("hr_interviewer_name") or row.get("hr_interviewer_email")),
+            ("HR Interviewer Email", row.get("hr_interviewer_email")),
             ("Teams Event ID", row.get("teams_event_id")),
             ("Teams Join URL", row.get("teams_join_url")),
             ("Interview Score", interview_report.get("overall_score")),
@@ -1739,6 +2293,38 @@ Previous transcript:
             ("Job Description", row["job_description"], "pre-wide"),
         ]
         title = row["full_name"] or row["candidate_email"] or f"Application {application_id}"
+        requirement_options = '<option value="">No requirement</option>' + "".join(
+            f'<option value="{html_escape(requirement["id"])}" {"selected" if requirement["id"] == row.get("requirement_id") else ""}>{html_escape(requirement["position_title"])} ({html_escape(requirement["status"])})</option>'
+            for requirement in requirements
+        )
+        edit_form = f"""
+        <section class="panel">
+            <div class="panel-head"><h2>Edit Application</h2></div>
+            <form method="post" action="/applications/update" class="requirement-form">
+                <input type="hidden" name="id" value="{html_escape(application_id)}">
+                <label>Candidate Email<input name="candidate_email" type="email" value="{html_escape(row["candidate_email"] or "")}"></label>
+                <label>Source Email<input name="source_email" type="email" value="{html_escape(row["source_email"] or "")}"></label>
+                <label>Referrer Email<input name="referrer_email" type="email" value="{html_escape(row["referrer_email"] or "")}"></label>
+                <label>Submission Type<select name="submission_type"><option value="self_application" {"selected" if row["submission_type"] == "self_application" else ""}>Self Application</option><option value="referral" {"selected" if row["submission_type"] == "referral" else ""}>Referral</option></select></label>
+                <label>Requirement<select name="requirement_id">{requirement_options}</select></label>
+                <label>Detected Position<input name="detected_position" value="{html_escape(row["detected_position"] or "")}"></label>
+                <label>Matched Position<input name="matched_position" value="{html_escape(row["matched_position"] or "")}"></label>
+                <label>Status<select name="application_status">{self.status_options(row["application_status"])}</select></label>
+                <label>ATS Score<input name="ats_score" type="number" step="0.1" value="{html_escape(row["ats_score"] or "")}"></label>
+                <label>JD Match Score<input name="jd_match_score" type="number" step="0.1" value="{html_escape(row["jd_match_score"] or "")}"></label>
+                <label>Current Salary<input name="screening_current_salary" type="number" value="{html_escape(row.get("screening_current_salary") or "")}"></label>
+                <label>Expected Salary<input name="screening_expected_salary" type="number" value="{html_escape(row.get("screening_expected_salary") or "")}"></label>
+                <label>Current Location<input name="screening_current_location" value="{html_escape(row.get("screening_current_location") or "")}"></label>
+                <label>Joining Days<input name="screening_joining_days" type="number" value="{html_escape(row.get("screening_joining_days") or "")}"></label>
+                <label>HR Interviewer Email<input name="hr_interviewer_email" type="email" value="{html_escape(row.get("hr_interviewer_email") or "")}"></label>
+                <label>HR Interviewer Name<input name="hr_interviewer_name" value="{html_escape(row.get("hr_interviewer_name") or "")}"></label>
+                <label class="wide">AI Short Description<textarea name="ai_short_description" rows="3">{html_escape(row["ai_short_description"] or "")}</textarea></label>
+                <label class="wide">HR Escalation Reason<textarea name="hr_escalation_reason" rows="3">{html_escape(row.get("hr_escalation_reason") or "")}</textarea></label>
+                <label class="wide">Interview Availability<textarea name="interview_availability" rows="3">{html_escape(row.get("interview_availability") or "")}</textarea></label>
+                <button type="submit">Save Changes</button>
+            </form>
+        </section>
+        """
         hr_approve_form = ""
         if (row["application_status"] or "").lower() == "hr_escalated":
             hr_approve_form = f"""
@@ -1759,8 +2345,20 @@ Previous transcript:
                 <button type="submit" class="danger">Reject Candidate</button>
             </form>
             """
+        jd_rejection_form = ""
+        if (row["application_status"] or "").lower() == "rejected_jd_score":
+            jd_rejection_form = f"""
+            <form method="post" action="/applications/revoke-jd-rejection" class="inline-form" onsubmit="return confirm('Revoke the JD-score rejection and send screening questions to this candidate?');">
+                <input type="hidden" name="id" value="{html_escape(application_id)}">
+                <button type="submit">Revoke JD Rejection</button>
+            </form>
+            """
         final_hr_decision_forms = ""
         if (row["application_status"] or "").lower() == "final_hr_round_completed_pending_decision":
+            interviewer_options = '<option value="">Auto assign</option>' + "".join(
+                f'<option value="{html_escape(interviewer["email"])}">{html_escape(interviewer["name"])} ({html_escape(interviewer["email"])})</option>'
+                for interviewer in final_hr_interviewers()
+            )
             final_hr_decision_forms = f"""
             <form method="post" action="/applications/final-select" class="inline-form" onsubmit="return confirm('Select this candidate and send the onboarding documents email?');">
                 <input type="hidden" name="id" value="{html_escape(application_id)}">
@@ -1774,8 +2372,13 @@ Previous transcript:
                 <input type="hidden" name="id" value="{html_escape(application_id)}">
                 <button type="submit" class="secondary">Put On Hold</button>
             </form>
-            <form method="post" action="/applications/final-reschedule" class="inline-form" onsubmit="return confirm('Ask this candidate to reschedule the final HR round?');">
+            <form method="post" action="/applications/final-reschedule" class="inline-form" onsubmit="return configureHrReschedule(this);">
                 <input type="hidden" name="id" value="{html_escape(application_id)}">
+                <input type="hidden" name="reschedule_mode" value="ask_candidate">
+                <input type="hidden" name="scheduled_at" value="">
+                <select name="interviewer_email" class="hr-interviewer-select">
+                    {interviewer_options}
+                </select>
                 <button type="submit" class="secondary">Reschedule HR Round</button>
             </form>
             """
@@ -1801,8 +2404,10 @@ Previous transcript:
                 <div class="action-stack">
                     {status_badge(row["application_status"])}
                     <a class="link-button" href="/applications/{html_escape(application_id)}/cv">Download CV</a>
+                    {self.delete_form("/applications/delete", application_id, "Delete Application", "Delete this application?")}
                     {hr_approve_form}
                     {post_interview_review_forms}
+                    {jd_rejection_form}
                     {final_hr_decision_forms}
                     {send_interview_form}
                     {send_teams_form}
@@ -1810,6 +2415,7 @@ Previous transcript:
             </div>
             {self.detail_grid(fields)}
         </section>
+        {edit_form}
         """
 
     def render_public_interview(self, token: str):
@@ -2807,12 +3413,33 @@ Previous transcript:
             ("Created", date_text(row["created_at"])),
             ("Details", row["details"], "json-wide"),
         ]
+        details_text = self.json_text(row["details"])
+        edit_form = f"""
+        <section class="panel">
+            <div class="panel-head"><h2>Edit Email Event</h2></div>
+            <form method="post" action="/events/update" class="requirement-form">
+                <input type="hidden" name="id" value="{html_escape(event_id)}">
+                <label>Event Type<input name="event_type" value="{html_escape(row["event_type"] or "")}"></label>
+                <label>Source Email<input name="source_email" value="{html_escape(row["source_email"] or "")}"></label>
+                <label class="wide">Email Subject<input name="email_subject" value="{html_escape(row["email_subject"] or "")}"></label>
+                <label class="wide">Details JSON<textarea name="details" rows="8">{details_text}</textarea></label>
+                <button type="submit">Save Changes</button>
+            </form>
+        </section>
+        """
         return f"""
         {self.back_link("/events", "Back to events")}
         <section class="panel">
-            <div class="panel-head"><h2>Email Event #{html_escape(event_id)}</h2>{status_badge(row["event_type"])}</div>
+            <div class="panel-head">
+                <h2>Email Event #{html_escape(event_id)}</h2>
+                <div class="action-stack">
+                    {status_badge(row["event_type"])}
+                    {self.delete_form("/events/delete", event_id, "Delete Event", "Delete this email event log?")}
+                </div>
+            </div>
             {self.detail_grid(fields)}
         </section>
+        {edit_form}
         """
 
     def status_options(self, selected: str | None) -> str:
@@ -2828,6 +3455,8 @@ Previous transcript:
             "hr_round_time_requested",
             "interview_on_hold_hr_review",
             "interview_rejected",
+            "rejected_jd_score",
+            "manual_hr_review",
             "final_hr_round_completed_pending_decision",
             "selected_documents_requested",
             "rejected_after_hr_round",
@@ -2893,6 +3522,14 @@ Previous transcript:
     def back_link(self, href: str, label: str) -> str:
         return f'<div class="back-row"><a class="link-button" href="{html_escape(href)}">{html_escape(label)}</a></div>'
 
+    def delete_form(self, action: str, record_id, label: str, message: str) -> str:
+        return f"""
+        <form method="post" action="{html_escape(action)}" class="inline-form" onsubmit="return confirm('{html_escape(message)}');">
+            <input type="hidden" name="id" value="{html_escape(record_id)}">
+            <button type="submit" class="danger">{html_escape(label)}</button>
+        </form>
+        """
+
     def not_found_panel(self, record_name: str, back_href: str) -> str:
         return f"""
         {self.back_link(back_href, f"Back to {record_name.lower()}s")}
@@ -2935,6 +3572,7 @@ Previous transcript:
                     {self.nav_link("/candidates", "Candidates", active == "candidates")}
                     {self.nav_link("/events", "Email Events", active == "events")}
                 </nav>
+                <a class="logout-link" href="/logout">Sign out</a>
             </aside>
             <main>
                 <header class="topbar">
@@ -2946,6 +3584,33 @@ Previous transcript:
                 </header>
                 {content}
             </main>
+            <script>
+            function configureHrReschedule(form) {{
+                const scheduleNow = window.confirm(
+                    'Do you want to schedule the final HR round now?\\n\\nOK = choose date/time now\\nCancel = ask candidate for availability'
+                );
+                form.reschedule_mode.value = scheduleNow ? 'schedule_now' : 'ask_candidate';
+                if (scheduleNow) {{
+                    const timeValue = window.prompt(
+                        'Enter interview date/time in IST. Example: 2026-07-31T18:30',
+                        ''
+                    );
+                    if (!timeValue) return false;
+                    form.scheduled_at.value = timeValue;
+                }} else {{
+                    form.scheduled_at.value = '';
+                }}
+                const interviewer = form.interviewer_email;
+                const selected = interviewer && interviewer.options[interviewer.selectedIndex]
+                    ? interviewer.options[interviewer.selectedIndex].text
+                    : 'Auto assign';
+                return window.confirm(
+                    (scheduleNow ? 'Schedule final HR round now' : 'Ask candidate for availability') +
+                    '\\nInterviewer: ' + selected +
+                    '\\nAllowed slots: Monday-Friday, 6 PM to 1 AM IST\\n\\nContinue?'
+                );
+            }}
+            </script>
         </body>
         </html>
         """
@@ -3058,6 +3723,13 @@ nav a {
     color: #dbe7f3;
 }
 nav a.active, nav a:hover { background: var(--nav-soft); color: white; }
+.logout-link {
+    display: block;
+    margin-top: 18px;
+    color: #c8d7ea;
+    text-decoration: none;
+    font-size: 13px;
+}
 main {
     min-width: 0;
     padding: 24px;
@@ -3211,11 +3883,11 @@ td.description {
     background: #dff5ef;
     color: #0f6b58;
 }
-.badge-closed, .badge-rejected, .badge-withdrawn {
+.badge-closed, .badge-rejected, .badge-rejected_jd_score, .badge-withdrawn {
     background: #fde8e6;
     color: var(--danger);
 }
-.badge-no_open_requirement, .badge-review, .badge-reviewed {
+.badge-no_open_requirement, .badge-review, .badge-reviewed, .badge-manual_hr_review {
     background: #fff3d8;
     color: var(--accent-2);
 }
@@ -3291,6 +3963,51 @@ pre {
 }
 .health div:last-child { border-bottom: 0; padding-bottom: 0; }
 .health span { color: var(--muted); }
+.schedule-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+}
+.schedule-card {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 14px;
+    background: #fbfdff;
+}
+.schedule-card > div {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+}
+.schedule-card strong, .schedule-card small {
+    display: block;
+}
+.schedule-card small {
+    color: var(--muted);
+    margin-top: 3px;
+}
+.schedule-card b {
+    display: inline-block;
+    margin: 12px 0;
+    font-size: 28px;
+}
+.schedule-card ul {
+    display: grid;
+    gap: 8px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+.schedule-card li {
+    display: grid;
+    gap: 3px;
+    padding-top: 8px;
+    border-top: 1px solid var(--line);
+}
+.schedule-card li span {
+    color: var(--muted);
+    font-size: 12px;
+}
 .back-row {
     margin-bottom: 16px;
 }
@@ -3349,6 +4066,44 @@ pre {
     border-radius: 8px;
     padding: 24px;
 }
+.login-page {
+    display: block;
+    min-height: 100vh;
+    background: var(--page);
+}
+.login-wrap {
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+}
+.login-card {
+    width: min(420px, 100%);
+    background: white;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 24px;
+    box-shadow: 0 18px 42px rgba(15, 23, 42, .12);
+}
+.login-brand {
+    color: var(--ink);
+    margin-bottom: 20px;
+}
+.login-form {
+    display: grid;
+    gap: 14px;
+    margin-top: 18px;
+}
+.login-form label {
+    display: grid;
+    gap: 6px;
+    color: var(--muted);
+    font-size: 13px;
+}
+.login-form input {
+    width: 100%;
+    box-sizing: border-box;
+}
 code {
     display: block;
     margin-top: 12px;
@@ -3363,7 +4118,7 @@ code {
         height: auto;
     }
     nav { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-    .metrics, .notification-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .metrics, .notification-grid, .schedule-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .grid-two, .requirement-form, .detail-grid { grid-template-columns: 1fr; }
     .field, .field:nth-child(3n) { border-right: 0; }
     main { padding: 16px; }
@@ -3373,7 +4128,7 @@ code {
 @media (max-width: 640px) {
     nav { grid-template-columns: 1fr 1fr; }
     .topbar, .search { align-items: stretch; flex-direction: column; }
-    .metrics, .notification-grid { grid-template-columns: 1fr; }
+    .metrics, .notification-grid, .schedule-grid { grid-template-columns: 1fr; }
 }
 """
 

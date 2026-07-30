@@ -336,6 +336,14 @@ MICROSOFT_CLIENT_ID=your-azure-app-client-id
 MICROSOFT_CLIENT_SECRET=your-azure-app-client-secret
 MICROSOFT_MAILBOX=career@virtualadmins.org
 
+# The mailbox above receives candidate email. Final HR Teams meetings are
+# created from one of these interviewer calendars and auto-assigned.
+FINAL_HR_INTERVIEWERS=Pragati Pradhan <pragati.pradhan@virtualadmins.org>, Akash <akash@virtualadmins.org>
+FINAL_HR_WINDOW_START_HOUR=18
+FINAL_HR_WINDOW_END_HOUR=1
+FINAL_HR_WORKDAYS=0,1,2,3,4
+FINAL_HR_DEFAULT_DURATION_MINUTES=45
+
 GRAPH_WEBHOOK_HOST=0.0.0.0
 GRAPH_WEBHOOK_PORT=8081
 GRAPH_WEBHOOK_PATH=/graph/outlook
