@@ -1025,6 +1025,30 @@ def candidate_email_from_cv(extracted: dict[str, Any], cv_text: str) -> str | No
     return clean_email(extracted.get("email")) or clean_email(cv_text)
 
 
+def non_indian_phone_reason(extracted: dict[str, Any], cv_text: str) -> str | None:
+    values = [str(extracted.get("phone") or ""), cv_text[:4000]]
+    combined = "\n".join(value for value in values if value)
+
+    for match in re.finditer(r"(?<!\w)(\+|00)[\d\s().-]{8,22}\d\b", combined):
+        prefix = match.group(1)
+        raw_number = match.group(0)
+        digits = re.sub(r"\D", "", raw_number)
+        if prefix == "+" and not digits.startswith("91"):
+            return f"Detected non-India phone number: {raw_number.strip()}"
+        if prefix == "00" and not digits.startswith("0091"):
+            return f"Detected non-India phone number: {raw_number.strip()}"
+
+    extracted_phone = str(extracted.get("phone") or "").strip()
+    if extracted_phone:
+        phone_digits = re.sub(r"\D", "", extracted_phone)
+        if extracted_phone.startswith("+") and not extracted_phone.startswith("+91"):
+            return f"Extracted phone number is not an India +91 number: {extracted_phone}"
+        if extracted_phone.startswith("00") and not phone_digits.startswith("0091"):
+            return f"Extracted phone number is not an India +91 number: {extracted_phone}"
+
+    return None
+
+
 def score_number(value: Any) -> float | None:
     if value in (None, "", "null"):
         return None
@@ -3477,6 +3501,24 @@ class AIRecruiterAgent:
             body,
         )
 
+    def reply_india_location_only(self, inbox_email: InboxEmail):
+        fallback_body = recruiter_email_body(
+            "Thanks for sharing your CV.",
+            "At the moment, we are hiring only for candidates based in India. Because the contact details in the CV do not appear to be for India, we will not be able to proceed with this application right now.",
+            "Wishing you all the best in your job search.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "candidate shared a CV, but the contact number appears to be outside India and this hiring is India-only",
+            {"india_only_hiring": True, "do_not_proceed": True},
+            fallback_body,
+        )
+        self.mailer.send_reply(
+            inbox_email,
+            f"Application update: {inbox_email.subject}",
+            body,
+        )
+
     def reply_received(self, inbox_email: InboxEmail):
         fallback_body = recruiter_email_body(
             "Thanks for applying and sharing your CV.",
@@ -3875,6 +3917,28 @@ class AIRecruiterAgent:
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000),
             },
         )
+        if inbox_email.attachments and any(is_cv_filename(filename) for filename, _ in inbox_email.attachments):
+            if not classification.get("is_employment_related"):
+                classification = {
+                    **classification,
+                    "is_employment_related": True,
+                    "latest_intent": "submitting_cv",
+                    "reason": (
+                        "Readable CV attachment is present, so the email should be processed "
+                        "as a recruiting CV submission even though subject/body are empty."
+                    ),
+                }
+                log_json(
+                    logging.INFO,
+                    "classification_overridden_by_cv_attachment",
+                    **inbox_email_summary(inbox_email),
+                    classification=classification,
+                )
+                trace_recruiter_event(
+                    "classification_overridden_by_cv_attachment",
+                    inputs=inbox_email_summary(inbox_email),
+                    outputs={"classification": classification},
+                )
 
         if active_application and is_final_agent_status(active_application.get("application_status")):
             trace_recruiter_event(
@@ -4051,7 +4115,6 @@ class AIRecruiterAgent:
             "cv_attachments_detected",
             **inbox_email_summary(inbox_email),
             cv_attachment_count=len(cv_attachments),
-            cv_attachment_names=[filename for filename, _ in cv_attachments],
         )
         trace_recruiter_event(
             "cv_attachments_detected",
@@ -4251,6 +4314,38 @@ class AIRecruiterAgent:
                     "skill_count": len(ensure_list(extracted.get("skills"))),
                 },
             )
+            india_phone_rejection_reason = non_indian_phone_reason(extracted, cv_text)
+            if india_phone_rejection_reason:
+                log_json(
+                    logging.INFO,
+                    "india_location_only_rejected",
+                    **inbox_email_summary(inbox_email),
+                    filename=filename,
+                    extracted_phone=extracted.get("phone"),
+                    reason=india_phone_rejection_reason,
+                )
+                trace_recruiter_event(
+                    "india_location_only_rejected",
+                    inputs=inbox_email_summary(inbox_email),
+                    outputs={
+                        "filename": filename,
+                        "extracted_phone": extracted.get("phone"),
+                        "reason": india_phone_rejection_reason,
+                        "next_action": "reply_india_location_only",
+                    },
+                )
+                self.db.log_email_event(
+                    inbox_email,
+                    "india_location_only_rejected",
+                    {
+                        "filename": filename,
+                        "extracted_phone": extracted.get("phone"),
+                        "reason": india_phone_rejection_reason,
+                        "candidate_email": candidate_email_from_cv(extracted, cv_text),
+                    },
+                )
+                self.reply_india_location_only(inbox_email)
+                continue
             if use_cv_role_override:
                 requested_match = {"requirement_id": None, "confidence": 0, "reason": "Sender corrected thread; using CV role"}
             else:
