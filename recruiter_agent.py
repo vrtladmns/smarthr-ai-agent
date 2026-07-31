@@ -4,6 +4,7 @@ import email
 import hashlib
 import imaplib
 import json
+import logging
 import mimetypes
 import random
 import re
@@ -19,6 +20,7 @@ from email.policy import default
 from email.utils import parseaddr, parsedate_to_datetime
 from html import escape as html_escape
 from html import unescape
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,7 +31,7 @@ from uuid import uuid4
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from langsmith import traceable
+from langsmith import trace, traceable
 
 from config import (
     DATABASE_URL,
@@ -74,6 +76,8 @@ from config import (
     RECRUITER_IMAP_HOST,
     RECRUITER_INTERVIEW_BASE_URL,
     RECRUITER_IMAP_PORT,
+    RECRUITER_LOG_FILE,
+    RECRUITER_LOG_LEVEL,
     RECRUITER_MAILBOX,
     RECRUITER_OFFICE_LOCATION,
     RECRUITER_APPEND_SIGNATURE,
@@ -99,6 +103,126 @@ from llm_factory import make_chat_model
 
 
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+
+
+LOGGER = logging.getLogger("recruiter_agent")
+
+
+def setup_recruiter_logging():
+    if LOGGER.handlers:
+        return
+    log_level = getattr(logging, str(RECRUITER_LOG_LEVEL).upper(), logging.INFO)
+    LOGGER.setLevel(log_level)
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s [%(threadName)s] %(message)s"
+    )
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(log_level)
+    LOGGER.addHandler(console_handler)
+
+    if RECRUITER_LOG_FILE:
+        log_path = Path(RECRUITER_LOG_FILE)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_path,
+            maxBytes=5_000_000,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(log_level)
+        LOGGER.addHandler(file_handler)
+
+    LOGGER.propagate = False
+
+
+def log_json(level: int, event: str, **details: Any):
+    safe_details = {
+        key: value
+        for key, value in details.items()
+        if key.lower() not in {"password", "secret", "token", "api_key", "client_secret"}
+    }
+    LOGGER.log(
+        level,
+        "%s %s",
+        event,
+        json.dumps(safe_details, default=str, ensure_ascii=False),
+    )
+
+
+def safe_trace_payload(value: Any, depth: int = 0) -> Any:
+    if depth > 4:
+        return str(value)[:300]
+    if isinstance(value, dict):
+        output = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text.lower() in {
+                "password",
+                "secret",
+                "token",
+                "api_key",
+                "client_secret",
+                "payload",
+                "attachment_payload",
+                "cv_text",
+                "body",
+                "thread_context",
+            }:
+                output[key_text] = "[redacted]"
+            else:
+                output[key_text] = safe_trace_payload(item, depth + 1)
+        return output
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+        return [safe_trace_payload(item, depth + 1) for item in items[:30]]
+    if isinstance(value, str):
+        return value if len(value) <= 1200 else f"{value[:1200]}...[truncated]"
+    return value
+
+
+def trace_recruiter_event(
+    name: str,
+    *,
+    inputs: dict[str, Any] | None = None,
+    outputs: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+    tags: list[str] | None = None,
+):
+    try:
+        with trace(
+            name,
+            run_type="chain",
+            inputs=safe_trace_payload(inputs or {}),
+            metadata=safe_trace_payload(metadata or {}),
+            tags=["recruiter-agent", *(tags or [])],
+        ) as run:
+            if outputs is not None:
+                run.add_outputs(safe_trace_payload(outputs))
+    except Exception as exc:
+        LOGGER.debug("LangSmith trace event failed for %s: %s", name, exc)
+
+
+def inbox_email_summary(inbox_email) -> dict[str, Any]:
+    if not inbox_email:
+        return {}
+    return {
+        "message_id": inbox_email.message_id,
+        "uid": inbox_email.uid,
+        "sender": inbox_email.sender,
+        "subject": inbox_email.subject,
+        "attachment_count": len(inbox_email.attachments or []),
+        "cv_attachment_names": [
+            filename
+            for filename, _ in inbox_email.attachments or []
+            if is_cv_filename(filename)
+        ],
+    }
+
+
+setup_recruiter_logging()
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -2896,20 +3020,49 @@ class RecruiterAI:
         self.reply_llm = make_chat_model(json_mode=False, max_tokens=350)
 
     def json_call(self, prompt: str) -> dict[str, Any]:
-        response = self.llm.invoke(
-            f"""
+        started_at = time.monotonic()
+        try:
+            response = self.llm.invoke(
+                f"""
 Return one valid JSON object only.
 Do not include markdown, comments, trailing commas, or explanatory text.
 
 {prompt}
 """
-        ).content
-        json_text = self.extract_json_object(response)
-        try:
-            return json.loads(json_text)
-        except json.JSONDecodeError as exc:
-            repaired = self.repair_json(json_text, exc)
-            return json.loads(repaired)
+            ).content
+            json_text = self.extract_json_object(response)
+            try:
+                result = json.loads(json_text)
+            except json.JSONDecodeError as exc:
+                log_json(
+                    logging.WARNING,
+                    "llm_json_parse_failed_repairing",
+                    error=str(exc),
+                    response_preview=str(response)[:1000],
+                    elapsed_ms=round((time.monotonic() - started_at) * 1000),
+                )
+                repaired = self.repair_json(json_text, exc)
+                result = json.loads(repaired)
+            log_json(
+                logging.DEBUG,
+                "llm_json_call_completed",
+                elapsed_ms=round((time.monotonic() - started_at) * 1000),
+                response_chars=len(str(response)),
+            )
+            return result
+        except Exception as exc:
+            LOGGER.exception(
+                "llm_json_call_failed %s",
+                json.dumps(
+                    {
+                        "error": str(exc),
+                        "prompt_preview": prompt[:1000],
+                        "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+                    },
+                    default=str,
+                ),
+            )
+            raise
 
     def extract_json_object(self, response: str) -> str:
         match = re.search(r"\{.*\}", response, flags=re.S)
@@ -3689,6 +3842,12 @@ class AIRecruiterAgent:
 
     @traceable(name="process_recruiting_email")
     def process_email(self, inbox_email: InboxEmail) -> bool:
+        started_at = time.monotonic()
+        log_json(logging.INFO, "email_processing_started", **inbox_email_summary(inbox_email))
+        trace_recruiter_event(
+            "email_processing_started",
+            inputs=inbox_email_summary(inbox_email),
+        )
         thread_context = build_thread_context(inbox_email)
         classification = self.ai.classify_email(inbox_email)
         latest_application = self.db.latest_application_for_email(inbox_email.sender)
@@ -3697,8 +3856,36 @@ class AIRecruiterAgent:
             if latest_application
             else None
         )
+        log_json(
+            logging.INFO,
+            "email_classified",
+            **inbox_email_summary(inbox_email),
+            classification=classification,
+            latest_application_id=latest_application["id"] if latest_application else None,
+            active_application_status=active_application.get("application_status") if active_application else None,
+            elapsed_ms=round((time.monotonic() - started_at) * 1000),
+        )
+        trace_recruiter_event(
+            "email_classified",
+            inputs=inbox_email_summary(inbox_email),
+            outputs={
+                "classification": classification,
+                "latest_application_id": latest_application["id"] if latest_application else None,
+                "active_application_status": active_application.get("application_status") if active_application else None,
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+            },
+        )
 
         if active_application and is_final_agent_status(active_application.get("application_status")):
+            trace_recruiter_event(
+                "final_status_no_auto_reply",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={
+                    "application_id": active_application["id"],
+                    "status": active_application.get("application_status"),
+                    "next_action": "manual_hr_review_notification",
+                },
+            )
             self.db.log_email_event(
                 inbox_email,
                 "final_status_no_auto_reply",
@@ -3729,6 +3916,14 @@ class AIRecruiterAgent:
             ],
             hours=72,
         ):
+            trace_recruiter_event(
+                "manual_review_thread_no_auto_reply",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={
+                    "application_id": active_application["id"] if active_application else None,
+                    "next_action": "no_auto_reply",
+                },
+            )
             self.db.log_email_event(
                 inbox_email,
                 "manual_review_thread_no_auto_reply",
@@ -3742,6 +3937,14 @@ class AIRecruiterAgent:
 
         if is_withdrawal_request(inbox_email.body):
             withdrawn_application = self.db.mark_latest_application_withdrawn(inbox_email.sender)
+            trace_recruiter_event(
+                "withdrawal_request",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={
+                    "application_found": withdrawn_application is not None,
+                    "application_id": withdrawn_application["id"] if withdrawn_application else None,
+                },
+            )
             self.db.log_email_event(
                 inbox_email,
                 "withdrawal_request",
@@ -3807,18 +4010,57 @@ class AIRecruiterAgent:
                 return True
 
         if not classification.get("is_employment_related"):
+            trace_recruiter_event(
+                "ignored_non_employment",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={"classification": classification, "next_action": "leave_unread"},
+            )
             self.db.log_email_event(inbox_email, "ignored_non_employment", classification)
             return False
 
         requirements = self.db.open_requirements()
         is_referral = is_referral_thread(thread_context)
         use_cv_role_override = is_cv_role_override_request(inbox_email.body, thread_context)
+        log_json(
+            logging.INFO,
+            "open_requirements_loaded",
+            **inbox_email_summary(inbox_email),
+            open_requirement_count=len(requirements),
+            open_requirements=[row.get("position_title") for row in requirements],
+            is_referral=is_referral,
+            use_cv_role_override=use_cv_role_override,
+        )
+        trace_recruiter_event(
+            "open_requirements_loaded",
+            inputs=inbox_email_summary(inbox_email),
+            outputs={
+                "open_requirement_count": len(requirements),
+                "open_requirements": [row.get("position_title") for row in requirements],
+                "is_referral": is_referral,
+                "use_cv_role_override": use_cv_role_override,
+            },
+        )
 
         cv_attachments = [
             (filename, payload)
             for filename, payload in inbox_email.attachments
             if is_cv_filename(filename)
         ]
+        log_json(
+            logging.INFO,
+            "cv_attachments_detected",
+            **inbox_email_summary(inbox_email),
+            cv_attachment_count=len(cv_attachments),
+            cv_attachment_names=[filename for filename, _ in cv_attachments],
+        )
+        trace_recruiter_event(
+            "cv_attachments_detected",
+            inputs=inbox_email_summary(inbox_email),
+            outputs={
+                "cv_attachment_count": len(cv_attachments),
+                "cv_attachment_names": [filename for filename, _ in cv_attachments],
+            },
+        )
         if not cv_attachments:
             if self.db.recent_event_count(
                 inbox_email.sender,
@@ -3857,6 +4099,23 @@ class AIRecruiterAgent:
             )
             matched_requirement_id = safe_int(match.get("requirement_id"))
             requirement = next((row for row in requirements if row["id"] == matched_requirement_id), None)
+            log_json(
+                logging.INFO,
+                "missing_cv_requirement_decision",
+                **inbox_email_summary(inbox_email),
+                match=match,
+                matched_requirement=requirement["position_title"] if requirement else None,
+                detected_position=classification.get("detected_position"),
+            )
+            trace_recruiter_event(
+                "missing_cv_requirement_decision",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={
+                    "match": match,
+                    "matched_requirement": requirement["position_title"] if requirement else None,
+                    "detected_position": classification.get("detected_position"),
+                },
+            )
 
             if is_status_followup(inbox_email.body):
                 self.db.log_email_event(
@@ -3918,14 +4177,51 @@ class AIRecruiterAgent:
             )
 
             if requirement:
+                log_json(
+                    logging.INFO,
+                    "reply_missing_cv_for_open_requirement",
+                    **inbox_email_summary(inbox_email),
+                    requirement_id=requirement.get("id"),
+                    requirement_position=requirement.get("position_title"),
+                )
                 self.reply_missing_cv(inbox_email)
             else:
+                log_json(
+                    logging.INFO,
+                    "reply_no_opening_no_cv",
+                    **inbox_email_summary(inbox_email),
+                    detected_position=classification.get("detected_position"),
+                )
                 self.reply_no_opening(inbox_email, classification.get("detected_position"))
             return True
 
         for filename, payload in cv_attachments:
+            log_json(
+                logging.INFO,
+                "cv_processing_started",
+                **inbox_email_summary(inbox_email),
+                filename=filename,
+                payload_bytes=len(payload or b""),
+            )
+            trace_recruiter_event(
+                "cv_processing_started",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={"filename": filename, "payload_bytes": len(payload or b"")},
+            )
             cv_text = extract_cv_text(filename, payload)
             if not cv_text:
+                log_json(
+                    logging.WARNING,
+                    "cv_text_extract_failed",
+                    **inbox_email_summary(inbox_email),
+                    filename=filename,
+                )
+                trace_recruiter_event(
+                    "cv_text_extract_failed",
+                    inputs=inbox_email_summary(inbox_email),
+                    outputs={"filename": filename},
+                    tags=["warning"],
+                )
                 self.db.log_email_event(
                     inbox_email,
                     "cv_text_extract_failed",
@@ -3934,6 +4230,27 @@ class AIRecruiterAgent:
                 continue
 
             extracted = self.ai.extract_cv_details(cv_text, thread_context)
+            log_json(
+                logging.INFO,
+                "cv_details_extracted",
+                **inbox_email_summary(inbox_email),
+                filename=filename,
+                target_position=extracted.get("target_position"),
+                current_title=extracted.get("current_title"),
+                candidate_email=candidate_email_from_cv(extracted, cv_text),
+                skill_count=len(ensure_list(extracted.get("skills"))),
+            )
+            trace_recruiter_event(
+                "cv_details_extracted",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={
+                    "filename": filename,
+                    "target_position": extracted.get("target_position"),
+                    "current_title": extracted.get("current_title"),
+                    "candidate_email": candidate_email_from_cv(extracted, cv_text),
+                    "skill_count": len(ensure_list(extracted.get("skills"))),
+                },
+            )
             if use_cv_role_override:
                 requested_match = {"requirement_id": None, "confidence": 0, "reason": "Sender corrected thread; using CV role"}
             else:
@@ -3959,6 +4276,25 @@ class AIRecruiterAgent:
             )
             cv_position = extracted.get("target_position") or extracted.get("current_title")
             if not use_cv_role_override and not roles_are_compatible(requested_position, cv_position, cv_text):
+                log_json(
+                    logging.INFO,
+                    "wrong_cv_for_requested_role",
+                    **inbox_email_summary(inbox_email),
+                    requested_position=requested_position,
+                    cv_position=cv_position,
+                    requested_match=requested_match,
+                    use_cv_role_override=use_cv_role_override,
+                )
+                trace_recruiter_event(
+                    "wrong_cv_for_requested_role",
+                    inputs=inbox_email_summary(inbox_email),
+                    outputs={
+                        "requested_position": requested_position,
+                        "cv_position": cv_position,
+                        "requested_match": requested_match,
+                        "use_cv_role_override": use_cv_role_override,
+                    },
+                )
                 self.db.log_email_event(
                     inbox_email,
                     "wrong_cv_for_requested_role",
@@ -4015,8 +4351,46 @@ class AIRecruiterAgent:
                     "use_cv_role_override": use_cv_role_override,
                 },
             )
+            trace_recruiter_event(
+                "requirement_match",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={
+                    "target_position": extracted.get("target_position"),
+                    "current_title": extracted.get("current_title"),
+                    "detected_position": classification.get("detected_position"),
+                    "match": match,
+                    "matched_requirement": requirement["position_title"] if requirement else None,
+                    "open_requirement_count": len(requirements),
+                    "is_referral": is_referral,
+                    "candidate_email": candidate_email_from_cv(extracted, cv_text),
+                    "use_cv_role_override": use_cv_role_override,
+                },
+            )
 
             evaluation = self.ai.evaluate_cv(cv_text, extracted, requirement)
+            log_json(
+                logging.INFO,
+                "cv_evaluated",
+                **inbox_email_summary(inbox_email),
+                filename=filename,
+                requirement_id=requirement.get("id") if requirement else None,
+                matched_requirement=requirement.get("position_title") if requirement else None,
+                ats_score=evaluation.get("ats_score"),
+                jd_match_score=evaluation.get("jd_match_score"),
+                recommendation=evaluation.get("recommendation"),
+            )
+            trace_recruiter_event(
+                "cv_evaluated",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={
+                    "filename": filename,
+                    "requirement_id": requirement.get("id") if requirement else None,
+                    "matched_requirement": requirement.get("position_title") if requirement else None,
+                    "ats_score": evaluation.get("ats_score"),
+                    "jd_match_score": evaluation.get("jd_match_score"),
+                    "recommendation": evaluation.get("recommendation"),
+                },
+            )
             candidate_email = candidate_email_from_cv(extracted, cv_text)
             submission_type = "referral" if is_referral else "self_application"
             referrer_email = inbox_email.sender if is_referral else None
@@ -4045,6 +4419,29 @@ class AIRecruiterAgent:
                 candidate_email,
                 referrer_email,
             )
+            log_json(
+                logging.INFO,
+                "application_saved",
+                **inbox_email_summary(inbox_email),
+                application_id=application_id,
+                candidate_id=candidate_id,
+                status=status,
+                requirement_id=requirement.get("id") if requirement else None,
+                candidate_email=candidate_email,
+                submission_type=submission_type,
+            )
+            trace_recruiter_event(
+                "application_saved",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={
+                    "application_id": application_id,
+                    "candidate_id": candidate_id,
+                    "status": status,
+                    "requirement_id": requirement.get("id") if requirement else None,
+                    "candidate_email": candidate_email,
+                    "submission_type": submission_type,
+                },
+            )
             if application_id:
                 try:
                     uploaded_filename = upload_cv_attachment(application_id, filename, payload)
@@ -4059,7 +4456,36 @@ class AIRecruiterAgent:
                             "attachment_sha256": attachment_sha256,
                         },
                     )
+                    log_json(
+                        logging.INFO,
+                        "cv_uploaded",
+                        **inbox_email_summary(inbox_email),
+                        application_id=application_id,
+                        attachment_filename=uploaded_filename,
+                        attachment_sha256=attachment_sha256,
+                    )
+                    trace_recruiter_event(
+                        "cv_uploaded",
+                        inputs=inbox_email_summary(inbox_email),
+                        outputs={
+                            "application_id": application_id,
+                            "attachment_filename": uploaded_filename,
+                            "attachment_sha256": attachment_sha256,
+                        },
+                    )
                 except Exception as exc:
+                    LOGGER.exception(
+                        "cv_upload_failed %s",
+                        json.dumps(
+                            {
+                                **inbox_email_summary(inbox_email),
+                                "application_id": application_id,
+                                "filename": filename,
+                                "error": str(exc),
+                            },
+                            default=str,
+                        ),
+                    )
                     self.db.log_email_event(
                         inbox_email,
                         "cv_upload_failed",
@@ -4073,6 +4499,26 @@ class AIRecruiterAgent:
 
             if requirement:
                 if application_id and passes_screening_threshold(evaluation, requirement):
+                    log_json(
+                        logging.INFO,
+                        "screening_threshold_passed",
+                        **inbox_email_summary(inbox_email),
+                        application_id=application_id,
+                        ats_score=evaluation.get("ats_score"),
+                        jd_match_score=evaluation.get("jd_match_score"),
+                        requirement_position=requirement.get("position_title"),
+                    )
+                    trace_recruiter_event(
+                        "screening_threshold_passed",
+                        inputs=inbox_email_summary(inbox_email),
+                        outputs={
+                            "application_id": application_id,
+                            "ats_score": evaluation.get("ats_score"),
+                            "jd_match_score": evaluation.get("jd_match_score"),
+                            "requirement_position": requirement.get("position_title"),
+                            "next_action": "screening_questions_sent",
+                        },
+                    )
                     self.db.update_application_screening(
                         application_id,
                         "screening_questions_sent",
@@ -4086,6 +4532,28 @@ class AIRecruiterAgent:
                     continue
                 if application_id:
                     reason = jd_rejection_reason(evaluation, requirement)
+                    log_json(
+                        logging.INFO,
+                        "screening_threshold_failed",
+                        **inbox_email_summary(inbox_email),
+                        application_id=application_id,
+                        reason=reason,
+                        ats_score=evaluation.get("ats_score"),
+                        jd_match_score=evaluation.get("jd_match_score"),
+                        requirement_position=requirement.get("position_title"),
+                    )
+                    trace_recruiter_event(
+                        "screening_threshold_failed",
+                        inputs=inbox_email_summary(inbox_email),
+                        outputs={
+                            "application_id": application_id,
+                            "reason": reason,
+                            "ats_score": evaluation.get("ats_score"),
+                            "jd_match_score": evaluation.get("jd_match_score"),
+                            "requirement_position": requirement.get("position_title"),
+                            "next_action": "jd_score_rejected",
+                        },
+                    )
                     self.db.mark_jd_score_rejected(application_id, reason)
                     try:
                         notify_jd_score_rejection_to_hr(application_id, evaluation, requirement)
@@ -4113,16 +4581,44 @@ class AIRecruiterAgent:
                 else:
                     self.reply_received(inbox_email)
             else:
+                log_json(
+                    logging.INFO,
+                    "reply_no_opening_with_cv",
+                    **inbox_email_summary(inbox_email),
+                    application_id=application_id,
+                    target_position=extracted.get("target_position"),
+                    current_title=extracted.get("current_title"),
+                )
+                trace_recruiter_event(
+                    "reply_no_opening_with_cv",
+                    inputs=inbox_email_summary(inbox_email),
+                    outputs={
+                        "application_id": application_id,
+                        "target_position": extracted.get("target_position"),
+                        "current_title": extracted.get("current_title"),
+                    },
+                )
                 self.reply_no_opening(inbox_email, extracted.get("target_position"))
 
+        log_json(
+            logging.INFO,
+            "email_processing_finished",
+            **inbox_email_summary(inbox_email),
+            elapsed_ms=round((time.monotonic() - started_at) * 1000),
+        )
+        trace_recruiter_event(
+            "email_processing_finished",
+            inputs=inbox_email_summary(inbox_email),
+            outputs={"elapsed_ms": round((time.monotonic() - started_at) * 1000)},
+        )
         return True
 
     def run_once(self):
         self.init_schema()
-        print(f"Using mail provider: {self.inbox.provider_name}")
+        LOGGER.info("Using mail provider: %s", self.inbox.provider_name)
         emails = self.inbox.fetch_unseen(RECRUITER_POLL_LIMIT)
         if not emails:
-            print("No unread recruiter emails found.")
+            LOGGER.info("No unread recruiter emails found.")
             return
 
         for inbox_email in emails:
@@ -4130,12 +4626,18 @@ class AIRecruiterAgent:
                 should_mark_seen = self.process_email(inbox_email)
                 if should_mark_seen:
                     self.inbox.mark_seen(inbox_email.uid)
-                    print(f"Processed: {inbox_email.subject} from {inbox_email.sender}")
+                    log_json(logging.INFO, "email_processed_marked_seen", **inbox_email_summary(inbox_email))
                 else:
                     self.inbox.mark_unseen(inbox_email.uid)
-                    print(f"Ignored non-recruitment email and left unread: {inbox_email.subject} from {inbox_email.sender}")
+                    log_json(logging.INFO, "email_ignored_left_unread", **inbox_email_summary(inbox_email))
             except Exception as exc:
-                print(f"Failed to process {inbox_email.subject} from {inbox_email.sender}: {exc}")
+                LOGGER.exception(
+                    "email_processing_failed %s",
+                    json.dumps(
+                        {**inbox_email_summary(inbox_email), "error": str(exc)},
+                        default=str,
+                    ),
+                )
                 try:
                     self.db.log_email_event(
                         inbox_email,
@@ -4143,35 +4645,90 @@ class AIRecruiterAgent:
                         {"error": str(exc)},
                     )
                 except Exception as log_exc:
-                    print(f"Could not log processing failure: {log_exc}")
+                    LOGGER.exception("Could not log processing failure: %s", log_exc)
 
     def process_one_graph_message(self, message_id: str, resource_path: str | None = None) -> bool:
         self.init_schema()
         if not isinstance(self.inbox, MicrosoftGraphProvider):
-            print("Single-message Graph processing is only available with MAIL_PROVIDER=microsoft_graph.")
+            LOGGER.error("Single-message Graph processing is only available with MAIL_PROVIDER=microsoft_graph.")
             return False
 
+        log_json(
+            logging.INFO,
+            "graph_message_fetch_started",
+            graph_message_id=message_id,
+            resource_path=resource_path,
+        )
+        trace_recruiter_event(
+            "graph_message_fetch_started",
+            inputs={"graph_message_id": message_id, "resource_path": resource_path},
+            tags=["graph"],
+        )
         inbox_email = self.inbox.fetch_message_by_id(message_id, resource_path=resource_path)
         if not inbox_email:
-            print(f"Microsoft Graph message not found or unavailable: {message_id}")
+            log_json(
+                logging.WARNING,
+                "graph_message_not_found",
+                graph_message_id=message_id,
+                resource_path=resource_path,
+            )
+            trace_recruiter_event(
+                "graph_message_not_found",
+                inputs={"graph_message_id": message_id, "resource_path": resource_path},
+                tags=["graph", "warning"],
+            )
             return False
 
         try:
             should_mark_seen = self.process_email(inbox_email)
             if should_mark_seen:
                 self.inbox.mark_seen(inbox_email.uid)
-                print(f"Processed Graph message only: {inbox_email.subject} from {inbox_email.sender}")
+                log_json(
+                    logging.INFO,
+                    "graph_message_processed_marked_seen",
+                    **inbox_email_summary(inbox_email),
+                    graph_message_id=message_id,
+                )
+                trace_recruiter_event(
+                    "graph_message_processed_marked_seen",
+                    inputs=inbox_email_summary(inbox_email),
+                    outputs={"graph_message_id": message_id},
+                    tags=["graph"],
+                )
                 return True
             else:
                 self.inbox.mark_unseen(inbox_email.uid)
-                print(f"Ignored non-recruitment Graph message and left unread: {inbox_email.subject} from {inbox_email.sender}")
+                log_json(
+                    logging.INFO,
+                    "graph_message_ignored_left_unread",
+                    **inbox_email_summary(inbox_email),
+                    graph_message_id=message_id,
+                )
+                trace_recruiter_event(
+                    "graph_message_ignored_left_unread",
+                    inputs=inbox_email_summary(inbox_email),
+                    outputs={"graph_message_id": message_id},
+                    tags=["graph"],
+                )
                 return True
         except Exception as exc:
-            print(f"Failed to process Graph message {message_id}: {exc}")
+            LOGGER.exception(
+                "graph_message_processing_failed %s",
+                json.dumps(
+                    {**inbox_email_summary(inbox_email), "graph_message_id": message_id, "error": str(exc)},
+                    default=str,
+                ),
+            )
+            trace_recruiter_event(
+                "graph_message_processing_failed",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={"graph_message_id": message_id, "error": str(exc)},
+                tags=["graph", "error"],
+            )
             try:
                 self.inbox.mark_unseen(inbox_email.uid)
             except Exception as mark_exc:
-                print(f"Could not mark failed Graph message unread: {mark_exc}")
+                LOGGER.exception("Could not mark failed Graph message unread: %s", mark_exc)
             try:
                 self.db.log_email_event(
                     inbox_email,
@@ -4179,7 +4736,7 @@ class AIRecruiterAgent:
                     {"error": str(exc), "graph_message_id": message_id},
                 )
             except Exception as log_exc:
-                print(f"Could not log processing failure: {log_exc}")
+                LOGGER.exception("Could not log processing failure: %s", log_exc)
             return False
 
     def run_forever(self, poll_seconds: int):
@@ -5018,7 +5575,26 @@ class GraphWebhookServer:
         failed_refs = []
         with self.lock:
             unique_message_refs = list(dict.fromkeys(message_refs))
-            print(f"Microsoft Graph trigger received for {len(unique_message_refs)} message(s)")
+            log_json(
+                logging.INFO,
+                "graph_notification_received",
+                message_count=len(unique_message_refs),
+                message_refs=[
+                    {"message_id": message_id, "resource_path": resource_path}
+                    for message_id, resource_path in unique_message_refs
+                ],
+            )
+            trace_recruiter_event(
+                "graph_notification_received",
+                inputs={
+                    "message_count": len(unique_message_refs),
+                    "message_refs": [
+                        {"message_id": message_id, "resource_path": resource_path}
+                        for message_id, resource_path in unique_message_refs
+                    ],
+                },
+                tags=["graph", "webhook"],
+            )
             agent = None
             try:
                 agent = AIRecruiterAgent()
@@ -5027,7 +5603,18 @@ class GraphWebhookServer:
                     if not processed:
                         failed_refs.append((message_id, resource_path))
             except Exception as exc:
-                print(f"Microsoft Graph notification processing failed: {exc}")
+                LOGGER.exception("Microsoft Graph notification processing failed: %s", exc)
+                trace_recruiter_event(
+                    "graph_notification_processing_failed",
+                    inputs={
+                        "message_refs": [
+                            {"message_id": message_id, "resource_path": resource_path}
+                            for message_id, resource_path in unique_message_refs
+                        ],
+                    },
+                    outputs={"error": str(exc)},
+                    tags=["graph", "webhook", "error"],
+                )
                 failed_refs.extend(unique_message_refs)
             finally:
                 if agent:
@@ -5040,13 +5627,27 @@ class GraphWebhookServer:
         retry_key = (message_id, resource_path or "")
         with self.retry_lock:
             if retry_key in self.pending_retries:
-                print(f"Microsoft Graph retry already scheduled for message {message_id}")
+                log_json(logging.INFO, "graph_retry_already_scheduled", graph_message_id=message_id)
+                trace_recruiter_event(
+                    "graph_retry_already_scheduled",
+                    inputs={"graph_message_id": message_id, "resource_path": resource_path},
+                    tags=["graph", "retry"],
+                )
                 return
             self.pending_retries.add(retry_key)
 
-        print(
-            f"Scheduling Microsoft Graph retry for message {message_id} "
-            f"in {GRAPH_PROCESSING_RETRY_SECONDS} seconds."
+        log_json(
+            logging.INFO,
+            "graph_retry_scheduled",
+            graph_message_id=message_id,
+            resource_path=resource_path,
+            retry_seconds=GRAPH_PROCESSING_RETRY_SECONDS,
+        )
+        trace_recruiter_event(
+            "graph_retry_scheduled",
+            inputs={"graph_message_id": message_id, "resource_path": resource_path},
+            outputs={"retry_seconds": GRAPH_PROCESSING_RETRY_SECONDS},
+            tags=["graph", "retry"],
         )
         Thread(
             target=self.retry_message_after_delay,
@@ -5063,11 +5664,31 @@ class GraphWebhookServer:
                     agent = AIRecruiterAgent()
                     processed = agent.process_one_graph_message(message_id, resource_path=resource_path)
                     if processed:
-                        print(f"Retried and processed Microsoft Graph message: {message_id}")
+                        log_json(logging.INFO, "graph_retry_processed", graph_message_id=message_id)
+                        trace_recruiter_event(
+                            "graph_retry_processed",
+                            inputs={"graph_message_id": message_id, "resource_path": resource_path},
+                            tags=["graph", "retry"],
+                        )
                     else:
-                        print(f"Microsoft Graph retry failed; message was left unread: {message_id}")
+                        log_json(logging.WARNING, "graph_retry_failed_left_unread", graph_message_id=message_id)
+                        trace_recruiter_event(
+                            "graph_retry_failed_left_unread",
+                            inputs={"graph_message_id": message_id, "resource_path": resource_path},
+                            tags=["graph", "retry", "warning"],
+                        )
                 except Exception as exc:
-                    print(f"Microsoft Graph retry crashed; message was left unread: {message_id}: {exc}")
+                    LOGGER.exception(
+                        "Microsoft Graph retry crashed; message was left unread: %s: %s",
+                        message_id,
+                        exc,
+                    )
+                    trace_recruiter_event(
+                        "graph_retry_crashed",
+                        inputs={"graph_message_id": message_id, "resource_path": resource_path},
+                        outputs={"error": str(exc)},
+                        tags=["graph", "retry", "error"],
+                    )
                 finally:
                     if agent:
                         agent.close()

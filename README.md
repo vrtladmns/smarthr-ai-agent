@@ -405,6 +405,21 @@ Follow logs:
 journalctl -u recruiter-agent -f
 ```
 
+Detailed recruiter logs are also written to a rotating file:
+
+```bash
+tail -f /home/ubuntu/company-policy-agent/logs/recruiter_agent.log
+tail -n 200 /home/ubuntu/company-policy-agent/logs/recruiter_agent.log
+grep -i "processing_failed\|graph_message_processing_failed\|llm_json_call_failed" /home/ubuntu/company-policy-agent/logs/recruiter_agent.log
+```
+
+You can control logging from `.env`:
+
+```env
+RECRUITER_LOG_LEVEL=INFO
+RECRUITER_LOG_FILE=logs/recruiter_agent.log
+```
+
 Configure Nginx:
 
 ```bash
@@ -482,6 +497,7 @@ Useful commands:
 sudo systemctl status recruiter-agent
 sudo systemctl restart recruiter-agent
 journalctl -u recruiter-agent --tail=100
+tail -n 200 logs/recruiter_agent.log
 curl -i https://hr.virtualadmins.org/health
 ./venv/bin/python recruiter_agent.py --list-graph-subscriptions
 ```

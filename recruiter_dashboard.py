@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import logging
 import mimetypes
 import random
 import re
@@ -24,6 +25,7 @@ from config import (
 )
 from llm_factory import make_chat_model
 from recruiter_agent import (
+    LOGGER,
     RecruiterDatabase,
     candidate_interview_url,
     final_hr_interviewers,
@@ -40,6 +42,7 @@ from recruiter_agent import (
     send_interview_rejection,
     send_interview_request_after_hr_approval,
     send_teams_link_for_application,
+    log_json,
 )
 
 
@@ -56,7 +59,7 @@ def notify_post_interview_outcome_async(application_id: int, report: dict):
         try:
             notify_post_interview_outcome(application_id, report)
         except Exception as exc:
-            print(f"Post-interview notification failed for application {application_id}: {exc}")
+            LOGGER.exception("Post-interview notification failed for application %s: %s", application_id, exc)
 
     Thread(target=run, daemon=True).start()
 
@@ -67,9 +70,9 @@ def start_final_hr_round_monitor():
             try:
                 marked = mark_due_final_hr_rounds_pending()
                 if marked:
-                    print(f"Marked {marked} final HR round(s) pending decision.")
+                    log_json(logging.INFO, "final_hr_rounds_marked_pending", count=marked)
             except Exception as exc:
-                print(f"Final HR round monitor failed: {exc}")
+                LOGGER.exception("Final HR round monitor failed: %s", exc)
             time.sleep(FINAL_HR_CHECK_SECONDS)
 
     Thread(target=run, daemon=True).start()
@@ -353,6 +356,14 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
+        log_json(
+            logging.INFO,
+            "dashboard_request_started",
+            method="GET",
+            path=parsed.path,
+            query=parsed.query,
+            remote=self.client_address[0] if self.client_address else None,
+        )
         try:
             if parsed.path == "/login":
                 self.render_login()
@@ -403,10 +414,29 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(404, "Page not found")
         except Exception as exc:
+            LOGGER.exception(
+                "dashboard_get_failed %s",
+                json.dumps(
+                    {
+                        "path": parsed.path,
+                        "query": parsed.query,
+                        "remote": self.client_address[0] if self.client_address else None,
+                        "error": str(exc),
+                    },
+                    default=str,
+                ),
+            )
             self.render_error(exc)
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        log_json(
+            logging.INFO,
+            "dashboard_request_started",
+            method="POST",
+            path=parsed.path,
+            remote=self.client_address[0] if self.client_address else None,
+        )
         try:
             interview_api = interview_api_path(parsed.path)
             if interview_api:
@@ -430,6 +460,14 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             payload = self.rfile.read(length).decode("utf-8")
             form = {key: values[0] if values else "" for key, values in parse_qs(payload).items()}
+            log_json(
+                logging.INFO,
+                "dashboard_form_received",
+                path=parsed.path,
+                form_keys=sorted(form.keys()),
+                application_id=form.get("id"),
+                remote=self.client_address[0] if self.client_address else None,
+            )
 
             if parsed.path == "/requirements":
                 self.create_requirement(form)
@@ -547,6 +585,17 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(404, "Page not found")
         except Exception as exc:
+            LOGGER.exception(
+                "dashboard_post_failed %s",
+                json.dumps(
+                    {
+                        "path": parsed.path,
+                        "remote": self.client_address[0] if self.client_address else None,
+                        "error": str(exc),
+                    },
+                    default=str,
+                ),
+            )
             self.render_error(exc)
 
     def db(self) -> DashboardDB:
@@ -3659,7 +3708,7 @@ Previous transcript:
         self.wfile.write(data)
 
     def log_message(self, format: str, *args):
-        print(f"[dashboard] {self.address_string()} - {format % args}")
+        LOGGER.info("[dashboard] %s - %s", self.address_string(), format % args)
 
 
 CSS = """
