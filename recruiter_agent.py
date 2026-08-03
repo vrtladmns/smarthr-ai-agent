@@ -35,8 +35,7 @@ from langsmith import trace, traceable
 
 from config import (
     DATABASE_URL,
-    CV_UPLOAD_API_URL_TEMPLATE,
-    CV_UPLOAD_TIMEOUT_SECONDS,
+    CV_STORAGE_DIR,
     DB_PROVIDER,
     FINAL_HR_DEFAULT_DURATION_MINUTES,
     FINAL_HR_INTERVIEWERS,
@@ -215,9 +214,9 @@ def inbox_email_summary(inbox_email) -> dict[str, Any]:
         "subject": inbox_email.subject,
         "attachment_count": len(inbox_email.attachments or []),
         "cv_attachment_names": [
-            filename
+            attachment_display_name(filename)
             for filename, _ in inbox_email.attachments or []
-            if is_cv_filename(filename)
+            if is_cv_attachment(filename, _)
         ],
     }
 
@@ -338,6 +337,35 @@ def is_final_hr_slot_allowed(value: datetime) -> bool:
     return in_window and operational_day.weekday() in final_hr_workdays()
 
 
+def final_hr_operational_day(value: datetime) -> datetime.date:
+    local = as_recruiter_time(value)
+    hour_value = local.hour + local.minute / 60
+    if FINAL_HR_WINDOW_START_HOUR > FINAL_HR_WINDOW_END_HOUR and hour_value < FINAL_HR_WINDOW_END_HOUR:
+        return (local - timedelta(days=1)).date()
+    return local.date()
+
+
+def next_final_hr_working_day(after: datetime | None = None) -> datetime.date:
+    local = as_recruiter_time(after or recruiter_now())
+    day = local.date() + timedelta(days=1)
+    workdays = final_hr_workdays()
+    for _ in range(14):
+        if day.weekday() in workdays:
+            return day
+        day += timedelta(days=1)
+    return day
+
+
+def final_hr_datetime_for_operational_day(day, hour: int, minute: int = 0) -> datetime:
+    calendar_day = day
+    if FINAL_HR_WINDOW_START_HOUR > FINAL_HR_WINDOW_END_HOUR and hour < FINAL_HR_WINDOW_END_HOUR:
+        calendar_day = day + timedelta(days=1)
+    return datetime.combine(calendar_day, datetime.min.time(), tzinfo=recruiter_tz()).replace(
+        hour=hour,
+        minute=minute,
+    )
+
+
 def next_final_hr_slot(after: datetime | None = None) -> datetime:
     current = as_recruiter_time(after or recruiter_now()) + timedelta(minutes=15)
     current = current.replace(second=0, microsecond=0)
@@ -374,15 +402,32 @@ def random_final_hr_slot(after: datetime | None = None) -> datetime:
     return random.choice(candidates) if candidates else next_final_hr_slot(now)
 
 
-def coerce_final_hr_slot(value: datetime | None, flexible: bool = False) -> datetime | None:
+def coerce_final_hr_slot(
+    value: datetime | None,
+    flexible: bool = False,
+    require_next_working_day: bool = False,
+) -> datetime | None:
     if flexible:
         return random_final_hr_slot()
     if not value:
         return None
     local = as_recruiter_time(value)
-    if is_final_hr_slot_allowed(local):
+    if require_next_working_day:
+        minimum_working_day = next_final_hr_working_day()
+        if final_hr_operational_day(local) < minimum_working_day:
+            local = final_hr_datetime_for_operational_day(minimum_working_day, local.hour, local.minute)
+    if is_final_hr_slot_allowed(local) and (
+        not require_next_working_day or final_hr_operational_day(local) >= next_final_hr_working_day()
+    ):
         return local
-    return next_final_hr_slot(local)
+    search_from = local
+    if require_next_working_day and final_hr_operational_day(local) < next_final_hr_working_day():
+        search_from = final_hr_datetime_for_operational_day(
+            next_final_hr_working_day(),
+            FINAL_HR_WINDOW_START_HOUR,
+            0,
+        ) - timedelta(minutes=15)
+    return next_final_hr_slot(search_from)
 
 
 def choose_final_hr_interviewer(
@@ -455,6 +500,7 @@ CREATE TABLE IF NOT EXISTS recruiter_applications (
     candidate_id BIGINT NOT NULL REFERENCES recruiter_candidates(id),
     requirement_id BIGINT REFERENCES recruitment_requirements(id),
     email_message_id TEXT,
+    email_thread_id TEXT,
     source_email TEXT,
     candidate_email TEXT,
     referrer_email TEXT,
@@ -506,6 +552,7 @@ ON recruitment_requirements (LOWER(position_title));
 ALTER TABLE recruiter_candidates ADD COLUMN IF NOT EXISTS candidate_email TEXT;
 ALTER TABLE recruiter_candidates ADD COLUMN IF NOT EXISTS referrer_email TEXT;
 ALTER TABLE recruiter_candidates ADD COLUMN IF NOT EXISTS submission_type TEXT NOT NULL DEFAULT 'self_application';
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS email_thread_id TEXT;
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS candidate_email TEXT;
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS referrer_email TEXT;
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS submission_type TEXT NOT NULL DEFAULT 'self_application';
@@ -595,6 +642,7 @@ CREATE TABLE recruiter_applications (
     candidate_id BIGINT NOT NULL REFERENCES recruiter_candidates(id),
     requirement_id BIGINT NULL REFERENCES recruitment_requirements(id),
     email_message_id NVARCHAR(1000) NULL,
+    email_thread_id NVARCHAR(1000) NULL,
     source_email NVARCHAR(500) NULL,
     candidate_email NVARCHAR(500) NULL,
     referrer_email NVARCHAR(500) NULL,
@@ -656,6 +704,9 @@ ON recruitment_requirements (position_title);
 
 IF COL_LENGTH('recruiter_applications', 'attachment_payload') IS NULL
 ALTER TABLE recruiter_applications ADD attachment_payload VARBINARY(MAX) NULL;
+
+IF COL_LENGTH('recruiter_applications', 'email_thread_id') IS NULL
+ALTER TABLE recruiter_applications ADD email_thread_id NVARCHAR(1000) NULL;
 
 IF COL_LENGTH('recruiter_applications', 'screening_details') IS NULL
 ALTER TABLE recruiter_applications ADD screening_details NVARCHAR(MAX) NOT NULL DEFAULT '{}';
@@ -845,22 +896,85 @@ def build_thread_context(inbox_email: InboxEmail) -> str:
     return "\n\n---\n\n".join(lines)
 
 
+def thread_message_ids(inbox_email: InboxEmail) -> list[str]:
+    seen = set()
+    values = [
+        inbox_email.message_id,
+        inbox_email.in_reply_to,
+        inbox_email.references,
+    ]
+    values.extend(message.message_id for message in inbox_email.thread_messages or [] if message.message_id)
+
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        matches = re.findall(r"<[^>\s]+>", text)
+        if matches:
+            seen.update(matches)
+        elif " " not in text:
+            seen.add(text)
+    return list(seen)
+
+
+def latest_reply_text(body: str) -> str:
+    if not body:
+        return ""
+    markers = [
+        r"\n\s*On .+ wrote:\s*$",
+        r"\n\s*From:\s+",
+        r"\n\s*Sent:\s+",
+        r"\n\s*-{2,}\s*Original Message\s*-{2,}",
+    ]
+    latest = body
+    for marker in markers:
+        parts = re.split(marker, latest, maxsplit=1, flags=re.I | re.M)
+        latest = parts[0]
+    return latest.strip()
+
+
 def extract_attachments(message: email.message.EmailMessage) -> list[tuple[str, bytes]]:
     attachments = []
     for part in message.walk():
-        if part.get_content_disposition() != "attachment":
+        if part.get_content_disposition() not in {"attachment", "inline"} and not part.get_filename():
             continue
 
         filename = decode_mime(part.get_filename()) or f"attachment-{len(attachments) + 1}"
+        content_type = part.get_content_type() or ""
+        attachment_name = f"{filename}|{content_type}" if content_type else filename
         payload = part.get_payload(decode=True)
         if payload:
-            attachments.append((filename, payload))
+            attachments.append((attachment_name, payload))
 
     return attachments
 
 
+def attachment_display_name(filename: str) -> str:
+    return (filename or "").split("|", 1)[0]
+
+
 def is_cv_filename(filename: str) -> bool:
-    return Path(filename.lower()).suffix in CV_EXTENSIONS
+    return is_cv_attachment(filename, b"")
+
+
+def is_cv_attachment(filename: str, payload: bytes | None = None) -> bool:
+    raw = filename or ""
+    display_name = attachment_display_name(raw)
+    lowered = raw.lower()
+    display_lower = display_name.lower()
+    suffix = Path(display_lower).suffix
+    if suffix in CV_EXTENSIONS:
+        return True
+    if any(mime in lowered for mime in ["application/pdf", "application/msword", "officedocument.wordprocessingml.document"]):
+        return True
+    if "text/plain" in lowered and any(word in display_lower for word in ["cv", "resume", "resumé", "biodata", "bio-data", "profile"]):
+        return True
+    if payload:
+        if payload.startswith(b"%PDF") and any(word in display_lower for word in ["cv", "resume", "profile", "attachment"]):
+            return True
+        if payload[:2] == b"PK" and any(word in display_lower for word in ["cv", "resume", "profile", "attachment"]):
+            return True
+    return False
 
 
 def safe_int(value: Any) -> int | None:
@@ -1100,6 +1214,46 @@ def screening_answers_complete(answers: dict[str, Any]) -> bool:
         answers.get(key) not in (None, "", [])
         for key in ["comfortable_with_terms", "current_salary", "expected_salary", "current_location", "joining_days"]
     )
+
+
+def candidate_declined_required_location(text: str) -> bool:
+    latest = normalize_position_text(latest_reply_text(text))
+    if not latest:
+        return False
+    if any(
+        phrase in latest
+        for phrase in [
+            "not ready to relocate",
+            "not willing to relocate",
+            "cannot relocate",
+            "cant relocate",
+            "can't relocate",
+            "not relocate",
+            "not comfortable to relocate",
+            "not comfortable with mohali",
+            "not open to mohali",
+            "not ready for mohali",
+            "cannot move to mohali",
+            "cant move to mohali",
+            "can't move to mohali",
+        ]
+    ):
+        return True
+    preferred_city_only = any(city in latest for city in ["hyderabad", "bangalore", "bengaluru", "remote", "work from home"])
+    mohali_missing = "mohali" not in latest
+    if preferred_city_only and mohali_missing and any(
+        phrase in latest
+        for phrase in [
+            "only",
+            "looking for",
+            "preferred location",
+            "prefer",
+            "if had any vacancies",
+            "if you have any vacancies",
+        ]
+    ):
+        return True
+    return False
 
 
 def json_dict(value: Any) -> dict[str, Any]:
@@ -1357,7 +1511,6 @@ def normalize_position_text(value: str | None) -> str:
     value = value.lower()
     value = re.sub(r"\bdev\b", "developer", value)
     value = re.sub(r"\bacct\b", "accountant", value)
-    value = re.sub(r"\baccounts?\b", "accountant", value)
     value = re.sub(r"\baccounting\b", "accountant", value)
     value = re.sub(r"[^a-z0-9]+", " ", value)
     words = [
@@ -1372,37 +1525,45 @@ def position_tokens(value: str | None) -> set[str]:
     return set(normalize_position_text(value).split())
 
 
-def is_design_role_text(value: str | None) -> bool:
-    tokens = position_tokens(value)
-    phrases = normalize_position_text(value)
-    design_tokens = {
-        "ui",
-        "ux",
-        "designer",
-        "design",
-        "figma",
-        "wireframe",
-        "wireframes",
-        "prototype",
-        "prototyping",
-        "usability",
-        "user",
-        "interface",
-        "experience",
-        "product",
+GENERIC_ROLE_WORDS = {
+    "job",
+    "role",
+    "position",
+    "opening",
+    "vacancy",
+    "profile",
+    "candidate",
+    "resume",
+    "cv",
+    "senior",
+    "sr",
+    "junior",
+    "jr",
+    "lead",
+    "trainee",
+    "intern",
+    "associate",
+    "assistant",
+    "executive",
+    "specialist",
+    "manager",
+    "officer",
+    "staff",
+    "team",
+    "full",
+    "cycle",
+    "us",
+    "uk",
+    "india",
+}
+
+
+def meaningful_role_tokens(value: str | None) -> set[str]:
+    return {
+        token
+        for token in position_tokens(value)
+        if token not in GENERIC_ROLE_WORDS and len(token) > 1
     }
-    if tokens & design_tokens:
-        return True
-    return any(
-        phrase in phrases
-        for phrase in [
-            "user interface",
-            "user experience",
-            "product designer",
-            "visual designer",
-            "interaction designer",
-        ]
-    )
 
 
 def deterministic_requirement_match(
@@ -1416,54 +1577,54 @@ def deterministic_requirement_match(
         extracted.get("current_title"),
         classification.get("detected_position"),
     ]
-    candidate_fields = candidate_positions + [
-        " ".join(str(skill) for skill in ensure_list(extracted.get("skills"))),
-        source_text,
-    ]
-
-    candidate_text = normalize_position_text(" ".join(value for value in candidate_fields if value))
+    candidate_role_text = normalize_position_text(" ".join(value for value in candidate_positions if value))
+    candidate_skill_text = normalize_position_text(
+        " ".join(str(skill) for skill in ensure_list(extracted.get("skills")))
+    )
+    candidate_text = normalize_position_text(
+        " ".join(value for value in [candidate_role_text, candidate_skill_text] if value)
+    )
+    if not candidate_text and source_text:
+        candidate_text = normalize_position_text(source_text[:1200])
     candidate_words = position_tokens(candidate_text)
     if not candidate_words:
         return {"requirement_id": None, "confidence": 0, "reason": "No candidate role detected"}
+    candidate_role_words = meaningful_role_tokens(candidate_role_text) or meaningful_role_tokens(candidate_text)
+    if not candidate_role_words:
+        return {"requirement_id": None, "confidence": 0, "reason": "No meaningful candidate role detected"}
 
     best_requirement = None
     best_score = 0.0
+    best_reason = "No deterministic position-title match"
 
     for requirement in requirements:
         title = requirement.get("position_title")
         title_text = normalize_position_text(title)
-        title_words = position_tokens(title)
+        title_words = meaningful_role_tokens(title)
         if not title_words:
             continue
 
-        if title_text and title_text in candidate_text:
+        if title_text and candidate_role_text and title_text in candidate_role_text:
             score = 1.0
-        elif candidate_text and candidate_text in title_text:
+            reason = "Requirement title appears in candidate role/title"
+        elif candidate_role_text and candidate_role_text in title_text:
             score = 0.95
+            reason = "Candidate role/title appears in requirement title"
         else:
-            overlap = candidate_words & title_words
-            score = len(overlap) / len(title_words)
-
-        hiring_title_words = {"developer", "engineer", "programmer", "designer", "accountant", "executive", "manager"}
-        if candidate_words & title_words:
-            if "python" in candidate_words and "python" in title_words and title_words & {"developer", "engineer", "programmer"}:
-                score = max(score, 0.9)
-            elif is_design_role_text(candidate_text) and is_design_role_text(title_text):
-                score = max(score, 0.9)
-            elif "accountant" in candidate_words and "accountant" in title_words:
-                score = max(score, 0.9)
-            elif len(candidate_words) <= 2 and title_words & hiring_title_words:
-                score = max(score, 0.82)
+            overlap = candidate_role_words & title_words
+            score = len(overlap) / max(len(title_words), 1)
+            reason = f"Shared meaningful role tokens: {sorted(overlap)}" if overlap else "No shared meaningful role tokens"
 
         if score > best_score:
             best_score = score
             best_requirement = requirement
+            best_reason = reason
 
-    if best_requirement and best_score >= 0.75:
+    if best_requirement and best_score >= 0.65:
         return {
             "requirement_id": best_requirement["id"],
             "confidence": round(best_score, 2),
-            "reason": "Matched by normalized position title",
+            "reason": best_reason,
         }
 
     return {
@@ -1471,6 +1632,214 @@ def deterministic_requirement_match(
         "confidence": round(best_score, 2),
         "reason": "No deterministic position-title match",
     }
+
+
+def requirement_is_compatible_with_candidate_role(
+    extracted: dict[str, Any],
+    classification: dict[str, Any],
+    requirement: dict[str, Any] | None,
+) -> bool:
+    if not requirement:
+        return True
+    candidate_role_text = normalize_position_text(
+        " ".join(
+            value
+            for value in [
+                extracted.get("target_position"),
+                extracted.get("current_title"),
+                classification.get("detected_position"),
+            ]
+            if value
+        )
+    )
+    if not candidate_role_text:
+        return True
+    title_text = normalize_position_text(requirement.get("position_title"))
+    if not title_text:
+        return True
+    if title_text in candidate_role_text or candidate_role_text in title_text:
+        return True
+
+    role_words = meaningful_role_tokens(candidate_role_text)
+    requirement_text = normalize_position_text(
+        " ".join(
+            str(value)
+            for value in [
+                requirement.get("position_title"),
+                requirement.get("job_description"),
+            ]
+            if value
+        )
+    )
+    requirement_words = meaningful_role_tokens(requirement_text)
+    overlap = role_words & requirement_words
+    if overlap:
+        return True
+    return False
+
+
+def classification_has_specific_role(classification: dict[str, Any]) -> bool:
+    role = normalize_position_text(classification.get("detected_position"))
+    if not role:
+        return False
+    vague_roles = {
+        "job",
+        "any",
+        "any suitable",
+        "suitable",
+        "opening",
+        "vacancy",
+        "resume",
+        "cv",
+        "profile",
+    }
+    if role in vague_roles:
+        return False
+    return len(position_tokens(role)) >= 1
+
+
+def application_has_saved_cv(application: dict[str, Any] | None) -> bool:
+    if not application:
+        return False
+    for field in [
+        "attachment_filename",
+        "attachment_sha256",
+        "raw_cv_text",
+        "cv_summary",
+        "ai_short_description",
+    ]:
+        if str(application.get(field) or "").strip():
+            return True
+    return False
+
+
+def application_role_is_compatible(
+    application: dict[str, Any] | None,
+    classification: dict[str, Any],
+    thread_context: str,
+) -> bool:
+    if not application or not classification_has_specific_role(classification):
+        return True
+    application_role = (
+        application.get("requirement_position")
+        or application.get("matched_position")
+        or application.get("detected_position")
+    )
+    requested_role = classification.get("detected_position")
+    if not application_role or not requested_role:
+        return True
+    return roles_are_compatible(application_role, requested_role, thread_context)
+
+
+def is_design_role_text(value: str | None) -> bool:
+    tokens = position_tokens(value)
+    text = normalize_position_text(value)
+    design_tokens = {
+        "ui",
+        "ux",
+        "designer",
+        "design",
+        "figma",
+        "wireframe",
+        "wireframes",
+        "prototype",
+        "prototyping",
+        "usability",
+        "interface",
+    }
+    if tokens & design_tokens:
+        return True
+    return any(
+        phrase in text
+        for phrase in [
+            "user interface",
+            "user experience",
+            "product designer",
+            "visual designer",
+            "interaction designer",
+        ]
+    )
+
+
+ROLE_FAMILY_KEYWORDS = {
+    "hr": {
+        "hr",
+        "human",
+        "resource",
+        "resources",
+        "recruiter",
+        "recruitment",
+        "talent",
+        "onboarding",
+        "employee",
+        "payroll",
+    },
+    "design": {
+        "ui",
+        "ux",
+        "designer",
+        "design",
+        "figma",
+        "wireframe",
+        "prototype",
+        "usability",
+        "interface",
+    },
+    "software": {
+        "python",
+        "java",
+        "javascript",
+        "developer",
+        "engineer",
+        "backend",
+        "frontend",
+        "fullstack",
+        "django",
+        "fastapi",
+        "flask",
+    },
+    "accounting": {
+        "accountant",
+        "accounting",
+        "bookkeeping",
+        "gst",
+        "tds",
+        "tally",
+        "ledger",
+        "reconciliation",
+        "payable",
+        "receivable",
+    },
+    "tax": {
+        "tax",
+        "irs",
+        "1040",
+        "1065",
+        "1120",
+        "k1",
+        "preparer",
+    },
+    "it_support": {
+        "desktop",
+        "support",
+        "helpdesk",
+        "active",
+        "directory",
+        "gpo",
+        "troubleshooting",
+        "hardware",
+        "network",
+    },
+}
+
+
+def role_families_from_text(value: str | None) -> set[str]:
+    tokens = position_tokens(value)
+    families = set()
+    for family, keywords in ROLE_FAMILY_KEYWORDS.items():
+        if tokens & keywords:
+            families.add(family)
+    return families
 
 
 def roles_are_compatible(requested_role: str | None, cv_role: str | None, cv_text: str = "") -> bool:
@@ -1507,6 +1876,11 @@ def roles_are_compatible(requested_role: str | None, cv_role: str | None, cv_tex
             return True
 
     if is_design_role_text(requested_text) and is_design_role_text(cv_search_text):
+        return True
+
+    requested_families = role_families_from_text(requested_text)
+    cv_families = role_families_from_text(cv_search_text)
+    if requested_families and requested_families & cv_families:
         return True
 
     overlap = requested_words & position_tokens(cv_search_text)
@@ -1552,31 +1926,31 @@ def extract_cv_text(filename: str, payload: bytes) -> str:
     return ""
 
 
-def upload_cv_attachment(application_id: int, filename: str, payload: bytes) -> str:
-    if not CV_UPLOAD_API_URL_TEMPLATE:
-        return filename
+def safe_cv_storage_filename(filename: str) -> str:
+    display_name = attachment_display_name(filename) or "cv"
+    safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", display_name).strip(" ._")
+    if not safe_name:
+        safe_name = "cv"
+    return safe_name[:180]
 
-    requests = require_package("requests", "./venv/bin/python -m pip install requests")
-    url = CV_UPLOAD_API_URL_TEMPLATE.format(application_id=application_id)
-    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    response = requests.post(
-        url,
-        files={"file": (filename, payload, content_type)},
-        headers={"accept": "*/*"},
-        timeout=CV_UPLOAD_TIMEOUT_SECONDS,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(f"CV upload API failed: {response.status_code} {response.text}")
+
+def save_cv_attachment_file(application_id: int, filename: str, payload: bytes) -> str:
+    storage_root = Path(CV_STORAGE_DIR)
+    if not storage_root.is_absolute():
+        storage_root = Path.cwd() / storage_root
+
+    storage_dir = storage_root / f"application-{application_id}"
+    storage_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = safe_cv_storage_filename(filename)
+    content_hash = hashlib.sha256(payload).hexdigest()[:16]
+    target = storage_dir / f"{content_hash}-{safe_name}"
+    target.write_bytes(payload)
 
     try:
-        data = response.json()
-    except ValueError as exc:
-        raise RuntimeError(f"CV upload API returned non-JSON response: {response.text[:300]}") from exc
-
-    uploaded_filename = data.get("attachmentFilename") or data.get("attachment_filename") or data.get("filename")
-    if not uploaded_filename:
-        raise RuntimeError(f"CV upload API response did not include attachmentFilename: {data}")
-    return uploaded_filename
+        return str(target.relative_to(Path.cwd()))
+    except ValueError:
+        return str(target)
 
 
 class RecruiterDatabase:
@@ -1842,6 +2216,41 @@ class RecruiterDatabase:
             """,
             (sender, sender, sender),
         )
+
+    def latest_application_for_thread(self, inbox_email: InboxEmail) -> dict[str, Any] | None:
+        conditions = []
+        params = []
+
+        thread_id = str(inbox_email.gmail_thread_id or "").strip()
+        if thread_id:
+            conditions.append("COALESCE(ra.email_thread_id, '') = %s")
+            params.append(thread_id)
+
+        message_ids = thread_message_ids(inbox_email)
+        if message_ids:
+            placeholders = ", ".join(["%s"] * len(message_ids))
+            conditions.append(f"ra.email_message_id IN ({placeholders})")
+            params.extend(message_ids)
+
+        if not conditions:
+            return None
+
+        return self.one(
+            f"""
+            SELECT
+                ra.*,
+                rr.position_title AS requirement_position
+            FROM recruiter_applications ra
+            LEFT JOIN recruitment_requirements rr ON rr.id = ra.requirement_id
+            WHERE {' OR '.join(conditions)}
+            ORDER BY ra.created_at DESC
+            LIMIT 1
+            """,
+            tuple(params),
+        )
+
+    def latest_application_for_inbox_email(self, inbox_email: InboxEmail) -> dict[str, Any] | None:
+        return self.latest_application_for_thread(inbox_email) or self.latest_application_for_email(inbox_email.sender)
 
     def application_with_requirement(self, application_id: int) -> dict[str, Any] | None:
         return self.one(
@@ -2233,6 +2642,7 @@ class RecruiterDatabase:
             candidate_id,
             requirement["id"] if requirement else None,
             inbox_email.message_id,
+            inbox_email.gmail_thread_id,
             inbox_email.sender,
             candidate_email,
             referrer_email,
@@ -2272,7 +2682,7 @@ class RecruiterDatabase:
                     INSERT INTO recruiter_applications
                     (
                         application_uid, candidate_id, requirement_id, email_message_id,
-                        source_email, candidate_email, referrer_email, submission_type,
+                        email_thread_id, source_email, candidate_email, referrer_email, submission_type,
                         email_subject, detected_position, matched_position,
                         application_status, ats_score, jd_match_score, strengths, risks,
                         missing_requirements, ai_short_description, ai_evaluation,
@@ -2282,7 +2692,7 @@ class RecruiterDatabase:
                     VALUES
                     (
                         ?, ?, ?, ?,
-                        ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?,
                         ?, ?, ?,
                         ?, ?, ?, ?, ?,
                         ?, ?, ?,
@@ -2303,7 +2713,7 @@ class RecruiterDatabase:
                 INSERT INTO recruiter_applications
                 (
                     application_uid, candidate_id, requirement_id, email_message_id,
-                    source_email, candidate_email, referrer_email, submission_type,
+                    email_thread_id, source_email, candidate_email, referrer_email, submission_type,
                     email_subject, detected_position, matched_position,
                     application_status, ats_score, jd_match_score, strengths, risks,
                     missing_requirements, ai_short_description, ai_evaluation,
@@ -2312,7 +2722,7 @@ class RecruiterDatabase:
                 VALUES
                 (
                     %s, %s, %s, %s,
-                    %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
                     %s, %s, %s,
                     %s, %s, %s, %s::jsonb, %s::jsonb,
                     %s::jsonb, %s, %s::jsonb,
@@ -2724,8 +3134,10 @@ class MicrosoftGraphProvider:
                 continue
             content = attachment.get("contentBytes")
             name = attachment.get("name") or "attachment"
+            content_type = attachment.get("contentType") or ""
+            attachment_name = f"{name}|{content_type}" if content_type else name
             if content:
-                attachments.append((name, base64.b64decode(content)))
+                attachments.append((attachment_name, base64.b64decode(content)))
         return attachments
 
     def mark_seen(self, uid: bytes):
@@ -2752,7 +3164,7 @@ class MicrosoftGraphProvider:
 
         body = body.replace("\n", "\r\n").replace("\r\r\n", "\r\n")
         message_id = inbox_email.uid.decode()
-        if not to_email or clean_email(to_email) == clean_email(inbox_email.sender):
+        if message_id:
             draft = self.request(
                 "POST",
                 f"/users/{self.mailbox}/messages/{quote(message_id, safe='')}/createReply",
@@ -2764,10 +3176,13 @@ class MicrosoftGraphProvider:
             draft_body = (draft.get("body") or {}).get("content") or ""
             reply_html = append_signature_if_needed(email_body_to_html(body), draft_body)
             content = f"{reply_html}<br>{draft_body}" if draft_body else reply_html
+            patch_payload = {"body": {"contentType": "HTML", "content": content}}
+            if to_email and clean_email(to_email) != clean_email(inbox_email.sender):
+                patch_payload["toRecipients"] = [{"emailAddress": {"address": recipient}}]
             self.request(
                 "PATCH",
                 f"/users/{self.mailbox}/messages/{quote(draft_id, safe='')}",
-                json={"body": {"contentType": "HTML", "content": content}},
+                json=patch_payload,
             )
             self.request(
                 "POST",
@@ -2776,7 +3191,8 @@ class MicrosoftGraphProvider:
             )
             return
 
-        reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+        base_subject = inbox_email.subject or subject
+        reply_subject = base_subject if base_subject.lower().startswith("re:") else f"Re: {base_subject}"
         reply_html = append_signature_if_needed(email_body_to_html(body))
         self.request(
             "POST",
@@ -3017,7 +3433,8 @@ class RecruiterMailer:
         message = EmailMessage()
         message["From"] = RECRUITER_FROM_EMAIL
         message["To"] = recipient
-        message["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+        base_subject = inbox_email.subject or subject
+        message["Subject"] = base_subject if base_subject.lower().startswith("re:") else f"Re: {base_subject}"
         if inbox_email.message_id:
             message["In-Reply-To"] = inbox_email.message_id
             references = " ".join(
@@ -3230,6 +3647,33 @@ CV text:
 """
         ))
 
+    @traceable(name="summarize_cv_role")
+    def summarize_cv_role(self, cv_text: str, extracted: dict[str, Any]) -> dict[str, Any]:
+        return self.json_call(
+            f"""
+Return only valid JSON.
+Read the CV and summarize what type of job this candidate actually belongs to.
+Focus on the candidate's main role, current title, work history, projects, and core skills.
+Do not infer Accountant from phrases like "user accounts", "account unlocks", "Active Directory accounts", or support tickets.
+
+JSON schema:
+{{
+  "cv_summary": "2-3 sentence recruiter summary",
+  "primary_role": "specific role title or null",
+  "role_family": "short free-form role family, for example tax, accounting, it_support, seo, python_backend, ui_ux, sales, hr, admin, or other",
+  "seniority": "junior/mid/senior/unknown",
+  "evidence": ["short evidence from CV"],
+  "confidence": 0
+}}
+
+Already extracted CV facts:
+{json.dumps(safe_trace_payload(extracted), default=str)}
+
+CV text:
+{cv_text[:12000]}
+"""
+        )
+
     @traceable(name="match_requirement")
     def match_requirement(self, extracted: dict[str, Any], requirements: list[dict[str, Any]]) -> dict[str, Any]:
         compact_requirements = [
@@ -3250,12 +3694,17 @@ CV text:
             f"""
 Return only valid JSON.
 Choose the best open requirement for this candidate, or null if none fits the target role.
+Match by the candidate's primary role, work history, domain, responsibilities, and the requirement title/JD.
+Do not match based on incidental shared words. A match must be the same role family and meaningfully fit the JD.
+If the candidate belongs to a different function/domain than all open requirements, return null.
+Prefer the most specific requirement over a broader adjacent role.
+Use confidence >= 0.75 only when the role/domain fit is clear; otherwise return null.
 
 JSON schema:
 {{
   "requirement_id": null,
   "confidence": 0,
-  "reason": "short reason"
+  "reason": "short reason with evidence from CV and JD"
 }}
 
 Candidate:
@@ -3572,6 +4021,30 @@ class AIRecruiterAgent:
             fallback_body,
         )
         self.mailer.send_reply(inbox_email, f"Screening details required: {inbox_email.subject}", body)
+
+    def reply_location_not_fit(self, inbox_email: InboxEmail, application: dict[str, Any] | None):
+        role = None
+        if application:
+            role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
+        role_text = f" for the {role} role" if role else ""
+        fallback_body = recruiter_email_body(
+            "Thank you for letting us know.",
+            f"I understand that you are not ready to relocate to Mohali. Since this opening{role_text} is currently work from office in Mohali, we will not be able to proceed further with your application for this role right now.",
+            "We will keep your profile in mind and reach out if we have a suitable opening in your preferred location in the future.",
+            "Thank you again for your time.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "candidate is not ready to relocate/work from Mohali for a Mohali work-from-office role; close politely and do not ask for salary details again",
+            {
+                "role": role,
+                "candidate_declined_location": True,
+                "office_location": RECRUITER_OFFICE_LOCATION,
+                "do_not_ask_more_screening_questions": True,
+            },
+            fallback_body,
+        )
+        self.mailer.send_reply(inbox_email, f"Application update: {inbox_email.subject}", body)
 
     def reply_negotiate_screening(self, inbox_email: InboxEmail, requirement: dict[str, Any] | None, issues: list[str]):
         fallback_body = recruiter_email_body(
@@ -3892,18 +4365,50 @@ class AIRecruiterAgent:
         )
         thread_context = build_thread_context(inbox_email)
         classification = self.ai.classify_email(inbox_email)
-        latest_application = self.db.latest_application_for_email(inbox_email.sender)
+        thread_application = self.db.latest_application_for_thread(inbox_email)
+        latest_application = thread_application or self.db.latest_application_for_email(inbox_email.sender)
         active_application = (
             self.db.application_with_requirement(latest_application["id"])
             if latest_application
             else None
         )
+        application_lookup_scope = "thread" if thread_application else "sender" if latest_application else None
+        if active_application and not thread_application and classification_has_specific_role(classification):
+            active_role = (
+                active_application.get("requirement_position")
+                or active_application.get("matched_position")
+                or active_application.get("detected_position")
+            )
+            requested_role = classification.get("detected_position")
+            if active_role and requested_role and not roles_are_compatible(active_role, requested_role, thread_context):
+                log_json(
+                    logging.INFO,
+                    "sender_application_match_ignored_role_conflict",
+                    **inbox_email_summary(inbox_email),
+                    application_id=active_application["id"],
+                    active_role=active_role,
+                    requested_role=requested_role,
+                )
+                trace_recruiter_event(
+                    "sender_application_match_ignored_role_conflict",
+                    inputs=inbox_email_summary(inbox_email),
+                    outputs={
+                        "application_id": active_application["id"],
+                        "active_role": active_role,
+                        "requested_role": requested_role,
+                        "next_action": "process_as_new_thread",
+                    },
+                )
+                latest_application = None
+                active_application = None
+                application_lookup_scope = None
         log_json(
             logging.INFO,
             "email_classified",
             **inbox_email_summary(inbox_email),
             classification=classification,
             latest_application_id=latest_application["id"] if latest_application else None,
+            application_lookup_scope=application_lookup_scope,
             active_application_status=active_application.get("application_status") if active_application else None,
             elapsed_ms=round((time.monotonic() - started_at) * 1000),
         )
@@ -3913,11 +4418,12 @@ class AIRecruiterAgent:
             outputs={
                 "classification": classification,
                 "latest_application_id": latest_application["id"] if latest_application else None,
+                "application_lookup_scope": application_lookup_scope,
                 "active_application_status": active_application.get("application_status") if active_application else None,
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000),
             },
         )
-        if inbox_email.attachments and any(is_cv_filename(filename) for filename, _ in inbox_email.attachments):
+        if inbox_email.attachments and any(is_cv_attachment(filename, payload) for filename, payload in inbox_email.attachments):
             if not classification.get("is_employment_related"):
                 classification = {
                     **classification,
@@ -4000,7 +4506,19 @@ class AIRecruiterAgent:
             return True
 
         if is_withdrawal_request(inbox_email.body):
-            withdrawn_application = self.db.mark_latest_application_withdrawn(inbox_email.sender)
+            withdrawn_application = latest_application
+            if withdrawn_application:
+                self.db.execute(
+                    """
+                    UPDATE recruiter_applications
+                    SET application_status = 'withdrawn'
+                    WHERE id = %s
+                    """,
+                    (withdrawn_application["id"],),
+                )
+                withdrawn_application["application_status"] = "withdrawn"
+            else:
+                withdrawn_application = self.db.mark_latest_application_withdrawn(inbox_email.sender)
             trace_recruiter_event(
                 "withdrawal_request",
                 inputs=inbox_email_summary(inbox_email),
@@ -4026,6 +4544,43 @@ class AIRecruiterAgent:
             if current_status in {"screening_questions_sent", "screening_under_review", "screening_negotiation"}:
                 extracted_answers = self.ai.extract_screening_answers(inbox_email, active_application)
                 answers = merge_screening_answers(active_application.get("screening_details"), extracted_answers)
+                if candidate_declined_required_location(inbox_email.body) or extracted_answers.get("comfortable_with_terms") is False:
+                    answers = {**answers, "comfortable_with_terms": False}
+                    reason = "candidate declined Mohali/work-from-office location terms"
+                    self.db.update_application_screening(
+                        active_application["id"],
+                        "screening_location_not_fit",
+                        {**answers, "issues": [reason]},
+                    )
+                    self.db.log_email_event(
+                        inbox_email,
+                        "screening_location_not_fit",
+                        {
+                            "application_id": active_application["id"],
+                            "extracted_answers": extracted_answers,
+                            "merged_answers": answers,
+                            "reason": reason,
+                            "latest_reply": latest_reply_text(inbox_email.body)[:1000],
+                        },
+                    )
+                    log_json(
+                        logging.INFO,
+                        "screening_location_not_fit",
+                        **inbox_email_summary(inbox_email),
+                        application_id=active_application["id"],
+                        reason=reason,
+                    )
+                    trace_recruiter_event(
+                        "screening_location_not_fit",
+                        inputs=inbox_email_summary(inbox_email),
+                        outputs={
+                            "application_id": active_application["id"],
+                            "reason": reason,
+                            "next_action": "reply_location_not_fit",
+                        },
+                    )
+                    self.reply_location_not_fit(inbox_email, active_application)
+                    return True
                 self.db.log_email_event(
                     inbox_email,
                     "screening_reply_received",
@@ -4106,9 +4661,9 @@ class AIRecruiterAgent:
         )
 
         cv_attachments = [
-            (filename, payload)
+            (attachment_display_name(filename), payload)
             for filename, payload in inbox_email.attachments
-            if is_cv_filename(filename)
+            if is_cv_attachment(filename, payload)
         ]
         log_json(
             logging.INFO,
@@ -4125,6 +4680,76 @@ class AIRecruiterAgent:
             },
         )
         if not cv_attachments:
+            saved_cv_application = (
+                active_application
+                if application_has_saved_cv(active_application)
+                else latest_application
+                if application_has_saved_cv(latest_application)
+                else None
+            )
+            existing_application_followup = thread_application or (
+                latest_application if is_status_followup(inbox_email.body) else None
+            ) or (
+                saved_cv_application
+                if saved_cv_application
+                and application_role_is_compatible(saved_cv_application, classification, thread_context)
+                else None
+            )
+            if existing_application_followup:
+                self.db.log_email_event(
+                    inbox_email,
+                    "existing_application_followup_without_cv",
+                    {
+                        **classification,
+                        "application_id": existing_application_followup["id"],
+                        "application_status": existing_application_followup.get("application_status"),
+                        "matched_requirement": existing_application_followup.get("requirement_position"),
+                        "application_lookup_scope": (
+                            "thread"
+                            if thread_application
+                            else "sender_status_followup"
+                            if is_status_followup(inbox_email.body)
+                            else "sender_saved_cv"
+                        ),
+                        "saved_cv_found": application_has_saved_cv(existing_application_followup),
+                        "no_cv_request_sent": True,
+                    },
+                )
+                log_json(
+                    logging.INFO,
+                    "existing_application_followup_without_cv",
+                    **inbox_email_summary(inbox_email),
+                    application_id=existing_application_followup["id"],
+                    application_status=existing_application_followup.get("application_status"),
+                    application_lookup_scope=(
+                        "thread"
+                        if thread_application
+                        else "sender_status_followup"
+                        if is_status_followup(inbox_email.body)
+                        else "sender_saved_cv"
+                    ),
+                    saved_cv_found=application_has_saved_cv(existing_application_followup),
+                )
+                trace_recruiter_event(
+                    "existing_application_followup_without_cv",
+                    inputs=inbox_email_summary(inbox_email),
+                    outputs={
+                        "application_id": existing_application_followup["id"],
+                        "application_status": existing_application_followup.get("application_status"),
+                        "application_lookup_scope": (
+                            "thread"
+                            if thread_application
+                            else "sender_status_followup"
+                            if is_status_followup(inbox_email.body)
+                            else "sender_saved_cv"
+                        ),
+                        "saved_cv_found": application_has_saved_cv(existing_application_followup),
+                        "next_action": "reply_status_followup",
+                    },
+                )
+                self.reply_status_followup(inbox_email, existing_application_followup)
+                return True
+
             if self.db.recent_event_count(
                 inbox_email.sender,
                 ["missing_cv", "followup_missing_cv", "unsupported_attachment"],
@@ -4144,7 +4769,7 @@ class AIRecruiterAgent:
                     "unsupported_attachment",
                     {
                         **classification,
-                        "attachments": [filename for filename, _ in inbox_email.attachments],
+                        "attachments": [attachment_display_name(filename) for filename, _ in inbox_email.attachments],
                     },
                 )
                 self.reply_supported_cv_required(inbox_email)
@@ -4162,6 +4787,21 @@ class AIRecruiterAgent:
             )
             matched_requirement_id = safe_int(match.get("requirement_id"))
             requirement = next((row for row in requirements if row["id"] == matched_requirement_id), None)
+            if requirement and not requirement_is_compatible_with_candidate_role(
+                {"target_position": classification.get("detected_position")},
+                classification,
+                requirement,
+            ):
+                match = {
+                    "requirement_id": None,
+                    "confidence": 0,
+                    "reason": (
+                        f"Rejected incompatible requirement match: candidate role "
+                        f"{classification.get('detected_position')!r} is not compatible with "
+                        f"{requirement.get('position_title')!r}"
+                    ),
+                }
+                requirement = None
             log_json(
                 logging.INFO,
                 "missing_cv_requirement_decision",
@@ -4314,6 +4954,31 @@ class AIRecruiterAgent:
                     "skill_count": len(ensure_list(extracted.get("skills"))),
                 },
             )
+            cv_role_summary = self.ai.summarize_cv_role(cv_text, extracted)
+            if cv_role_summary.get("primary_role") and not extracted.get("target_position"):
+                extracted["target_position"] = cv_role_summary.get("primary_role")
+            log_json(
+                logging.INFO,
+                "cv_role_summarized",
+                **inbox_email_summary(inbox_email),
+                filename=filename,
+                primary_role=cv_role_summary.get("primary_role"),
+                role_family=cv_role_summary.get("role_family"),
+                confidence=cv_role_summary.get("confidence"),
+                evidence=cv_role_summary.get("evidence"),
+            )
+            trace_recruiter_event(
+                "cv_role_summarized",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={
+                    "filename": filename,
+                    "primary_role": cv_role_summary.get("primary_role"),
+                    "role_family": cv_role_summary.get("role_family"),
+                    "confidence": cv_role_summary.get("confidence"),
+                    "evidence": cv_role_summary.get("evidence"),
+                    "cv_summary": cv_role_summary.get("cv_summary"),
+                },
+            )
             india_phone_rejection_reason = non_indian_phone_reason(extracted, cv_text)
             if india_phone_rejection_reason:
                 log_json(
@@ -4409,10 +5074,12 @@ class AIRecruiterAgent:
             if not extracted.get("target_position") and not use_cv_role_override:
                 extracted["target_position"] = classification.get("detected_position")
 
-            source_text_for_match = cv_text[:4000] if use_cv_role_override else f"{thread_context}\n{cv_text[:4000]}"
+            email_has_role = classification_has_specific_role(classification)
+            cv_inferred_role = cv_role_summary.get("primary_role") or cv_position
+            source_text_for_match = cv_text[:4000] if use_cv_role_override or not email_has_role else f"{thread_context}\n{cv_text[:4000]}"
             classification_for_match = (
-                {"detected_position": cv_position}
-                if use_cv_role_override
+                {"detected_position": cv_inferred_role}
+                if use_cv_role_override or not email_has_role
                 else classification
             )
             match = requested_match if requested_requirement else (
@@ -4426,10 +5093,30 @@ class AIRecruiterAgent:
                 else {"requirement_id": None, "confidence": 0, "reason": "No open requirements in database"}
             )
             if requirements and not match.get("requirement_id"):
-                match = self.ai.match_requirement(extracted, requirements)
+                match = self.ai.match_requirement(
+                    {**extracted, "cv_role_summary": cv_role_summary},
+                    requirements,
+                )
+                if score_number(match.get("confidence")) is not None and score_number(match.get("confidence")) < 0.75:
+                    match = {
+                        "requirement_id": None,
+                        "confidence": score_number(match.get("confidence")) or 0,
+                        "reason": f"LLM requirement match confidence below threshold: {match.get('reason')}",
+                    }
 
             matched_requirement_id = safe_int(match.get("requirement_id"))
             requirement = next((row for row in requirements if row["id"] == matched_requirement_id), None)
+            if requirement and not requirement_is_compatible_with_candidate_role(extracted, classification_for_match, requirement):
+                match = {
+                    "requirement_id": None,
+                    "confidence": 0,
+                    "reason": (
+                        f"Rejected incompatible requirement match: candidate role "
+                        f"{extracted.get('target_position') or extracted.get('current_title') or classification_for_match.get('detected_position')!r} "
+                        f"is not compatible with {requirement.get('position_title')!r}"
+                    ),
+                }
+                requirement = None
             self.db.log_email_event(
                 inbox_email,
                 "requirement_match",
@@ -4539,38 +5226,38 @@ class AIRecruiterAgent:
             )
             if application_id:
                 try:
-                    uploaded_filename = upload_cv_attachment(application_id, filename, payload)
-                    self.db.update_application_attachment_filename(application_id, uploaded_filename)
+                    saved_filename = save_cv_attachment_file(application_id, filename, payload)
+                    self.db.update_application_attachment_filename(application_id, saved_filename)
                     self.db.log_email_event(
                         inbox_email,
-                        "cv_uploaded",
+                        "cv_saved_to_folder",
                         {
                             "application_id": application_id,
                             "original_filename": filename,
-                            "attachment_filename": uploaded_filename,
+                            "attachment_filename": saved_filename,
                             "attachment_sha256": attachment_sha256,
                         },
                     )
                     log_json(
                         logging.INFO,
-                        "cv_uploaded",
+                        "cv_saved_to_folder",
                         **inbox_email_summary(inbox_email),
                         application_id=application_id,
-                        attachment_filename=uploaded_filename,
+                        attachment_filename=saved_filename,
                         attachment_sha256=attachment_sha256,
                     )
                     trace_recruiter_event(
-                        "cv_uploaded",
+                        "cv_saved_to_folder",
                         inputs=inbox_email_summary(inbox_email),
                         outputs={
                             "application_id": application_id,
-                            "attachment_filename": uploaded_filename,
+                            "attachment_filename": saved_filename,
                             "attachment_sha256": attachment_sha256,
                         },
                     )
                 except Exception as exc:
                     LOGGER.exception(
-                        "cv_upload_failed %s",
+                        "cv_save_failed %s",
                         json.dumps(
                             {
                                 **inbox_email_summary(inbox_email),
@@ -4583,7 +5270,7 @@ class AIRecruiterAgent:
                     )
                     self.db.log_email_event(
                         inbox_email,
-                        "cv_upload_failed",
+                        "cv_save_failed",
                         {
                             "application_id": application_id,
                             "original_filename": filename,

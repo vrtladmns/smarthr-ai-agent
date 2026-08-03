@@ -13,6 +13,7 @@ chroma/
 
 credentials/
 documents/
+storage/
 
 *.log
 *.sqlite

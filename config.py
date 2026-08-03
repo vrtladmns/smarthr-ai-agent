@@ -102,11 +102,7 @@ FINAL_HR_WINDOW_START_HOUR = int(os.getenv("FINAL_HR_WINDOW_START_HOUR", "18"))
 FINAL_HR_WINDOW_END_HOUR = int(os.getenv("FINAL_HR_WINDOW_END_HOUR", "1"))
 FINAL_HR_WORKDAYS = os.getenv("FINAL_HR_WORKDAYS", "0,1,2,3,4")
 FINAL_HR_DEFAULT_DURATION_MINUTES = int(os.getenv("FINAL_HR_DEFAULT_DURATION_MINUTES", "45"))
-CV_UPLOAD_API_URL_TEMPLATE = os.getenv(
-    "CV_UPLOAD_API_URL_TEMPLATE",
-    "http://smarthrai-apis.runasp.net/api/AiData/applications/{application_id}/cv",
-)
-CV_UPLOAD_TIMEOUT_SECONDS = int(os.getenv("CV_UPLOAD_TIMEOUT_SECONDS", "30"))
+CV_STORAGE_DIR = os.getenv("CV_STORAGE_DIR", "storage/cvs")
 
 GMAIL_PUBSUB_TOPIC = os.getenv("GMAIL_PUBSUB_TOPIC", "")
 GMAIL_CREDENTIALS_FILE = os.getenv("GMAIL_CREDENTIALS_FILE", "credentials/gmail_oauth_client.json")

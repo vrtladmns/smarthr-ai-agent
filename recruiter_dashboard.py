@@ -1,6 +1,8 @@
 import argparse
+import csv
 import hashlib
 import hmac
+import io
 import json
 import logging
 import mimetypes
@@ -12,10 +14,12 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from threading import Thread
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from config import (
+    CV_STORAGE_DIR,
     DB_PROVIDER,
     OLLAMA_NUM_PREDICT,
     RECRUITER_DASHBOARD_LOGIN_EMAIL,
@@ -173,6 +177,16 @@ def date_text(value) -> str:
     return str(value)
 
 
+def parse_date_filter(value: str | None) -> datetime | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
 def list_text(value, limit: int = 4) -> str:
     if value is None:
         return "-"
@@ -191,6 +205,26 @@ def list_text(value, limit: int = 4) -> str:
         more = f" +{len(value) - limit}" if len(value) > limit else ""
         return ", ".join(parts) + more if parts else "-"
     return html_escape(value)
+
+
+def list_plain_text(value, limit: int | None = None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    if isinstance(value, list):
+        selected = value if limit is None else value[:limit]
+        parts = []
+        for item in selected:
+            if isinstance(item, dict):
+                parts.append(", ".join(str(v) for v in item.values() if v))
+            else:
+                parts.append(str(item))
+        return ", ".join(part for part in parts if part)
+    return str(value)
 
 
 def json_object(value) -> dict:
@@ -265,6 +299,13 @@ def download_path(path: str, section: str) -> int | None:
     return None
 
 
+def cv_view_path(path: str, section: str) -> int | None:
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) == 4 and parts[0] == section and parts[1].isdigit() and parts[2] == "cv" and parts[3] == "view":
+        return int(parts[1])
+    return None
+
+
 def interview_token_path(path: str) -> str | None:
     parts = [part for part in path.strip("/").split("/") if part]
     if len(parts) == 2 and parts[0] == "interview" and re.fullmatch(r"[A-Za-z0-9_-]{20,200}", parts[1]):
@@ -289,6 +330,31 @@ def safe_download_name(value: str | None, fallback: str) -> str:
     name = (value or fallback).strip() or fallback
     name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name)
     return name[:160] or fallback
+
+
+def stored_cv_path(value: str | None) -> Path | None:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw or raw.startswith(("http://", "https://")):
+        return None
+
+    candidates = []
+    path = Path(raw)
+    if path.is_absolute():
+        candidates.append(path)
+    else:
+        candidates.append(Path.cwd() / path)
+        candidates.append(Path.cwd() / CV_STORAGE_DIR / raw)
+
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
 
 
 def dashboard_auth_enabled() -> bool:
@@ -383,6 +449,8 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
             event_id = detail_path(parsed.path, "events")
             candidate_cv_id = download_path(parsed.path, "candidates")
             application_cv_id = download_path(parsed.path, "applications")
+            candidate_cv_view_id = cv_view_path(parsed.path, "candidates")
+            application_cv_view_id = cv_view_path(parsed.path, "applications")
             interview_token = interview_token_path(parsed.path)
 
             if interview_token:
@@ -391,6 +459,10 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
                 return
             elif parsed.path == "/":
                 self.render_page("overview", self.render_overview())
+            elif candidate_cv_view_id is not None:
+                self.view_candidate_cv(candidate_cv_view_id)
+            elif application_cv_view_id is not None:
+                self.view_application_cv(application_cv_view_id)
             elif candidate_cv_id is not None:
                 self.download_candidate_cv(candidate_cv_id)
             elif application_cv_id is not None:
@@ -405,6 +477,8 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
                 self.render_page("candidates", self.render_candidates(query))
             elif application_id is not None:
                 self.render_page("application_detail", self.render_application_detail(application_id))
+            elif parsed.path == "/applications/export":
+                self.export_applications(query)
             elif parsed.path == "/applications":
                 self.render_page("applications", self.render_applications(query))
             elif event_id is not None:
@@ -1427,7 +1501,28 @@ Previous transcript:
         if not row:
             self.send_error(404, "CV not found")
             return
-        self.send_cv_download(row, f"application-{application_id}-cv.txt")
+        self.send_cv_file(row, f"application-{application_id}-cv.txt", inline=False)
+
+    def view_application_cv(self, application_id: int):
+        database = self.db()
+        try:
+            row = database.one(
+                """
+                SELECT
+                    ra.id, ra.attachment_filename, ra.attachment_payload,
+                    rc.full_name, rc.raw_cv_text
+                FROM recruiter_applications ra
+                JOIN recruiter_candidates rc ON rc.id = ra.candidate_id
+                WHERE ra.id = %s
+                """,
+                (application_id,),
+            )
+        finally:
+            database.close()
+        if not row:
+            self.send_error(404, "CV not found")
+            return
+        self.send_cv_file(row, f"application-{application_id}-cv.txt", inline=True)
 
     def download_candidate_cv(self, candidate_id: int):
         database = self.db()
@@ -1450,9 +1545,32 @@ Previous transcript:
         if not row:
             self.send_error(404, "CV not found")
             return
-        self.send_cv_download(row, f"candidate-{candidate_id}-cv.txt")
+        self.send_cv_file(row, f"candidate-{candidate_id}-cv.txt", inline=False)
 
-    def send_cv_download(self, row: dict, fallback_name: str):
+    def view_candidate_cv(self, candidate_id: int):
+        database = self.db()
+        try:
+            row = database.one(
+                """
+                SELECT
+                    ra.id, ra.attachment_filename, ra.attachment_payload,
+                    rc.full_name, rc.raw_cv_text
+                FROM recruiter_candidates rc
+                LEFT JOIN recruiter_applications ra ON ra.candidate_id = rc.id
+                WHERE rc.id = %s
+                ORDER BY ra.created_at DESC
+                LIMIT 1
+                """,
+                (candidate_id,),
+            )
+        finally:
+            database.close()
+        if not row:
+            self.send_error(404, "CV not found")
+            return
+        self.send_cv_file(row, f"candidate-{candidate_id}-cv.txt", inline=True)
+
+    def send_cv_file(self, row: dict, fallback_name: str, inline: bool = False):
         payload = row.get("attachment_payload")
         filename = row.get("attachment_filename")
         if payload:
@@ -1461,6 +1579,10 @@ Previous transcript:
             elif not isinstance(payload, bytes):
                 payload = bytes(payload)
             download_name = safe_download_name(filename, fallback_name)
+            content_type = mimetypes.guess_type(download_name)[0] or "application/octet-stream"
+        elif local_path := stored_cv_path(filename):
+            payload = local_path.read_bytes()
+            download_name = safe_download_name(local_path.name, fallback_name)
             content_type = mimetypes.guess_type(download_name)[0] or "application/octet-stream"
         else:
             text = row.get("raw_cv_text")
@@ -1475,7 +1597,8 @@ Previous transcript:
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+        disposition = "inline" if inline else "attachment"
+        self.send_header("Content-Disposition", f'{disposition}; filename="{download_name}"')
         self.end_headers()
         self.wfile.write(payload)
 
@@ -1488,7 +1611,7 @@ Previous transcript:
                     (SELECT COUNT(*) FROM recruitment_requirements WHERE LOWER(status) = 'open') AS open_roles,
                     (SELECT COUNT(*) FROM recruiter_candidates) AS candidates,
                     (SELECT COUNT(*) FROM recruiter_applications) AS applications,
-                    (SELECT COUNT(*) FROM recruiter_applications WHERE application_status = 'matched_requirement') AS matched,
+                    (SELECT COUNT(*) FROM recruiter_applications WHERE requirement_id IS NOT NULL) AS matched,
                     (SELECT COUNT(*) FROM recruiter_applications WHERE application_status = 'no_open_requirement') AS saved_for_later,
                     (SELECT COUNT(*) FROM recruiter_applications WHERE application_status = 'withdrawn') AS withdrawn,
                     (SELECT ROUND(AVG(ats_score), 1) FROM recruiter_applications WHERE ats_score IS NOT NULL) AS avg_ats,
@@ -1524,22 +1647,22 @@ Previous transcript:
             database.close()
 
         cards = [
-            ("Open Roles", summary["open_roles"], "Roles accepting CVs"),
-            ("Candidates", summary["candidates"], "Profiles saved"),
-            ("Applications", summary["applications"], "CVs processed"),
-            ("Matched", summary["matched"], "Linked to open roles"),
-            ("Saved Later", summary["saved_for_later"], "No open role now"),
-            ("Avg ATS", score(summary["avg_ats"]), "Across applications"),
+            ("Open Roles", summary["open_roles"], "Roles accepting CVs", "/requirements"),
+            ("Candidates", summary["candidates"], "Profiles saved", "/candidates"),
+            ("Applications", summary["applications"], "CVs processed", "/applications"),
+            ("Matched", summary["matched"], "Linked to requirements", "/applications?matched=1"),
+            ("Saved Later", summary["saved_for_later"], "No open role now", "/applications?status=no_open_requirement"),
+            ("Avg ATS", score(summary["avg_ats"]), "Across applications", "/applications"),
         ]
         card_html = "".join(
             f"""
-            <article class="metric">
+            <a class="metric metric-link" href="{html_escape(href)}">
                 <span>{html_escape(label)}</span>
                 <strong>{html_escape(value)}</strong>
                 <small>{html_escape(detail)}</small>
-            </article>
+            </a>
             """
-            for label, value, detail in cards
+            for label, value, detail, href in cards
         )
 
         urgent_html = "".join(
@@ -1905,6 +2028,7 @@ Previous transcript:
                 <td>
                     <div class="action-stack">
                         <a class="link-button" href="/candidates/{html_escape(row["id"])}">View</a>
+                        <a class="link-button" href="/candidates/{html_escape(row["id"])}/cv/view" target="_blank" rel="noopener">View CV</a>
                         <a class="link-button" href="/candidates/{html_escape(row["id"])}/cv">Download CV</a>
                         {self.delete_form("/candidates/delete", row["id"], "Delete", "Delete this candidate and all linked applications?")}
                     </div>
@@ -1925,11 +2049,28 @@ Previous transcript:
         </section>
         """
 
-    def render_applications(self, query: dict[str, list[str]]) -> str:
+    def application_filter_state(self, query: dict[str, list[str]]) -> dict:
         q = (query.get("q", [""])[0] or "").strip()
         status_filter = (query.get("status", [""])[0] or "").strip()
+        matched_filter = (query.get("matched", [""])[0] or "").strip().lower() in {"1", "true", "yes"}
+        created_from_text = (query.get("created_from", [""])[0] or "").strip()
+        created_to_text = (query.get("created_to", [""])[0] or "").strip()
+        created_from = parse_date_filter(created_from_text)
+        created_to = parse_date_filter(created_to_text)
+        return {
+            "q": q,
+            "status": status_filter,
+            "matched": matched_filter,
+            "created_from_text": created_from_text if created_from else "",
+            "created_to_text": created_to_text if created_to else "",
+            "created_from": created_from,
+            "created_to": created_to,
+        }
+
+    def application_filter_conditions(self, state: dict) -> tuple[str, tuple]:
         conditions = []
         params_list = []
+        q = state["q"]
         if q:
             conditions.append(
                 """
@@ -1945,12 +2086,24 @@ Previous transcript:
             )
             term = f"%{q.lower()}%"
             params_list.extend([term, term, term, term, term, term])
-        if status_filter:
+        if state["status"]:
             conditions.append("ra.application_status = %s")
-            params_list.append(status_filter)
+            params_list.append(state["status"])
+        if state["matched"]:
+            conditions.append("ra.requirement_id IS NOT NULL")
+        if state["created_from"]:
+            conditions.append("ra.created_at >= %s")
+            params_list.append(state["created_from"])
+        if state["created_to"]:
+            conditions.append("ra.created_at < %s")
+            params_list.append(state["created_to"] + timedelta(days=1))
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        params = tuple(params_list)
+        return where, tuple(params_list)
 
+    def fetch_application_rows(self, query: dict[str, list[str]], limit: int | None = 100) -> tuple[list[dict], dict]:
+        state = self.application_filter_state(query)
+        where, params = self.application_filter_conditions(state)
+        limit_clause = f"LIMIT {limit}" if limit else ""
         database = self.db()
         try:
             rows = database.rows(
@@ -1962,27 +2115,54 @@ Previous transcript:
                 LEFT JOIN recruitment_requirements rr ON rr.id = ra.requirement_id
                 {where}
                 ORDER BY ra.created_at DESC
-                LIMIT 100
+                {limit_clause}
                 """,
                 params,
             )
         finally:
             database.close()
+        return rows, state
+
+    def application_filter_url(self, state: dict, path: str = "/applications", status: str | None = None) -> str:
+        params = {}
+        if state["q"]:
+            params["q"] = state["q"]
+        selected_status = status if status is not None else state["status"]
+        if selected_status:
+            params["status"] = selected_status
+        if state["matched"]:
+            params["matched"] = "1"
+        if state["created_from_text"]:
+            params["created_from"] = state["created_from_text"]
+        if state["created_to_text"]:
+            params["created_to"] = state["created_to_text"]
+        return f"{path}?{urlencode(params)}" if params else path
+
+    def render_applications(self, query: dict[str, list[str]]) -> str:
+        rows, state = self.fetch_application_rows(query)
+        q = state["q"]
+        status_filter = state["status"]
+        matched_filter = state["matched"]
+
+        def filtered_applications_url(status: str | None = None) -> str:
+            return self.application_filter_url(state, status=status)
 
         table_rows = "".join(
             f"""
             <tr>
                 <td><a href="/applications/{html_escape(row["id"])}"><strong>{html_escape(row["full_name"] or "Unnamed candidate")}</strong></a><small>{html_escape(row["candidate_email"] or row["source_email"] or "")}</small></td>
                 <td>{html_escape(row["matched_position"] or row["detected_position"] or row["requirement_position"] or "-")}</td>
-                <td>{status_badge(row["application_status"])}</td>
+                <td><a class="status-filter-link" href="{html_escape(filtered_applications_url(row["application_status"]))}" title="Filter by this status">{status_badge(row["application_status"])}</a></td>
                 <td>{score(row["ats_score"])}</td>
                 <td>{score(row["jd_match_score"])}</td>
                 <td>{list_text(row["strengths"], 3)}</td>
                 <td>{list_text(row["risks"], 3)}</td>
                 <td>{html_escape(row["ai_short_description"] or "-")}</td>
+                <td>{date_text(row["created_at"])}</td>
                 <td>
                     <div class="action-stack">
                     <a class="link-button" href="/applications/{html_escape(row["id"])}">View</a>
+                    <a class="link-button" href="/applications/{html_escape(row["id"])}/cv/view" target="_blank" rel="noopener">View CV</a>
                     <a class="link-button" href="/applications/{html_escape(row["id"])}/cv">Download CV</a>
                     <form method="post" action="/applications/status" class="inline-form">
                         <input type="hidden" name="id" value="{html_escape(row["id"])}">
@@ -1997,20 +2177,115 @@ Previous transcript:
             </tr>
             """
             for row in rows
-        ) or '<tr><td colspan="9" class="empty">No applications found.</td></tr>'
+        ) or '<tr><td colspan="10" class="empty">No applications found.</td></tr>'
 
-        filter_label = f'<p class="filter-note">Filtered by status: {status_badge(status_filter)} <a href="/applications">Clear</a></p>' if status_filter else ""
+        filter_parts = []
+        if status_filter:
+            filter_parts.append(f"status: {status_badge(status_filter)}")
+        if matched_filter:
+            filter_parts.append("matched to requirement")
+        if state["created_from_text"] or state["created_to_text"]:
+            start = state["created_from_text"] or "start"
+            end = state["created_to_text"] or "today"
+            filter_parts.append(f"created: {html_escape(start)} to {html_escape(end)}")
+        filter_label = (
+            f'<p class="filter-note">Filtered by {" and ".join(filter_parts)} <a href="/applications">Clear</a></p>'
+            if filter_parts
+            else ""
+        )
+        status_filter_options = self.status_filter_options(status_filter)
+        matched_checked = "checked" if matched_filter else ""
+        export_url = self.application_filter_url(state, path="/applications/export")
+        filter_bar = f"""
+        <form method="get" action="/applications" class="filter-bar">
+            <input type="hidden" name="q" value="{html_escape(q)}">
+            <label>Status
+                <select name="status">
+                    {status_filter_options}
+                </select>
+            </label>
+            <label class="checkbox-label">
+                <input type="checkbox" name="matched" value="1" {matched_checked}>
+                Matched only
+            </label>
+            <label>Created from
+                <input type="date" name="created_from" value="{html_escape(state["created_from_text"])}">
+            </label>
+            <label>Created to
+                <input type="date" name="created_to" value="{html_escape(state["created_to_text"])}">
+            </label>
+            <button type="submit">Apply Filter</button>
+            <a class="link-button" href="{html_escape(export_url)}">Export Excel</a>
+            <a href="/applications">Clear</a>
+        </form>
+        """
         return f"""
         {self.search_form("/applications", q, "Search application, role, email, or status")}
+        {filter_bar}
         {filter_label}
-        <section class="panel">
+        <section class="panel applications-panel">
             <div class="panel-head"><h2>Applications</h2><span>{len(rows)} shown</span></div>
-            <table>
-                <thead><tr><th>Candidate</th><th>Role</th><th>Status</th><th>ATS</th><th>JD</th><th>Strengths</th><th>Risks</th><th>AI Summary</th><th>Action</th></tr></thead>
+            <div class="table-scroll">
+            <table class="sticky-table">
+                <thead><tr><th>Candidate</th><th>Role</th><th>Status</th><th>ATS</th><th>JD</th><th>Strengths</th><th>Risks</th><th>AI Summary</th><th>Created At</th><th>Action</th></tr></thead>
                 <tbody>{table_rows}</tbody>
             </table>
+            </div>
         </section>
         """
+
+    def export_applications(self, query: dict[str, list[str]]):
+        rows, state = self.fetch_application_rows(query, limit=None)
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(
+            [
+                "Application ID",
+                "Candidate",
+                "Candidate Email",
+                "Source Email",
+                "Role",
+                "Status",
+                "ATS Score",
+                "JD Match Score",
+                "Strengths",
+                "Risks",
+                "AI Summary",
+                "Created At",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    row.get("id"),
+                    row.get("full_name") or "Unnamed candidate",
+                    row.get("candidate_email") or "",
+                    row.get("source_email") or "",
+                    row.get("matched_position") or row.get("detected_position") or row.get("requirement_position") or "",
+                    row.get("application_status") or "",
+                    score(row.get("ats_score")),
+                    score(row.get("jd_match_score")),
+                    list_plain_text(row.get("strengths")),
+                    list_plain_text(row.get("risks")),
+                    row.get("ai_short_description") or "",
+                    date_text(row.get("created_at")),
+                ]
+            )
+
+        suffix_parts = []
+        if state["status"]:
+            suffix_parts.append(state["status"])
+        if state["created_from_text"] or state["created_to_text"]:
+            suffix_parts.append(f"{state['created_from_text'] or 'start'}-to-{state['created_to_text'] or 'today'}")
+        suffix = "-" + safe_download_name("-".join(suffix_parts), "filtered") if suffix_parts else ""
+        filename = f"applications{suffix}.csv"
+        payload = ("\ufeff" + output.getvalue()).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.end_headers()
+        self.wfile.write(payload)
 
     def render_events(self, query: dict[str, list[str]]) -> str:
         q = (query.get("q", [""])[0] or "").strip()
@@ -2184,7 +2459,12 @@ Previous transcript:
                 <td>{score(app["ats_score"])}</td>
                 <td>{score(app["jd_match_score"])}</td>
                 <td>{html_escape(app["attachment_filename"] or "-")}</td>
-                <td><a class="link-button" href="/applications/{html_escape(app["id"])}/cv">Download CV</a></td>
+                <td>
+                    <div class="action-stack">
+                        <a class="link-button" href="/applications/{html_escape(app["id"])}/cv/view" target="_blank" rel="noopener">View CV</a>
+                        <a class="link-button" href="/applications/{html_escape(app["id"])}/cv">Download CV</a>
+                    </div>
+                </td>
                 <td>{date_text(app["created_at"])}</td>
             </tr>
             """
@@ -2245,6 +2525,7 @@ Previous transcript:
                 <h2>{html_escape(title)}</h2>
                 <div class="action-stack">
                     {status_badge(row["submission_type"])}
+                    <a class="link-button" href="/candidates/{html_escape(candidate_id)}/cv/view" target="_blank" rel="noopener">View CV</a>
                     <a class="link-button" href="/candidates/{html_escape(candidate_id)}/cv">Download CV</a>
                     {self.delete_form("/candidates/delete", candidate_id, "Delete Candidate", "Delete this candidate and all linked applications?")}
                 </div>
@@ -2452,6 +2733,7 @@ Previous transcript:
                 <h2>{html_escape(title)}</h2>
                 <div class="action-stack">
                     {status_badge(row["application_status"])}
+                    <a class="link-button" href="/applications/{html_escape(application_id)}/cv/view" target="_blank" rel="noopener">View CV</a>
                     <a class="link-button" href="/applications/{html_escape(application_id)}/cv">Download CV</a>
                     {self.delete_form("/applications/delete", application_id, "Delete Application", "Delete this application?")}
                     {hr_approve_form}
@@ -3492,7 +3774,21 @@ Previous transcript:
         """
 
     def status_options(self, selected: str | None) -> str:
-        options = [
+        return "".join(
+            f'<option value="{html_escape(option)}" {"selected" if option == selected else ""}>{html_escape(option.replace("_", " "))}</option>'
+            for option in self.application_status_values()
+        )
+
+    def status_filter_options(self, selected: str | None) -> str:
+        options = ['<option value="">All statuses</option>']
+        options.extend(
+            f'<option value="{html_escape(option)}" {"selected" if option == selected else ""}>{html_escape(option.replace("_", " "))}</option>'
+            for option in self.application_status_values()
+        )
+        return "".join(options)
+
+    def application_status_values(self) -> list[str]:
+        return [
             "matched_requirement",
             "screening_questions_sent",
             "screening_negotiation",
@@ -3516,10 +3812,6 @@ Previous transcript:
             "rejected",
             "withdrawn",
         ]
-        return "".join(
-            f'<option value="{html_escape(option)}" {"selected" if option == selected else ""}>{html_escape(option.replace("_", " "))}</option>'
-            for option in options
-        )
 
     def detail_grid(self, fields: list[tuple]) -> str:
         rendered = []
@@ -3822,6 +4114,14 @@ h2 { font-size: 16px; }
 .metric {
     padding: 16px;
 }
+.metric-link {
+    color: inherit;
+    display: block;
+    text-decoration: none;
+}
+.metric-link:hover {
+    border-color: var(--accent);
+}
 .metric span, .metric small { color: var(--muted); }
 .metric strong {
     display: block;
@@ -3890,6 +4190,62 @@ h2 { font-size: 16px; }
     margin-left: 8px;
     color: var(--accent);
 }
+.filter-bar {
+    display: flex;
+    align-items: end;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin: 0 0 12px;
+    padding: 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: white;
+}
+.filter-bar label {
+    display: grid;
+    gap: 5px;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+}
+.filter-bar select {
+    min-width: 220px;
+}
+.filter-bar input[type="date"] {
+    min-width: 160px;
+}
+.filter-bar .checkbox-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 38px;
+    color: var(--ink);
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 14px;
+}
+.filter-bar .checkbox-label input {
+    width: auto;
+}
+.filter-bar a {
+    color: var(--accent);
+    min-height: 38px;
+    display: inline-flex;
+    align-items: center;
+}
+.status-filter-link {
+    display: inline-flex;
+    text-decoration: none;
+}
+.status-filter-link:hover .badge {
+    box-shadow: 0 0 0 2px rgba(27, 99, 177, .18);
+}
+.table-scroll {
+    max-height: calc(100vh - 260px);
+    overflow: auto;
+}
 table {
     width: 100%;
     border-collapse: collapse;
@@ -3906,6 +4262,12 @@ th {
     text-transform: uppercase;
     letter-spacing: .04em;
     background: #f8fafc;
+}
+.sticky-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    box-shadow: 0 1px 0 var(--line);
 }
 td.description {
     min-width: 320px;

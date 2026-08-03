@@ -351,8 +351,7 @@ GRAPH_NOTIFICATION_URL=https://hr.virtualadmins.org/graph/outlook
 GRAPH_CLIENT_STATE=use-a-long-random-secret
 GRAPH_SUBSCRIPTION_HOURS=48
 
-CV_UPLOAD_API_URL_TEMPLATE=http://smarthrai-apis.runasp.net/api/AiData/applications/{application_id}/cv
-CV_UPLOAD_TIMEOUT_SECONDS=30
+CV_STORAGE_DIR=storage/cvs
 
 RECRUITER_APPEND_SIGNATURE=true
 RECRUITER_SIGNATURE_SIGNOFF=Regards,
@@ -575,8 +574,7 @@ GRAPH_NOTIFICATION_URL=https://your-domain.com/graph/outlook
 GRAPH_CLIENT_STATE=use-a-long-random-secret
 GRAPH_SUBSCRIPTION_HOURS=48
 
-CV_UPLOAD_API_URL_TEMPLATE=http://smarthrai-apis.runasp.net/api/AiData/applications/{application_id}/cv
-CV_UPLOAD_TIMEOUT_SECONDS=30
+CV_STORAGE_DIR=storage/cvs
 
 RECRUITER_APPEND_SIGNATURE=true
 RECRUITER_SIGNATURE_SIGNOFF=Regards,
@@ -587,7 +585,7 @@ RECRUITER_SIGNATURE_EMAIL=career@virtualadmins.org
 RECRUITER_SIGNATURE_LOGO_URL=https://virtualadmins.org/assets/images/logos/vaadmin-logo.png
 ```
 
-When a CV is received, the agent first inserts the `recruiter_applications` row, then uploads the original CV file to `CV_UPLOAD_API_URL_TEMPLATE`. The `{application_id}` placeholder is replaced with the new application id. The API response field `attachmentFilename` is saved back into `recruiter_applications.attachment_filename`.
+When a CV is received, the agent first inserts the `recruiter_applications` row, then stores the original CV file under `CV_STORAGE_DIR` in an `application-{id}` folder. The saved file path is written to `recruiter_applications.attachment_filename`; `attachment_payload` is left empty for new records so CV files are not stored as database binary data. The dashboard uses that saved path for View CV and Download CV.
 
 Microsoft Graph does not always apply the Outlook web auto-signature to API-created replies. The agent preserves the draft signature if Graph returns one; otherwise it appends the configured fallback signature above the quoted email thread. Set `RECRUITER_APPEND_SIGNATURE=false` only if your Graph drafts already include the mailbox signature.
 
