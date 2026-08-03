@@ -1307,6 +1307,44 @@ def screening_fit(answers: dict[str, Any], requirement: dict[str, Any] | None) -
     return not issues, issues
 
 
+def latest_reply_accepts_budget(text: str, requirement: dict[str, Any] | None) -> bool:
+    latest_raw = latest_reply_text(text)
+    latest = normalize_position_text(latest_raw)
+    if not latest:
+        return False
+    if any(phrase in latest for phrase in ["not okay", "not ok", "not comfortable", "cannot", "can't", "cant"]):
+        return False
+    budget_max = score_number(requirement.get("budget_max") if requirement else None)
+    numbers = [float(match.group(0)) for match in re.finditer(r"\b\d+(?:\.\d+)?\b", latest_raw.replace(",", ""))]
+    if budget_max is not None:
+        saw_salary_number = False
+        for number in numbers:
+            annual_number = number * 100000 if number <= 200 and re.search(r"\b(lpa|lakh|lac)\b", latest, flags=re.I) else number
+            if annual_number >= 10000:
+                saw_salary_number = True
+            if annual_number <= budget_max:
+                return True
+        if saw_salary_number:
+            return False
+    if "negotiate" in latest and not any(phrase in latest for phrase in ["proceed", "comfortable", "agree", "within budget"]):
+        return False
+    acceptance_phrases = [
+        "yes please proceed",
+        "please proceed",
+        "go ahead",
+        "i agree",
+        "agreed",
+        "i am ok",
+        "i am okay",
+        "i am comfortable",
+        "comfortable with",
+        "within budget",
+        "budget works",
+        "no issues",
+    ]
+    return any(phrase in latest for phrase in acceptance_phrases)
+
+
 def parse_iso_datetime(value: Any) -> datetime | None:
     if not value:
         return None
@@ -3549,7 +3587,25 @@ Full email thread:
 """
         ).content.strip()
         response = self.clean_reply_body(response)
-        return response or fallback_body
+        if not self.reply_has_meaningful_content(response):
+            log_json(
+                logging.WARNING,
+                "llm_reply_empty_using_fallback",
+                scenario=scenario,
+                response_preview=response[:300],
+                fallback_preview=fallback_body[:300],
+            )
+            return fallback_body
+        return response
+
+    def reply_has_meaningful_content(self, body: str) -> bool:
+        text = normalize_position_text(body)
+        words = [
+            word
+            for word in text.split()
+            if word not in {"hi", "hello", "regards", "best", "hr", "team", "thanks", "thank", "you"}
+        ]
+        return len(words) >= 4
 
     def clean_reply_body(self, body: str) -> str:
         body = re.sub(r"```(?:text|html|markdown)?", "", body, flags=re.I).replace("```", "")
@@ -4594,6 +4650,24 @@ class AIRecruiterAgent:
                     self.db.update_application_screening(active_application["id"], "screening_questions_sent", answers)
                     self.reply_screening_missing_details(inbox_email, answers)
                     return True
+
+                if current_status == "screening_negotiation" and latest_reply_accepts_budget(
+                    inbox_email.body,
+                    active_application,
+                ):
+                    budget_max = score_number(active_application.get("budget_max"))
+                    if budget_max is not None:
+                        answers = {**answers, "expected_salary": budget_max, "accepted_budget": True}
+                    self.db.log_email_event(
+                        inbox_email,
+                        "screening_budget_accepted",
+                        {
+                            "application_id": active_application["id"],
+                            "merged_answers": answers,
+                            "budget_max": budget_max,
+                            "latest_reply": latest_reply_text(inbox_email.body)[:1000],
+                        },
+                    )
 
                 is_fit, issues = screening_fit(answers, active_application)
                 if is_fit:
