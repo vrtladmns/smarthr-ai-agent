@@ -2969,6 +2969,15 @@ Previous transcript:
       color: #c01048;
       border: 1px solid #fea3b4;
     }}
+    .browser-gate {{
+      padding: 16px;
+      border-radius: 8px;
+      background: #fff7ed;
+      color: #9a3412;
+      border: 1px solid #fed7aa;
+      line-height: 1.5;
+      margin-top: 14px;
+    }}
     .hidden {{
       display: none;
     }}
@@ -2992,6 +3001,9 @@ Previous transcript:
       <p class="muted">Hi {html_escape(candidate)}, this will feel like a short video interview. Please allow camera and microphone access when your browser asks.</p>
       {disabled_notice}
       <p id="message" class="status"></p>
+      <div id="browserGate" class="browser-gate hidden">
+        Please open this interview link in Google Chrome. This voice interview needs Chrome speech recognition for the microphone and live transcript.
+      </div>
       <div id="interviewBox" class="{html_escape('hidden' if completed else '')}">
         <div>
           <span class="pill"><span id="micDot" class="dot"></span><span id="micStatus">Mic not connected</span></span>
@@ -3085,6 +3097,7 @@ Previous transcript:
     const questionEl = document.getElementById('question');
     const answerEl = document.getElementById('answer');
     const messageEl = document.getElementById('message');
+    const browserGateEl = document.getElementById('browserGate');
     const interviewBox = document.getElementById('interviewBox');
     const startBtn = document.getElementById('startBtn');
     const listenBtn = document.getElementById('listenBtn');
@@ -3104,6 +3117,24 @@ Previous transcript:
     function setMessage(text, isError=false) {{
       messageEl.textContent = text || '';
       messageEl.className = isError ? 'error' : 'status';
+    }}
+
+    function isSupportedInterviewBrowser() {{
+      const ua = navigator.userAgent || '';
+      const vendor = navigator.vendor || '';
+      const hasSpeechRecognition = Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+      const blocked = /Firefox\\//.test(ua) || /Edg\\//.test(ua) || /OPR\\//.test(ua) || (/Safari\\//.test(ua) && !/Chrome\\//.test(ua));
+      const isChrome = (/Chrome\\//.test(ua) || /Chromium\\//.test(ua)) && /Google Inc/.test(vendor);
+      return hasSpeechRecognition && isChrome && !blocked;
+    }}
+
+    function enforceSupportedBrowser() {{
+      if (isSupportedInterviewBrowser()) return true;
+      if (browserGateEl) browserGateEl.classList.remove('hidden');
+      if (interviewBox) interviewBox.classList.add('hidden');
+      setMessage('');
+      startBtn.disabled = true;
+      return false;
     }}
 
     function setDeviceStatus(type, ok, text) {{
@@ -3470,6 +3501,7 @@ Previous transcript:
     }}
 
     async function startInterview() {{
+      if (!enforceSupportedBrowser()) return;
       startBtn.disabled = true;
       setMessage('Checking camera and microphone permissions...');
       const mediaOk = await ensureMediaAccess();
@@ -3750,6 +3782,7 @@ Previous transcript:
       nextBtn.disabled = true;
       endBtn.disabled = true;
     }});
+    enforceSupportedBrowser();
   </script>
 </body>
 </html>"""
