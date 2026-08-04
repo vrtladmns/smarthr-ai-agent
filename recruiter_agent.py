@@ -74,6 +74,8 @@ from config import (
     RECRUITER_HR_ESCALATION_EMAIL,
     RECRUITER_IMAP_HOST,
     RECRUITER_INTERVIEW_BASE_URL,
+    RECRUITER_INTERVIEW_HOLD_MIN_SCORE,
+    RECRUITER_INTERVIEW_PASS_SCORE,
     RECRUITER_IMAP_PORT,
     RECRUITER_LOG_FILE,
     RECRUITER_LOG_LEVEL,
@@ -5729,14 +5731,16 @@ def create_interview_link_for_application(application_id: int, reset: bool = Fal
 
 
 def interview_report_recommendation(report: dict[str, Any]) -> str:
+    overall_score = score_number(report.get("overall_score"))
+    if overall_score is not None and overall_score > RECRUITER_INTERVIEW_PASS_SCORE:
+        return "hire"
+    if overall_score is not None and overall_score >= RECRUITER_INTERVIEW_HOLD_MIN_SCORE:
+        return "hold"
+    if overall_score is not None:
+        return "reject"
     recommendation = str(report.get("recommendation") or "").strip().lower()
     if recommendation in {"strong_hire", "hire", "hold", "reject"}:
         return recommendation
-    overall_score = score_number(report.get("overall_score"))
-    if overall_score is not None and overall_score >= 70:
-        return "hire"
-    if overall_score is not None and overall_score < 45:
-        return "reject"
     return "hold"
 
 
@@ -5809,6 +5813,15 @@ def send_interview_rejection(application_id: int, reason: str | None = None):
 
 def notify_post_interview_outcome(application_id: int, report: dict[str, Any]):
     recommendation = interview_report_recommendation(report)
+    log_json(
+        logging.INFO,
+        "post_interview_recommendation_decided",
+        application_id=application_id,
+        overall_score=report.get("overall_score"),
+        recommendation=recommendation,
+        pass_score=RECRUITER_INTERVIEW_PASS_SCORE,
+        hold_min_score=RECRUITER_INTERVIEW_HOLD_MIN_SCORE,
+    )
     if recommendation in {"strong_hire", "hire"}:
         send_final_hr_round_request(application_id)
         return

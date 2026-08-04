@@ -27,6 +27,8 @@ from config import (
     RECRUITER_DASHBOARD_SESSION_SECRET,
     RECRUITER_BROWSER_PROCESSING_NUDGE_MS,
     RECRUITER_BROWSER_TTS_VOICE_HINTS,
+    RECRUITER_INTERVIEW_HOLD_MIN_SCORE,
+    RECRUITER_INTERVIEW_PASS_SCORE,
     RECRUITER_INTERVIEW_QUESTION_COUNT,
 )
 from llm_factory import make_chat_model
@@ -846,6 +848,10 @@ Return one valid JSON object only.
 You are an HR technical interviewer. Evaluate this browser voice interview fairly.
 Use only the candidate answers, CV, and JD context provided.
 Camera monitoring is a browser-side signal only. Do not over-penalize camera issues unless unusual activity is repeated.
+Use these final recommendation bands:
+- overall_score > {RECRUITER_INTERVIEW_PASS_SCORE}: hire or strong_hire
+- {RECRUITER_INTERVIEW_HOLD_MIN_SCORE} <= overall_score <= {RECRUITER_INTERVIEW_PASS_SCORE}: hold
+- overall_score < {RECRUITER_INTERVIEW_HOLD_MIN_SCORE}: reject
 
 JSON schema:
 {{
