@@ -25,6 +25,8 @@ from config import (
     RECRUITER_DASHBOARD_LOGIN_EMAIL,
     RECRUITER_DASHBOARD_LOGIN_PASSWORD,
     RECRUITER_DASHBOARD_SESSION_SECRET,
+    RECRUITER_BROWSER_PROCESSING_NUDGE_MS,
+    RECRUITER_BROWSER_TTS_VOICE_HINTS,
     RECRUITER_INTERVIEW_QUESTION_COUNT,
 )
 from llm_factory import make_chat_model
@@ -3037,6 +3039,7 @@ Previous transcript:
     let isSubmitting = false;
     let processingNudgeTimer = null;
     let processingNudgeSpoken = false;
+    let preferredInterviewVoice = null;
     let activeSpeechId = 0;
     let flowVersion = 0;
     let interviewClosed = false;
@@ -3069,7 +3072,9 @@ Previous transcript:
     }};
     const ANSWER_SILENCE_MS = 2800;
     const LONG_ANSWER_SILENCE_MS = 5200;
+    const PROCESSING_NUDGE_MS = {int(RECRUITER_BROWSER_PROCESSING_NUDGE_MS)};
     const MIC_ACTIVITY_THRESHOLD = 0.018;
+    const FEMALE_VOICE_HINTS = {json.dumps([hint.strip().lower() for hint in RECRUITER_BROWSER_TTS_VOICE_HINTS.split(",") if hint.strip()])};
 
     const questionEl = document.getElementById('question');
     const answerEl = document.getElementById('answer');
@@ -3107,12 +3112,34 @@ Previous transcript:
       callDot.className = live ? 'dot live' : 'dot ok';
     }}
 
+    function chooseInterviewVoice() {{
+      const voices = window.speechSynthesis ? window.speechSynthesis.getVoices() : [];
+      if (!voices.length) return null;
+      const englishVoices = voices.filter(voice => (voice.lang || '').toLowerCase().startsWith('en'));
+      const candidates = englishVoices.length ? englishVoices : voices;
+      return candidates.find(voice => {{
+        const name = `${{voice.name}} ${{voice.voiceURI}}`.toLowerCase();
+        return FEMALE_VOICE_HINTS.some(hint => name.includes(hint));
+      }}) || candidates[0] || null;
+    }}
+
+    function refreshInterviewVoice() {{
+      preferredInterviewVoice = chooseInterviewVoice();
+    }}
+
+    if (window.speechSynthesis) {{
+      refreshInterviewVoice();
+      window.speechSynthesis.onvoiceschanged = refreshInterviewVoice;
+    }}
+
     function speak(text, onend) {{
       const speechId = ++activeSpeechId;
       window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(text);
+      if (!preferredInterviewVoice) refreshInterviewVoice();
+      if (preferredInterviewVoice) utterance.voice = preferredInterviewVoice;
       utterance.rate = 0.95;
-      utterance.pitch = 1;
+      utterance.pitch = 1.08;
       aiStatus.textContent = 'Speaking';
       utterance.onend = () => {{
         if (speechId !== activeSpeechId) return;
@@ -3332,7 +3359,7 @@ Previous transcript:
         processingNudgeSpoken = true;
         setMessage('The interviewer is thinking...');
         speak(processingNudge());
-      }}, 3500);
+      }}, PROCESSING_NUDGE_MS);
     }}
 
     function closeInterviewScreen() {{

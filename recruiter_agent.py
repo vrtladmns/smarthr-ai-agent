@@ -4597,9 +4597,44 @@ class AIRecruiterAgent:
 
         if active_application and not inbox_email.attachments:
             current_status = (active_application.get("application_status") or "").lower()
-            if current_status in {"screening_questions_sent", "screening_under_review", "screening_negotiation"}:
+            candidate_accepted_escalated_budget = (
+                current_status == "hr_escalated"
+                and latest_reply_accepts_budget(inbox_email.body, active_application)
+            )
+            if current_status in {"screening_questions_sent", "screening_under_review", "screening_negotiation"} or candidate_accepted_escalated_budget:
                 extracted_answers = self.ai.extract_screening_answers(inbox_email, active_application)
                 answers = merge_screening_answers(active_application.get("screening_details"), extracted_answers)
+                if candidate_accepted_escalated_budget:
+                    budget_max = score_number(active_application.get("budget_max"))
+                    if budget_max is not None:
+                        answers = {**answers, "expected_salary": budget_max, "accepted_budget": True}
+                    self.db.log_email_event(
+                        inbox_email,
+                        "hr_escalated_budget_accepted",
+                        {
+                            "application_id": active_application["id"],
+                            "extracted_answers": extracted_answers,
+                            "merged_answers": answers,
+                            "budget_max": budget_max,
+                            "latest_reply": latest_reply_text(inbox_email.body)[:1000],
+                        },
+                    )
+                    log_json(
+                        logging.INFO,
+                        "hr_escalated_budget_accepted",
+                        **inbox_email_summary(inbox_email),
+                        application_id=active_application["id"],
+                        budget_max=budget_max,
+                    )
+                    trace_recruiter_event(
+                        "hr_escalated_budget_accepted",
+                        inputs=inbox_email_summary(inbox_email),
+                        outputs={
+                            "application_id": active_application["id"],
+                            "budget_max": budget_max,
+                            "next_action": "resume_screening_flow",
+                        },
+                    )
                 if candidate_declined_required_location(inbox_email.body) or extracted_answers.get("comfortable_with_terms") is False:
                     answers = {**answers, "comfortable_with_terms": False}
                     reason = "candidate declined Mohali/work-from-office location terms"
@@ -4770,6 +4805,16 @@ class AIRecruiterAgent:
                 else None
             )
             if existing_application_followup:
+                existing_status = (existing_application_followup.get("application_status") or "").lower()
+                if existing_status == "hr_escalated":
+                    self.notify_manual_hr_review(
+                        inbox_email,
+                        existing_application_followup,
+                        "Candidate replied while this application is escalated to HR. The reply was not an accepted-budget response, so HR should handle it manually.",
+                        event_type="hr_escalated_candidate_reply_handoff",
+                        mark_application=False,
+                    )
+                    return True
                 self.db.log_email_event(
                     inbox_email,
                     "existing_application_followup_without_cv",
