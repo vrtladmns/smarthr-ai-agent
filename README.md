@@ -857,7 +857,17 @@ When a candidate passes screening, the email agent sends:
 https://hr.virtualadmins.org/interview/<token>
 ```
 
-The candidate opens the link in a browser, allows microphone access, hears the questions, answers through browser speech recognition, and submits the interview. The dashboard backend generates the HR report and saves it to `recruiter_applications.interview_report`.
+The candidate opens the link in Google Chrome, allows microphone/camera access, shares their screen for recording, hears the questions, answers through browser speech recognition, and submits the interview. The dashboard backend generates the HR report and saves it to `recruiter_applications.interview_report`.
+
+Interview screen recordings are uploaded to OneDrive through Microsoft Graph and the OneDrive link is saved under `interview_report.recording`:
+
+```bash
+ONEDRIVE_RECORDINGS_ENABLED=true
+ONEDRIVE_RECORDINGS_USER=career@virtualadmins.org
+ONEDRIVE_RECORDINGS_FOLDER=AI Recruiter Interview Recordings
+```
+
+The Azure app used for Microsoft Graph must have OneDrive file permissions such as `Files.ReadWrite.All` or `Sites.ReadWrite.All` with admin consent, in addition to the existing mail/calendar permissions.
 
 Send or resend an interview link manually:
 

@@ -66,6 +66,8 @@ from config import (
     MSSQL_ODBC_DRIVER,
     NGROK_API_URL,
     OLLAMA_NUM_PREDICT,
+    ONEDRIVE_RECORDINGS_FOLDER,
+    ONEDRIVE_RECORDINGS_USER,
     RECRUITER_EMAIL,
     RECRUITER_EMAIL_PASSWORD,
     RECRUITER_FROM_EMAIL,
@@ -1974,6 +1976,11 @@ def safe_cv_storage_filename(filename: str) -> str:
     return safe_name[:180]
 
 
+def safe_onedrive_path_part(value: str) -> str:
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value or "")).strip(" ._")
+    return (safe_name or "recording")[:120]
+
+
 def save_cv_attachment_file(application_id: int, filename: str, payload: bytes) -> str:
     storage_root = Path(CV_STORAGE_DIR)
     if not storage_root.is_absolute():
@@ -3046,13 +3053,14 @@ class MicrosoftGraphProvider:
 
     def request(self, method: str, path: str, **kwargs):
         headers = kwargs.pop("headers", {})
+        timeout = kwargs.pop("timeout", 30)
         headers["Authorization"] = f"Bearer {self.token()}"
         headers.setdefault("Accept", "application/json")
         response = self.requests.request(
             method,
             f"{self.base_url}{path}",
             headers=headers,
-            timeout=30,
+            timeout=timeout,
             **kwargs,
         )
         if response.status_code >= 400:
@@ -3060,6 +3068,32 @@ class MicrosoftGraphProvider:
         if response.status_code == 204 or not response.content:
             return {}
         return response.json()
+
+    def upload_onedrive_file(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        folder: str | None = None,
+        content_type: str = "application/octet-stream",
+        user_email: str | None = None,
+    ) -> dict[str, Any]:
+        if not file_bytes:
+            raise RuntimeError("Cannot upload empty OneDrive file.")
+        drive_user = quote(user_email or ONEDRIVE_RECORDINGS_USER or self.mailbox_address, safe="")
+        folder_parts = [
+            safe_onedrive_path_part(part)
+            for part in str(folder or ONEDRIVE_RECORDINGS_FOLDER or "AI Recruiter Interview Recordings").split("/")
+            if safe_onedrive_path_part(part)
+        ]
+        safe_filename = safe_onedrive_path_part(filename)
+        drive_path = "/".join([*folder_parts, safe_filename])
+        return self.request(
+            "PUT",
+            f"/users/{drive_user}/drive/root:/{quote(drive_path, safe='/')}:/content",
+            headers={"Content-Type": content_type or "application/octet-stream"},
+            data=file_bytes,
+            timeout=180,
+        )
 
     def message_to_inbox_email(self, message: dict[str, Any]) -> InboxEmail:
         attachments = self.fetch_attachments(message["id"]) if message.get("hasAttachments") else []

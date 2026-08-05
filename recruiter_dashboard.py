@@ -30,10 +30,14 @@ from config import (
     RECRUITER_INTERVIEW_HOLD_MIN_SCORE,
     RECRUITER_INTERVIEW_PASS_SCORE,
     RECRUITER_INTERVIEW_QUESTION_COUNT,
+    ONEDRIVE_RECORDINGS_ENABLED,
+    ONEDRIVE_RECORDINGS_FOLDER,
+    ONEDRIVE_RECORDINGS_USER,
 )
 from llm_factory import make_chat_model
 from recruiter_agent import (
     LOGGER,
+    MicrosoftGraphProvider,
     RecruiterDatabase,
     candidate_interview_url,
     final_hr_interviewers,
@@ -51,6 +55,7 @@ from recruiter_agent import (
     send_interview_request_after_hr_approval,
     send_teams_link_for_application,
     log_json,
+    safe_onedrive_path_part,
 )
 
 
@@ -324,7 +329,7 @@ def interview_api_path(path: str) -> tuple[str, str] | None:
         and parts[0] == "api"
         and parts[1] == "interview"
         and re.fullmatch(r"[A-Za-z0-9_-]{20,200}", parts[2])
-        and parts[3] in {"start", "turn", "complete"}
+        and parts[3] in {"start", "turn", "complete", "recording"}
     ):
         return parts[2], parts[3]
     return None
@@ -519,6 +524,9 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
             interview_api = interview_api_path(parsed.path)
             if interview_api:
                 token, action = interview_api
+                if action == "recording":
+                    self.api_interview_recording(token)
+                    return
                 payload = self.read_json_body()
                 if action == "start":
                     self.api_interview_start(token)
@@ -784,6 +792,14 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
         return value if isinstance(value, dict) else {}
+
+    def read_raw_body(self, max_bytes: int = 300_000_000) -> bytes:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            return b""
+        if length > max_bytes:
+            raise ValueError(f"Request body too large: {length} bytes")
+        return self.rfile.read(length)
 
     def send_json(self, payload: dict, status: int = 200):
         body = json.dumps(payload, default=str).encode("utf-8")
@@ -1079,6 +1095,70 @@ Previous transcript:
                 "total_questions": len(questions),
             }
         )
+
+    def api_interview_recording(self, token: str):
+        application = self.application_for_interview_token(token)
+        if not application:
+            self.send_json({"error": "Interview link not found."}, status=404)
+            return
+        if not ONEDRIVE_RECORDINGS_ENABLED:
+            self.send_json({"ok": False, "error": "OneDrive recording upload is disabled."}, status=400)
+            return
+        try:
+            recording_bytes = self.read_raw_body()
+            if not recording_bytes:
+                self.send_json({"ok": False, "error": "Recording file was empty."}, status=400)
+                return
+            content_type = self.headers.get("Content-Type", "video/webm") or "video/webm"
+            extension = ".webm"
+            if "mp4" in content_type.lower():
+                extension = ".mp4"
+            timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+            candidate_label = safe_onedrive_path_part(application.get("full_name") or application.get("candidate_email") or "candidate")
+            filename = f"application-{application['id']}-{candidate_label}-{timestamp}{extension}"
+            folder = f"{ONEDRIVE_RECORDINGS_FOLDER}/Application {application['id']}"
+            uploaded = MicrosoftGraphProvider(ONEDRIVE_RECORDINGS_USER).upload_onedrive_file(
+                recording_bytes,
+                filename,
+                folder=folder,
+                content_type=content_type,
+                user_email=ONEDRIVE_RECORDINGS_USER,
+            )
+            recording_info = {
+                "filename": uploaded.get("name") or filename,
+                "onedrive_id": uploaded.get("id"),
+                "web_url": uploaded.get("webUrl"),
+                "size": uploaded.get("size") or len(recording_bytes),
+                "content_type": content_type,
+                "uploaded_at": datetime.utcnow().isoformat() + "Z",
+                "onedrive_user": ONEDRIVE_RECORDINGS_USER,
+            }
+            report = json_object(application.get("interview_report"))
+            report["recording"] = recording_info
+            database = self.db()
+            try:
+                database.db.execute(
+                    """
+                    UPDATE recruiter_applications
+                    SET interview_report = %s::jsonb
+                    WHERE id = %s
+                    """,
+                    (json.dumps(report), application["id"]),
+                )
+            finally:
+                database.close()
+            log_json(
+                logging.INFO,
+                "interview_recording_uploaded",
+                application_id=application["id"],
+                filename=recording_info["filename"],
+                size=recording_info["size"],
+                web_url=recording_info["web_url"],
+            )
+            self.send_json({"ok": True, "recording": recording_info})
+        except Exception as exc:
+            LOGGER.exception("Interview recording upload failed: %s", exc)
+            self.send_json({"ok": False, "error": str(exc)}, status=500)
 
     def api_interview_turn(self, token: str, payload: dict):
         application = self.application_for_interview_token(token)
@@ -2580,6 +2660,8 @@ Previous transcript:
             database.close()
 
         interview_report = json_object(row.get("interview_report"))
+        recording = json_object(interview_report.get("recording"))
+        recording_url = recording.get("web_url")
         interview_link = candidate_interview_url(row.get("interview_link_token")) if row.get("interview_link_token") else None
         fields = [
             ("Candidate", f'<a href="/candidates/{html_escape(row["candidate_id"])}">{html_escape(row["full_name"] or "Unnamed candidate")}</a>', "html"),
@@ -2608,6 +2690,7 @@ Previous transcript:
             ("Interview Availability", row.get("interview_availability"), "pre-wide"),
             ("Interview Scheduled At", date_text(row.get("interview_scheduled_at"))),
             ("Interview Link", interview_link),
+            ("Interview Recording", self.link_value(recording_url) if recording_url else None, "html"),
             ("Interview Started At", date_text(row.get("interview_started_at"))),
             ("Interview Completed At", date_text(row.get("interview_completed_at"))),
             ("HR Interviewer", row.get("hr_interviewer_name") or row.get("hr_interviewer_email")),
@@ -3050,6 +3133,11 @@ Previous transcript:
     let interviewPhase = 'idle';
     let recognition = null;
     let mediaStream = null;
+    let screenStream = null;
+    let recordingStream = null;
+    let interviewRecorder = null;
+    let interviewRecordingChunks = [];
+    let recordingUploadStarted = false;
     let finalTranscript = '';
     let isRecording = false;
     let autoAdvanceTimer = null;
@@ -3066,6 +3154,9 @@ Previous transcript:
     let audioMonitorId = null;
     let lastSpeechResultAt = 0;
     let lastMicActivityAt = 0;
+    let lastTranscriptChangeAt = 0;
+    let lastFinalTranscriptAt = 0;
+    let finalResultAutoAdvanceTimer = null;
     let cameraCanvas = null;
     let cameraContext = null;
     let cameraMonitorTimer = null;
@@ -3088,10 +3179,13 @@ Previous transcript:
       high_motion_events: 0,
       unusual_activity: []
     }};
-    const ANSWER_SILENCE_MS = 2800;
-    const LONG_ANSWER_SILENCE_MS = 5200;
+    const ANSWER_SILENCE_MS = 2200;
+    const LONG_ANSWER_SILENCE_MS = 3200;
+    const INCOMPLETE_ANSWER_SILENCE_MS = 7000;
+    const FINAL_TRANSCRIPT_GRACE_MS = 1400;
     const PROCESSING_NUDGE_MS = {int(RECRUITER_BROWSER_PROCESSING_NUDGE_MS)};
-    const MIC_ACTIVITY_THRESHOLD = 0.018;
+    const MIC_ACTIVITY_THRESHOLD = 0.026;
+    const RECORDING_MIME_TYPE = 'video/webm;codecs=vp8,opus';
     const FEMALE_VOICE_HINTS = {json.dumps([hint.strip().lower() for hint in RECRUITER_BROWSER_TTS_VOICE_HINTS.split(",") if hint.strip()])};
 
     const questionEl = document.getElementById('question');
@@ -3204,6 +3298,10 @@ Previous transcript:
         window.clearTimeout(autoAdvanceTimer);
         autoAdvanceTimer = null;
       }}
+      if (finalResultAutoAdvanceTimer) {{
+        window.clearTimeout(finalResultAutoAdvanceTimer);
+        finalResultAutoAdvanceTimer = null;
+      }}
     }}
 
     function clearProcessingNudge() {{
@@ -3219,18 +3317,63 @@ Previous transcript:
 
     function currentSilenceMs() {{
       const now = Date.now();
-      const lastActivity = Math.max(lastSpeechResultAt || 0, lastMicActivityAt || 0);
+      const lastTextActivity = Math.max(lastTranscriptChangeAt || 0, lastFinalTranscriptAt || 0);
+      const lastActivity = speechStarted ? lastTextActivity : Math.max(lastSpeechResultAt || 0, lastMicActivityAt || 0);
       return lastActivity ? now - lastActivity : 0;
     }}
 
+    function answerLooksIncomplete() {{
+      const text = answerEl.value.trim().toLowerCase();
+      if (!text) return true;
+      const incompleteEndings = [
+        'and', 'or', 'but', 'so', 'because', 'like', 'then', 'actually',
+        'for example', 'such as', 'i mean', 'let me think', 'one second',
+        'wait', 'just a moment'
+      ];
+      return incompleteEndings.some(ending => text.endsWith(ending));
+    }}
+
+    function answerHasExplicitCompletion() {{
+      const text = answerEl.value.trim().toLowerCase();
+      const completionPhrases = [
+        "that's all", "that is all", "that's it", "that is it",
+        "i'm done", "i am done", "that's my answer", "that is my answer",
+        "next question", "skip this", "skip question", "i don't know", "i do not know"
+      ];
+      return completionPhrases.some(phrase => text.includes(phrase));
+    }}
+
+    function answerCanAutoSubmit() {{
+      const words = answerWordCount();
+      if (interviewPhase === 'greeting') return words >= 1;
+      if (answerHasExplicitCompletion()) return true;
+      if (answerLooksIncomplete()) return false;
+      return words >= 10;
+    }}
+
     function answerSilenceThresholdMs() {{
+      if (answerLooksIncomplete()) return INCOMPLETE_ANSWER_SILENCE_MS;
       return answerWordCount() >= 45 ? LONG_ANSWER_SILENCE_MS : ANSWER_SILENCE_MS;
+    }}
+
+    function scheduleFinalResultAutoAdvance() {{
+      if (finalResultAutoAdvanceTimer) window.clearTimeout(finalResultAutoAdvanceTimer);
+      finalResultAutoAdvanceTimer = window.setTimeout(() => {{
+        if (
+          isRecording &&
+          !isSubmitting &&
+          !interviewClosed &&
+          answerCanAutoSubmit() &&
+          Date.now() - lastFinalTranscriptAt >= FINAL_TRANSCRIPT_GRACE_MS
+        ) {{
+          stopListeningAndAdvance();
+        }}
+      }}, FINAL_TRANSCRIPT_GRACE_MS);
     }}
 
     function scheduleAutoAdvance() {{
       clearAutoAdvanceTimer();
       autoAdvanceTimer = window.setTimeout(() => {{
-        const words = answerWordCount();
         const threshold = answerSilenceThresholdMs();
         const silentFor = currentSilenceMs();
         if (
@@ -3238,7 +3381,7 @@ Previous transcript:
           !isSubmitting &&
           !interviewClosed &&
           silentFor >= threshold &&
-          (words >= 3 || (interviewPhase === 'greeting' && words >= 1))
+          answerCanAutoSubmit()
         ) {{
           stopListeningAndAdvance();
           return;
@@ -3246,7 +3389,7 @@ Previous transcript:
         if (isRecording && !isSubmitting && !interviewClosed) {{
           scheduleAutoAdvance();
         }}
-      }}, Math.max(700, Math.min(answerSilenceThresholdMs(), 1200)));
+      }}, Math.max(900, Math.min(answerSilenceThresholdMs(), 1400)));
     }}
 
     function startAudioActivityMonitor() {{
@@ -3268,7 +3411,7 @@ Previous transcript:
             sum += value * value;
           }}
           const rms = Math.sqrt(sum / data.length);
-          if (rms >= MIC_ACTIVITY_THRESHOLD) {{
+          if (rms >= MIC_ACTIVITY_THRESHOLD && speechStarted) {{
             lastMicActivityAt = Date.now();
           }}
           audioMonitorId = window.requestAnimationFrame(tick);
@@ -3373,6 +3516,86 @@ Previous transcript:
       cameraMonitorTimer = window.setInterval(sampleCameraFrame, 2500);
     }}
 
+    function preferredRecordingMimeType() {{
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported(RECORDING_MIME_TYPE)) return RECORDING_MIME_TYPE;
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported('video/webm')) return 'video/webm';
+      return '';
+    }}
+
+    async function startInterviewRecording() {{
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {{
+        setMessage('Screen recording is required for this interview. Please open this link in Chrome on a laptop or desktop.', true);
+        return false;
+      }}
+      try {{
+        screenStream = await navigator.mediaDevices.getDisplayMedia({{
+          video: true,
+          audio: true
+        }});
+      }} catch (error) {{
+        setMessage('Screen recording is required. Please click Start again and share your screen when Chrome asks.', true);
+        return false;
+      }}
+      const tracks = [
+        ...screenStream.getVideoTracks(),
+        ...screenStream.getAudioTracks(),
+        ...mediaStream.getAudioTracks()
+      ];
+      recordingStream = new MediaStream(tracks);
+      interviewRecordingChunks = [];
+      try {{
+        const mimeType = preferredRecordingMimeType();
+        interviewRecorder = mimeType
+          ? new MediaRecorder(recordingStream, {{mimeType, videoBitsPerSecond: 900000, audioBitsPerSecond: 64000}})
+          : new MediaRecorder(recordingStream);
+      }} catch (error) {{
+        setMessage('Could not start screen recording in this browser. Please use Google Chrome.', true);
+        return false;
+      }}
+      interviewRecorder.ondataavailable = event => {{
+        if (event.data && event.data.size > 0) interviewRecordingChunks.push(event.data);
+      }};
+      interviewRecorder.onerror = () => setMessage('Screen recording had an issue. Please keep the interview tab open.', true);
+      interviewRecorder.start(1000);
+      setMessage('Screen recording started. Please keep sharing until the interview is complete.');
+      return true;
+    }}
+
+    async function stopAndUploadInterviewRecording() {{
+      if (recordingUploadStarted) return;
+      recordingUploadStarted = true;
+      if (!interviewRecorder) return;
+      const stopped = new Promise(resolve => {{
+        if (interviewRecorder.state === 'inactive') {{
+          resolve();
+          return;
+        }}
+        interviewRecorder.onstop = resolve;
+        try {{
+          interviewRecorder.stop();
+        }} catch (error) {{
+          resolve();
+        }}
+      }});
+      await stopped;
+      if (screenStream) screenStream.getTracks().forEach(track => track.stop());
+      if (recordingStream) recordingStream.getTracks().forEach(track => track.stop());
+      const mimeType = interviewRecorder.mimeType || 'video/webm';
+      const blob = new Blob(interviewRecordingChunks, {{type: mimeType}});
+      if (!blob.size) return;
+      setMessage('Saving interview recording to OneDrive...');
+      const response = await fetch(`/api/interview/${{token}}/recording`, {{
+        method: 'POST',
+        headers: {{'Content-Type': mimeType}},
+        body: blob
+      }});
+      const data = await response.json();
+      if (!response.ok || !data.ok) {{
+        throw new Error(data.error || 'Could not save interview recording.');
+      }}
+      setMessage('Interview recording saved successfully.');
+    }}
+
     function stopCameraMonitoring() {{
       if (cameraMonitorTimer) window.clearInterval(cameraMonitorTimer);
       cameraMonitorTimer = null;
@@ -3399,14 +3622,20 @@ Previous transcript:
       }}, PROCESSING_NUDGE_MS);
     }}
 
-    function closeInterviewScreen() {{
+    async function closeInterviewScreen() {{
       stopCameraMonitoring();
+      let recordingError = '';
+      try {{
+        await stopAndUploadInterviewRecording();
+      }} catch (error) {{
+        recordingError = error.message || 'Interview completed, but recording upload failed.';
+      }}
       if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
       if (audioMonitorId) window.cancelAnimationFrame(audioMonitorId);
       audioMonitorId = null;
       if (interviewBox) interviewBox.classList.add('hidden');
       setCallStatus('Completed', false);
-      setMessage('Interview completed. Thank you for your time today. I will get back to you with feedback soon.');
+      setMessage(recordingError || 'Interview completed. Thank you for your time today. I will get back to you with feedback soon.', Boolean(recordingError));
     }}
 
     async function ensureMediaAccess() {{
@@ -3453,19 +3682,32 @@ Previous transcript:
       rec.interimResults = true;
       rec.continuous = true;
       rec.onresult = (event) => {{
-        lastSpeechResultAt = Date.now();
+        const now = Date.now();
         let interim = '';
+        let sawFinal = false;
         for (let i = event.resultIndex; i < event.results.length; i++) {{
           const text = event.results[i][0].transcript;
-          if (event.results[i].isFinal) finalTranscript += text + ' ';
+          if (event.results[i].isFinal) {{
+            finalTranscript += text + ' ';
+            sawFinal = true;
+          }}
           else interim += text;
         }}
-        answerEl.value = (finalTranscript + interim).trim();
+        const nextTranscript = (finalTranscript + interim).trim();
+        if (nextTranscript && nextTranscript !== answerEl.value.trim()) {{
+          lastTranscriptChangeAt = now;
+        }}
+        lastSpeechResultAt = now;
+        answerEl.value = nextTranscript;
         if (answerEl.value.trim()) {{
           speechStarted = true;
           nextBtn.disabled = false;
           setMessage('Listening. Please continue naturally.');
           scheduleAutoAdvance();
+          if (sawFinal) {{
+            lastFinalTranscriptAt = Date.now();
+            scheduleFinalResultAutoAdvance();
+          }}
         }}
       }};
       rec.onerror = (event) => {{
@@ -3506,6 +3748,12 @@ Previous transcript:
       setMessage('Checking camera and microphone permissions...');
       const mediaOk = await ensureMediaAccess();
       if (!mediaOk) {{
+        startBtn.disabled = false;
+        return;
+      }}
+      setMessage('Please share your screen so this interview can be recorded.');
+      const recordingOk = await startInterviewRecording();
+      if (!recordingOk) {{
         startBtn.disabled = false;
         return;
       }}
@@ -3574,6 +3822,8 @@ Previous transcript:
       const now = Date.now();
       lastSpeechResultAt = now;
       lastMicActivityAt = now;
+      lastTranscriptChangeAt = now;
+      lastFinalTranscriptAt = 0;
       aiStatus.textContent = 'Listening';
       setMessage('Listening. Please answer now.');
       scheduleAutoAdvance();
@@ -3770,9 +4020,14 @@ Previous transcript:
       speak(currentQuestion || '', () => beginListening());
     }});
     nextBtn.addEventListener('click', submitTurn);
-    endBtn.addEventListener('click', () => {{
+    endBtn.addEventListener('click', async () => {{
       if (recognition && isRecording) recognition.stop();
       stopCameraMonitoring();
+      try {{
+        await stopAndUploadInterviewRecording();
+      }} catch (error) {{
+        setMessage(error.message || 'Interview ended, but recording upload failed.', true);
+      }}
       if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
       setCallStatus('Ended', false);
       setMessage('The interview has been ended in this browser window.');
