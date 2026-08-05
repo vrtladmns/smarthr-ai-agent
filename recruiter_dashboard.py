@@ -9,6 +9,7 @@ import mimetypes
 import random
 import re
 import secrets
+import shutil
 import time
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -65,6 +66,7 @@ WEB_INTERVIEW_SESSIONS: dict[str, dict] = {}
 FINAL_HR_CHECK_SECONDS = 300
 DASHBOARD_SESSION_COOKIE = "recruiter_dashboard_session"
 DASHBOARD_SESSION_SECONDS = 12 * 60 * 60
+RECORDING_UPLOAD_DIR = Path("/tmp/recruiter-interview-recordings")
 
 
 def notify_post_interview_outcome_async(application_id: int, report: dict):
@@ -329,7 +331,7 @@ def interview_api_path(path: str) -> tuple[str, str] | None:
         and parts[0] == "api"
         and parts[1] == "interview"
         and re.fullmatch(r"[A-Za-z0-9_-]{20,200}", parts[2])
-        and parts[3] in {"start", "turn", "complete", "recording"}
+        and parts[3] in {"start", "turn", "complete", "recording", "recording-chunk", "recording-complete"}
     ):
         return parts[2], parts[3]
     return None
@@ -527,11 +529,16 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
                 if action == "recording":
                     self.api_interview_recording(token)
                     return
+                if action == "recording-chunk":
+                    self.api_interview_recording_chunk(token, parsed)
+                    return
                 payload = self.read_json_body()
                 if action == "start":
                     self.api_interview_start(token)
                 elif action == "turn":
                     self.api_interview_turn(token, payload)
+                elif action == "recording-complete":
+                    self.api_interview_recording_complete(token, payload)
                 else:
                     self.api_interview_complete(token, payload)
                 return
@@ -813,6 +820,13 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
         database = self.db()
         try:
             return database.db.application_by_interview_token(token)
+        finally:
+            database.close()
+
+    def application_by_id(self, application_id: int) -> dict | None:
+        database = self.db()
+        try:
+            return database.one("SELECT * FROM recruiter_applications WHERE id = %s", (application_id,))
         finally:
             database.close()
 
@@ -1132,21 +1146,9 @@ Previous transcript:
                 "content_type": content_type,
                 "uploaded_at": datetime.utcnow().isoformat() + "Z",
                 "onedrive_user": ONEDRIVE_RECORDINGS_USER,
+                "upload_mode": "single_request",
             }
-            report = json_object(application.get("interview_report"))
-            report["recording"] = recording_info
-            database = self.db()
-            try:
-                database.db.execute(
-                    """
-                    UPDATE recruiter_applications
-                    SET interview_report = %s::jsonb
-                    WHERE id = %s
-                    """,
-                    (json.dumps(report), application["id"]),
-                )
-            finally:
-                database.close()
+            self.save_recording_info(application["id"], recording_info)
             log_json(
                 logging.INFO,
                 "interview_recording_uploaded",
@@ -1158,6 +1160,137 @@ Previous transcript:
             self.send_json({"ok": True, "recording": recording_info})
         except Exception as exc:
             LOGGER.exception("Interview recording upload failed: %s", exc)
+            self.send_json({"ok": False, "error": str(exc)}, status=500)
+
+    def recording_chunk_dir(self, application_id: int, token: str) -> Path:
+        safe_token = re.sub(r"[^A-Za-z0-9_-]+", "_", token)[:80]
+        return RECORDING_UPLOAD_DIR / f"application-{application_id}-{safe_token}"
+
+    def save_recording_info(self, application_id: int, recording_info: dict):
+        database = self.db()
+        try:
+            application = self.application_by_id(application_id)
+            report = json_object(application.get("interview_report") if application else None)
+            report["recording"] = recording_info
+            database.execute(
+                """
+                UPDATE recruiter_applications
+                SET interview_report = %s::jsonb
+                WHERE id = %s
+                """,
+                (json.dumps(report), application_id),
+            )
+        finally:
+            database.close()
+
+    def api_interview_recording_chunk(self, token: str, parsed):
+        application = self.application_for_interview_token(token)
+        if not application:
+            self.send_json({"error": "Interview link not found."}, status=404)
+            return
+        if not ONEDRIVE_RECORDINGS_ENABLED:
+            self.send_json({"ok": False, "error": "OneDrive recording upload is disabled."}, status=400)
+            return
+        try:
+            query = parse_qs(parsed.query)
+            index_text = (query.get("index") or [self.headers.get("X-Recording-Chunk-Index", "")])[0]
+            chunk_index = int(index_text)
+            if chunk_index < 0:
+                raise ValueError("Invalid recording chunk index.")
+            chunk_bytes = self.read_raw_body(max_bytes=10_000_000)
+            if not chunk_bytes:
+                self.send_json({"ok": False, "error": "Recording chunk was empty."}, status=400)
+                return
+            chunk_dir = self.recording_chunk_dir(application["id"], token)
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+            (chunk_dir / f"chunk-{chunk_index:06d}.part").write_bytes(chunk_bytes)
+            meta = {
+                "application_id": application["id"],
+                "content_type": self.headers.get("Content-Type", "video/webm") or "video/webm",
+                "updated_at": datetime.utcnow().isoformat() + "Z",
+            }
+            (chunk_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+            log_json(
+                logging.INFO,
+                "interview_recording_chunk_saved",
+                application_id=application["id"],
+                chunk_index=chunk_index,
+                size=len(chunk_bytes),
+            )
+            self.send_json({"ok": True, "chunk_index": chunk_index})
+        except Exception as exc:
+            LOGGER.exception("Interview recording chunk save failed: %s", exc)
+            self.send_json({"ok": False, "error": str(exc)}, status=500)
+
+    def api_interview_recording_complete(self, token: str, payload: dict):
+        application = self.application_for_interview_token(token)
+        if not application:
+            self.send_json({"error": "Interview link not found."}, status=404)
+            return
+        if not ONEDRIVE_RECORDINGS_ENABLED:
+            self.send_json({"ok": False, "error": "OneDrive recording upload is disabled."}, status=400)
+            return
+        chunk_dir = self.recording_chunk_dir(application["id"], token)
+        try:
+            chunk_files = sorted(chunk_dir.glob("chunk-*.part"))
+            if not chunk_files:
+                self.send_json({"ok": False, "error": "No recording chunks were received."}, status=400)
+                return
+            meta = {}
+            meta_path = chunk_dir / "meta.json"
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            content_type = payload.get("content_type") or meta.get("content_type") or "video/webm"
+            extension = ".mp4" if "mp4" in str(content_type).lower() else ".webm"
+            timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+            candidate_label = safe_onedrive_path_part(application.get("full_name") or application.get("candidate_email") or "candidate")
+            filename = f"application-{application['id']}-{candidate_label}-{timestamp}{extension}"
+            assembled_path = chunk_dir / filename
+            with assembled_path.open("wb") as output:
+                for chunk_file in chunk_files:
+                    output.write(chunk_file.read_bytes())
+            recording_bytes = assembled_path.read_bytes()
+            log_json(
+                logging.INFO,
+                "interview_recording_upload_started",
+                application_id=application["id"],
+                filename=filename,
+                size=len(recording_bytes),
+                chunk_count=len(chunk_files),
+            )
+            folder = f"{ONEDRIVE_RECORDINGS_FOLDER}/Application {application['id']}"
+            uploaded = MicrosoftGraphProvider(ONEDRIVE_RECORDINGS_USER).upload_onedrive_file(
+                recording_bytes,
+                filename,
+                folder=folder,
+                content_type=content_type,
+                user_email=ONEDRIVE_RECORDINGS_USER,
+            )
+            recording_info = {
+                "filename": uploaded.get("name") or filename,
+                "onedrive_id": uploaded.get("id"),
+                "web_url": uploaded.get("webUrl"),
+                "size": uploaded.get("size") or len(recording_bytes),
+                "content_type": content_type,
+                "uploaded_at": datetime.utcnow().isoformat() + "Z",
+                "onedrive_user": ONEDRIVE_RECORDINGS_USER,
+                "upload_mode": "chunked",
+                "chunk_count": len(chunk_files),
+            }
+            self.save_recording_info(application["id"], recording_info)
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+            log_json(
+                logging.INFO,
+                "interview_recording_uploaded",
+                application_id=application["id"],
+                filename=recording_info["filename"],
+                size=recording_info["size"],
+                web_url=recording_info["web_url"],
+                upload_mode="chunked",
+            )
+            self.send_json({"ok": True, "recording": recording_info})
+        except Exception as exc:
+            LOGGER.exception("Interview recording completion failed: %s", exc)
             self.send_json({"ok": False, "error": str(exc)}, status=500)
 
     def api_interview_turn(self, token: str, payload: dict):
@@ -3136,8 +3269,11 @@ Previous transcript:
     let screenStream = null;
     let recordingStream = null;
     let interviewRecorder = null;
-    let interviewRecordingChunks = [];
     let recordingUploadStarted = false;
+    let recordingChunkIndex = 0;
+    let recordingChunkUploads = [];
+    let recordingChunkFailures = [];
+    let recordingMimeType = '';
     let finalTranscript = '';
     let isRecording = false;
     let autoAdvanceTimer = null;
@@ -3522,6 +3658,31 @@ Previous transcript:
       return '';
     }}
 
+    function uploadRecordingChunk(blob) {{
+      if (!blob || !blob.size) return;
+      const chunkIndex = recordingChunkIndex++;
+      const upload = fetch(`/api/interview/${{token}}/recording-chunk?index=${{chunkIndex}}`, {{
+        method: 'POST',
+        headers: {{'Content-Type': recordingMimeType || blob.type || 'video/webm'}},
+        body: blob
+      }}).then(async response => {{
+        let data = {{}};
+        try {{
+          data = await response.clone().json();
+        }} catch (error) {{
+          data = {{error: await response.text().catch(() => response.statusText)}};
+        }}
+        if (!response.ok || !data.ok) {{
+          throw new Error(data.error || `Could not save recording chunk ${{chunkIndex}}.`);
+        }}
+        return data;
+      }}).catch(error => {{
+        recordingChunkFailures.push(error.message || `Recording chunk ${{chunkIndex}} failed.`);
+        return {{ok: false, error: error.message || `Recording chunk ${{chunkIndex}} failed.`}};
+      }});
+      recordingChunkUploads.push(upload);
+    }}
+
     async function startInterviewRecording() {{
       if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {{
         setMessage('Screen recording is required for this interview. Please open this link in Chrome on a laptop or desktop.', true);
@@ -3542,9 +3703,12 @@ Previous transcript:
         ...mediaStream.getAudioTracks()
       ];
       recordingStream = new MediaStream(tracks);
-      interviewRecordingChunks = [];
+      recordingChunkIndex = 0;
+      recordingChunkUploads = [];
+      recordingChunkFailures = [];
       try {{
         const mimeType = preferredRecordingMimeType();
+        recordingMimeType = mimeType || 'video/webm';
         interviewRecorder = mimeType
           ? new MediaRecorder(recordingStream, {{mimeType, videoBitsPerSecond: 900000, audioBitsPerSecond: 64000}})
           : new MediaRecorder(recordingStream);
@@ -3553,10 +3717,12 @@ Previous transcript:
         return false;
       }}
       interviewRecorder.ondataavailable = event => {{
-        if (event.data && event.data.size > 0) interviewRecordingChunks.push(event.data);
+        if (event.data && event.data.size > 0) {{
+          uploadRecordingChunk(event.data);
+        }}
       }};
       interviewRecorder.onerror = () => setMessage('Screen recording had an issue. Please keep the interview tab open.', true);
-      interviewRecorder.start(1000);
+      interviewRecorder.start(2000);
       setMessage('Screen recording started. Please keep sharing until the interview is complete.');
       return true;
     }}
@@ -3580,14 +3746,17 @@ Previous transcript:
       await stopped;
       if (screenStream) screenStream.getTracks().forEach(track => track.stop());
       if (recordingStream) recordingStream.getTracks().forEach(track => track.stop());
-      const mimeType = interviewRecorder.mimeType || 'video/webm';
-      const blob = new Blob(interviewRecordingChunks, {{type: mimeType}});
-      if (!blob.size) return;
+      const uploadResults = await Promise.allSettled(recordingChunkUploads);
+      const failedUploads = uploadResults.filter(result => result.status === 'rejected');
+      if (failedUploads.length || recordingChunkFailures.length) {{
+        throw new Error(recordingChunkFailures[0] || 'Could not save all recording chunks.');
+      }}
+      if (!recordingChunkIndex) return;
       setMessage('Saving interview recording to OneDrive...');
-      const response = await fetch(`/api/interview/${{token}}/recording`, {{
+      const response = await fetch(`/api/interview/${{token}}/recording-complete`, {{
         method: 'POST',
-        headers: {{'Content-Type': mimeType}},
-        body: blob
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{content_type: recordingMimeType || interviewRecorder.mimeType || 'video/webm'}})
       }});
       const data = await response.json();
       if (!response.ok || !data.ok) {{
