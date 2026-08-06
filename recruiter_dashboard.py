@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import csv
 import hashlib
 import hmac
@@ -19,6 +20,8 @@ from pathlib import Path
 from threading import Thread
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
+import edge_tts
+
 from config import (
     CV_STORAGE_DIR,
     DB_PROVIDER,
@@ -34,6 +37,7 @@ from config import (
     ONEDRIVE_RECORDINGS_ENABLED,
     ONEDRIVE_RECORDINGS_FOLDER,
     ONEDRIVE_RECORDINGS_USER,
+    TTS_VOICE,
 )
 from llm_factory import make_chat_model
 from recruiter_agent import (
@@ -67,6 +71,7 @@ FINAL_HR_CHECK_SECONDS = 300
 DASHBOARD_SESSION_COOKIE = "recruiter_dashboard_session"
 DASHBOARD_SESSION_SECONDS = 12 * 60 * 60
 RECORDING_UPLOAD_DIR = Path("/tmp/recruiter-interview-recordings")
+DASHBOARD_TTS_CACHE_DIR = Path("/tmp/recruiter-dashboard-tts")
 
 
 def notify_post_interview_outcome_async(application_id: int, report: dict):
@@ -331,7 +336,7 @@ def interview_api_path(path: str) -> tuple[str, str] | None:
         and parts[0] == "api"
         and parts[1] == "interview"
         and re.fullmatch(r"[A-Za-z0-9_-]{20,200}", parts[2])
-        and parts[3] in {"start", "turn", "complete", "recording", "recording-chunk", "recording-complete"}
+        and parts[3] in {"start", "turn", "complete", "recording", "recording-chunk", "recording-complete", "speech"}
     ):
         return parts[2], parts[3]
     return None
@@ -539,6 +544,8 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
                     self.api_interview_turn(token, payload)
                 elif action == "recording-complete":
                     self.api_interview_recording_complete(token, payload)
+                elif action == "speech":
+                    self.api_interview_speech(token, payload)
                 else:
                     self.api_interview_complete(token, payload)
                 return
@@ -815,6 +822,16 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def send_binary(self, payload: bytes, content_type: str, filename: str | None = None):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "private, max-age=3600")
+        if filename:
+            self.send_header("Content-Disposition", f'inline; filename="{safe_download_name(filename, "speech.mp3")}"')
+        self.end_headers()
+        self.wfile.write(payload)
 
     def application_for_interview_token(self, token: str) -> dict | None:
         database = self.db()
@@ -1291,6 +1308,54 @@ Previous transcript:
             self.send_json({"ok": True, "recording": recording_info})
         except Exception as exc:
             LOGGER.exception("Interview recording completion failed: %s", exc)
+            self.send_json({"ok": False, "error": str(exc)}, status=500)
+
+    async def make_interview_speech_file(self, text: str, speech_path: Path):
+        communicate = edge_tts.Communicate(text, TTS_VOICE)
+        await communicate.save(str(speech_path))
+
+    def dashboard_speech_path(self, text: str) -> Path:
+        key = hashlib.sha256(f"{TTS_VOICE}:{text}".encode("utf-8")).hexdigest()
+        return DASHBOARD_TTS_CACHE_DIR / f"{key}.mp3"
+
+    def ensure_dashboard_speech_file(self, text: str) -> Path:
+        text = text.strip()
+        if not text:
+            raise RuntimeError("Speech text is empty.")
+        DASHBOARD_TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        speech_path = self.dashboard_speech_path(text)
+        if speech_path.exists() and speech_path.stat().st_size > 256:
+            return speech_path
+        tmp_path = speech_path.with_suffix(f".{secrets.token_hex(8)}.tmp.mp3")
+        try:
+            asyncio.run(self.make_interview_speech_file(text, tmp_path))
+            if not tmp_path.exists() or tmp_path.stat().st_size <= 256:
+                raise RuntimeError("Generated speech file was empty.")
+            tmp_path.replace(speech_path)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+        return speech_path
+
+    def api_interview_speech(self, token: str, payload: dict):
+        application = self.application_for_interview_token(token)
+        if not application:
+            self.send_json({"error": "Interview link not found."}, status=404)
+            return
+        try:
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                self.send_json({"ok": False, "error": "Speech text is required."}, status=400)
+                return
+            if len(text) > 1200:
+                self.send_json({"ok": False, "error": "Speech text is too long."}, status=400)
+                return
+            speech_path = self.ensure_dashboard_speech_file(text)
+            self.send_binary(speech_path.read_bytes(), "audio/mpeg", filename=speech_path.name)
+        except Exception as exc:
+            LOGGER.exception("Interview speech generation failed: %s", exc)
             self.send_json({"ok": False, "error": str(exc)}, status=500)
 
     def api_interview_turn(self, token: str, payload: dict):
@@ -3268,6 +3333,10 @@ Previous transcript:
     let mediaStream = null;
     let screenStream = null;
     let recordingStream = null;
+    let recordingAudioContext = null;
+    let recordingAudioDestination = null;
+    let aiAudioElement = null;
+    let aiAudioSource = null;
     let interviewRecorder = null;
     let recordingUploadStarted = false;
     let recordingChunkIndex = 0;
@@ -3399,8 +3468,38 @@ Previous transcript:
       window.speechSynthesis.onvoiceschanged = refreshInterviewVoice;
     }}
 
-    function speak(text, onend) {{
-      const speechId = ++activeSpeechId;
+    async function fetchSpeechAudioUrl(text) {{
+      const response = await fetch(`/api/interview/${{token}}/speech`, {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{text}})
+      }});
+      if (!response.ok) {{
+        let errorText = response.statusText;
+        try {{
+          const data = await response.json();
+          errorText = data.error || errorText;
+        }} catch (error) {{}}
+        throw new Error(errorText || 'Could not generate speech audio.');
+      }}
+      const blob = await response.blob();
+      return URL.createObjectURL(blob);
+    }}
+
+    function ensureAiAudioElement() {{
+      aiAudioElement = aiAudioElement || new Audio();
+      aiAudioElement.preload = 'auto';
+      aiAudioElement.crossOrigin = 'anonymous';
+      if (recordingAudioContext && recordingAudioDestination && !aiAudioSource) {{
+        aiAudioSource = recordingAudioContext.createMediaElementSource(aiAudioElement);
+        aiAudioSource.connect(recordingAudioDestination);
+        aiAudioSource.connect(recordingAudioContext.destination);
+      }}
+      return aiAudioElement;
+    }}
+
+    function speakWithBrowserVoice(text, onend) {{
+      const speechId = activeSpeechId;
       window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(text);
       if (!preferredInterviewVoice) refreshInterviewVoice();
@@ -3421,8 +3520,59 @@ Previous transcript:
       window.speechSynthesis.speak(utterance);
     }}
 
+    function cancelCurrentSpeech() {{
+      ++activeSpeechId;
+      window.speechSynthesis.cancel();
+      if (aiAudioElement) {{
+        try {{
+          aiAudioElement.pause();
+          aiAudioElement.currentTime = 0;
+        }} catch (error) {{}}
+      }}
+    }}
+
+    function speak(text, onend) {{
+      const speechId = ++activeSpeechId;
+      window.speechSynthesis.cancel();
+      aiStatus.textContent = 'Speaking';
+      if (aiAudioElement) {{
+        try {{
+          aiAudioElement.pause();
+          aiAudioElement.currentTime = 0;
+        }} catch (error) {{}}
+      }}
+      fetchSpeechAudioUrl(text).then(audioUrl => {{
+        if (speechId !== activeSpeechId) {{
+          URL.revokeObjectURL(audioUrl);
+          return;
+        }}
+        const audio = ensureAiAudioElement();
+        audio.onended = () => {{
+          URL.revokeObjectURL(audioUrl);
+          if (speechId !== activeSpeechId) return;
+          aiStatus.textContent = 'Ready';
+          if (onend) onend();
+        }};
+        audio.onerror = () => {{
+          URL.revokeObjectURL(audioUrl);
+          if (speechId !== activeSpeechId) return;
+          speakWithBrowserVoice(text, onend);
+        }};
+        audio.src = audioUrl;
+        audio.play().catch(() => {{
+          URL.revokeObjectURL(audioUrl);
+          if (speechId !== activeSpeechId) return;
+          speakWithBrowserVoice(text, onend);
+        }});
+      }}).catch(() => {{
+        if (speechId !== activeSpeechId) return;
+        speakWithBrowserVoice(text, onend);
+      }});
+    }}
+
     function afterCurrentSpeech(callback) {{
-      if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {{
+      const audioSpeaking = aiAudioElement && !aiAudioElement.paused && !aiAudioElement.ended;
+      if (audioSpeaking || window.speechSynthesis.speaking || window.speechSynthesis.pending) {{
         window.setTimeout(() => afterCurrentSpeech(callback), 120);
         return;
       }}
@@ -3690,17 +3840,43 @@ Previous transcript:
       }}
       try {{
         screenStream = await navigator.mediaDevices.getDisplayMedia({{
-          video: true,
-          audio: true
+          video: {{
+            displaySurface: 'browser'
+          }},
+          audio: false,
+          preferCurrentTab: true,
+          selfBrowserSurface: 'include',
+          systemAudio: 'exclude',
+          surfaceSwitching: 'exclude'
         }});
       }} catch (error) {{
-        setMessage('Screen recording is required. Please click Start again and share your screen when Chrome asks.', true);
+        setMessage('Recording is required. Please click Start again and select this Chrome tab.', true);
         return false;
       }}
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContext) {{
+        screenStream.getTracks().forEach(track => track.stop());
+        screenStream = null;
+        setMessage('Audio mixing is not supported in this browser. Please use Google Chrome.', true);
+        return false;
+      }}
+      try {{
+        recordingAudioContext = new AudioContext();
+        recordingAudioDestination = recordingAudioContext.createMediaStreamDestination();
+        const micAudioSource = recordingAudioContext.createMediaStreamSource(new MediaStream(mediaStream.getAudioTracks()));
+        const micGain = recordingAudioContext.createGain();
+        micGain.gain.value = 1.0;
+        micAudioSource.connect(micGain).connect(recordingAudioDestination);
+      }} catch (error) {{
+        screenStream.getTracks().forEach(track => track.stop());
+        screenStream = null;
+        setMessage('Could not prepare mixed interview audio. Please refresh and try again in Chrome.', true);
+        return false;
+      }}
+      const mixedAudioTracks = recordingAudioDestination.stream.getAudioTracks();
       const tracks = [
         ...screenStream.getVideoTracks(),
-        ...screenStream.getAudioTracks(),
-        ...mediaStream.getAudioTracks()
+        ...mixedAudioTracks
       ];
       recordingStream = new MediaStream(tracks);
       recordingChunkIndex = 0;
@@ -3723,7 +3899,7 @@ Previous transcript:
       }};
       interviewRecorder.onerror = () => setMessage('Screen recording had an issue. Please keep the interview tab open.', true);
       interviewRecorder.start(2000);
-      setMessage('Screen recording started. Please keep sharing until the interview is complete.');
+      setMessage('Recording started with AI voice and microphone. Please keep sharing until the interview is complete.');
       return true;
     }}
 
@@ -3746,6 +3922,14 @@ Previous transcript:
       await stopped;
       if (screenStream) screenStream.getTracks().forEach(track => track.stop());
       if (recordingStream) recordingStream.getTracks().forEach(track => track.stop());
+      if (recordingAudioContext) {{
+        try {{
+          await recordingAudioContext.close();
+        }} catch (error) {{}}
+      }}
+      recordingAudioContext = null;
+      recordingAudioDestination = null;
+      aiAudioSource = null;
       const uploadResults = await Promise.allSettled(recordingChunkUploads);
       const failedUploads = uploadResults.filter(result => result.status === 'rejected');
       if (failedUploads.length || recordingChunkFailures.length) {{
@@ -3812,11 +3996,16 @@ Previous transcript:
         setMessage('This browser does not support camera/microphone access. Please use Chrome.', true);
         return false;
       }}
+      const audioConstraints = {{
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }};
       try {{
-        mediaStream = await navigator.mediaDevices.getUserMedia({{audio: true, video: true}});
+        mediaStream = await navigator.mediaDevices.getUserMedia({{audio: audioConstraints, video: true}});
       }} catch (firstError) {{
         try {{
-          mediaStream = await navigator.mediaDevices.getUserMedia({{audio: true, video: false}});
+          mediaStream = await navigator.mediaDevices.getUserMedia({{audio: audioConstraints, video: false}});
           setDeviceStatus('cam', false, 'Camera blocked');
           permissionOverlay.textContent = 'Camera is blocked, but microphone is connected.';
         }} catch (secondError) {{
@@ -3920,7 +4109,7 @@ Previous transcript:
         startBtn.disabled = false;
         return;
       }}
-      setMessage('Please share your screen so this interview can be recorded.');
+      setMessage('Please select this Chrome tab so the interview video can be recorded.');
       const recordingOk = await startInterviewRecording();
       if (!recordingOk) {{
         startBtn.disabled = false;
@@ -4132,7 +4321,7 @@ Previous transcript:
       if (action === 'complete') {{
         interviewClosed = true;
         ++flowVersion;
-        window.speechSynthesis.cancel();
+        cancelCurrentSpeech();
         questionEl.textContent = 'Interview completed';
         answerEl.classList.add('hidden');
         setCallStatus('Completed', false);
