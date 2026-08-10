@@ -541,6 +541,8 @@ CREATE TABLE IF NOT EXISTS recruiter_applications (
     interview_link_created_at TIMESTAMPTZ,
     interview_started_at TIMESTAMPTZ,
     interview_completed_at TIMESTAMPTZ,
+    interview_reminder_sent_at TIMESTAMPTZ,
+    interview_reminder_count INTEGER NOT NULL DEFAULT 0,
     interview_report JSONB NOT NULL DEFAULT '{}'::jsonb,
     received_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -579,6 +581,8 @@ ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_link_token
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_link_created_at TIMESTAMPTZ;
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_started_at TIMESTAMPTZ;
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_completed_at TIMESTAMPTZ;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_reminder_sent_at TIMESTAMPTZ;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_reminder_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_report JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS recruiter_email_events (
@@ -683,6 +687,8 @@ CREATE TABLE recruiter_applications (
     interview_link_created_at DATETIMEOFFSET NULL,
     interview_started_at DATETIMEOFFSET NULL,
     interview_completed_at DATETIMEOFFSET NULL,
+    interview_reminder_sent_at DATETIMEOFFSET NULL,
+    interview_reminder_count INT NOT NULL DEFAULT 0,
     interview_report NVARCHAR(MAX) NOT NULL DEFAULT '{}',
     received_at DATETIMEOFFSET NULL,
     created_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET()
@@ -765,6 +771,12 @@ ALTER TABLE recruiter_applications ADD interview_started_at DATETIMEOFFSET NULL;
 
 IF COL_LENGTH('recruiter_applications', 'interview_completed_at') IS NULL
 ALTER TABLE recruiter_applications ADD interview_completed_at DATETIMEOFFSET NULL;
+
+IF COL_LENGTH('recruiter_applications', 'interview_reminder_sent_at') IS NULL
+ALTER TABLE recruiter_applications ADD interview_reminder_sent_at DATETIMEOFFSET NULL;
+
+IF COL_LENGTH('recruiter_applications', 'interview_reminder_count') IS NULL
+ALTER TABLE recruiter_applications ADD interview_reminder_count INT NOT NULL DEFAULT 0;
 
 IF COL_LENGTH('recruiter_applications', 'interview_report') IS NULL
 ALTER TABLE recruiter_applications ADD interview_report NVARCHAR(MAX) NOT NULL DEFAULT '{}';
@@ -1493,6 +1505,23 @@ def is_status_followup(latest_body: str) -> bool:
         r"\bnext steps\b",
         r"\binterview\b",
         r"\bwhen can i expect\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def is_interview_delay_reply(latest_body: str) -> bool:
+    text = normalize_position_text(latest_body)
+    if not text:
+        return False
+    patterns = [
+        r"\b(i am|i'm|im)\s+(busy|occupied|tied up)\b",
+        r"\bnot\s+(available|free)\s+(today|right now|currently|at the moment)\b",
+        r"\b(i will|i'll|will)\s+(do|complete|finish|take|attempt)\s+(it|the interview)\s+(later|soon|tomorrow|in a few days|after a few days|next week)\b",
+        r"\b(i will|i'll|will)\s+(do|complete|finish|take|attempt)\s+(later|soon|tomorrow|next week)\b",
+        r"\b(in|after)\s+(a\s+)?few\s+days\b",
+        r"\bneed\s+(some|a little|more)?\s*time\b",
+        r"\bcan\s+i\s+(do|complete|take)\s+it\s+later\b",
+        r"\bwill\s+complete\s+(soon|later|tomorrow|next week)\b",
     ]
     return any(re.search(pattern, text) for pattern in patterns)
 
@@ -2375,6 +2404,8 @@ class RecruiterDatabase:
                 interview_link_created_at = NOW(),
                 interview_started_at = NULL,
                 interview_completed_at = NULL,
+                interview_reminder_sent_at = NULL,
+                interview_reminder_count = 0,
                 interview_report = '{}'::jsonb,
                 application_status = %s
             WHERE id = %s
@@ -2417,6 +2448,63 @@ class RecruiterDatabase:
             WHERE id = %s
             """,
             ("interview_started", application_id),
+        )
+
+    def pending_interview_reminders(
+        self,
+        link_cutoff: datetime,
+        reminder_cutoff: datetime,
+        max_reminders: int = 1,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        return self.rows(
+            """
+            SELECT
+                ra.*,
+                rc.full_name,
+                rr.position_title AS requirement_position
+            FROM recruiter_applications ra
+            JOIN recruiter_candidates rc ON rc.id = ra.candidate_id
+            LEFT JOIN recruitment_requirements rr ON rr.id = ra.requirement_id
+            WHERE ra.interview_link_token IS NOT NULL
+              AND ra.interview_link_created_at IS NOT NULL
+              AND ra.interview_link_created_at <= %s
+              AND ra.interview_completed_at IS NULL
+              AND COALESCE(ra.interview_reminder_count, 0) < %s
+              AND (
+                    ra.interview_reminder_sent_at IS NULL
+                    OR ra.interview_reminder_sent_at <= %s
+                  )
+              AND LOWER(COALESCE(ra.application_status, '')) IN ('interview_link_sent', 'interview_started')
+            ORDER BY ra.interview_link_created_at ASC
+            LIMIT %s
+            """,
+            (link_cutoff, max_reminders, reminder_cutoff, limit),
+        )
+
+    def mark_interview_reminder_sent(self, application_id: int):
+        self.execute(
+            """
+            UPDATE recruiter_applications
+            SET interview_reminder_sent_at = NOW(),
+                interview_reminder_count = COALESCE(interview_reminder_count, 0) + 1
+            WHERE id = %s
+            """,
+            (application_id,),
+        )
+
+    def mark_interview_reminder_handled(self, application_id: int):
+        self.execute(
+            """
+            UPDATE recruiter_applications
+            SET interview_reminder_sent_at = NOW(),
+                interview_reminder_count = CASE
+                    WHEN COALESCE(interview_reminder_count, 0) < 1 THEN 1
+                    ELSE interview_reminder_count
+                END
+            WHERE id = %s
+            """,
+            (application_id,),
         )
 
     def update_application_screening(
@@ -4377,6 +4465,42 @@ class AIRecruiterAgent:
         if application:
             position = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
             position_text = f" for {position}" if position else ""
+            status = (application.get("application_status") or "").lower()
+            if status in {"interview_link_sent", "interview_started"} and not application.get("interview_completed_at"):
+                token = application.get("interview_link_token")
+                link = candidate_interview_url(token) if token else None
+                fallback_lines = [
+                    "Thanks for following up.",
+                    f"Your AI interview{position_text} is still pending in our records.",
+                ]
+                if link:
+                    fallback_lines.append(f"You can complete it here: {link}")
+                fallback_lines.extend(
+                    [
+                        "Please use Google Chrome on a laptop or desktop, with a working microphone and a quiet place.",
+                        "Once you complete it, I will review your interview and get back to you with the next update.",
+                    ]
+                )
+                fallback_body = recruiter_email_body(*fallback_lines)
+                body = self.ai.draft_reply(
+                    inbox_email,
+                    "candidate is asking for an update while their AI interview is pending; share the existing interview link and do not create a new link",
+                    {
+                        "application_found": True,
+                        "position": position,
+                        "status": application.get("application_status"),
+                        "interview_pending": True,
+                        "interview_link": link,
+                        "reminder_policy": "only one automatic reminder is sent after 24 hours if the interview remains incomplete",
+                    },
+                    fallback_body,
+                )
+                self.mailer.send_reply(
+                    inbox_email,
+                    f"AI interview pending: {inbox_email.subject}",
+                    body,
+                )
+                return
             fallback_body = recruiter_email_body(
                 "Thanks for following up.",
                 f"We have your application{position_text} in our records. It is still under review, and our team will contact you if your profile is shortlisted.",
@@ -4408,6 +4532,37 @@ class AIRecruiterAgent:
                 f"Application status: {inbox_email.subject}",
                 body,
             )
+
+    def reply_interview_delay_acknowledged(self, inbox_email: InboxEmail, application: dict[str, Any]):
+        position = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
+        position_text = f" for the {position} role" if position else ""
+        token = application.get("interview_link_token")
+        link = candidate_interview_url(token) if token else None
+        lines = [
+            "No problem, thank you for letting me know.",
+            f"You can complete the AI interview{position_text} whenever you are available over the next few days.",
+        ]
+        if link:
+            lines.append(f"The same link will remain active: {link}")
+        lines.append("Once you complete it, I will review it and get back to you with the next update.")
+        fallback_body = recruiter_email_body(*lines)
+        body = self.ai.draft_reply(
+            inbox_email,
+            "candidate says they are busy and will complete the pending AI interview later; acknowledge politely, keep the same link active, and do not pressure them",
+            {
+                "application_id": application.get("id"),
+                "position": position,
+                "interview_pending": True,
+                "interview_link": link,
+                "automatic_reminder_suppressed": True,
+            },
+            fallback_body,
+        )
+        self.mailer.send_reply(
+            inbox_email,
+            f"AI interview link: {inbox_email.subject}",
+            body,
+        )
 
     def reply_withdrawal_confirmed(self, inbox_email: InboxEmail, application: dict[str, Any] | None):
         position = None
@@ -4629,6 +4784,35 @@ class AIRecruiterAgent:
                 },
             )
             self.reply_withdrawal_confirmed(inbox_email, withdrawn_application)
+            return True
+
+        if (
+            active_application
+            and not inbox_email.attachments
+            and (active_application.get("application_status") or "").lower() in {"interview_link_sent", "interview_started"}
+            and not active_application.get("interview_completed_at")
+            and is_interview_delay_reply(inbox_email.body)
+        ):
+            self.db.mark_interview_reminder_handled(active_application["id"])
+            self.db.log_email_event(
+                inbox_email,
+                "interview_delay_acknowledged",
+                {
+                    **classification,
+                    "application_id": active_application["id"],
+                    "automatic_reminder_suppressed": True,
+                },
+            )
+            trace_recruiter_event(
+                "interview_delay_acknowledged",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={
+                    "application_id": active_application["id"],
+                    "automatic_reminder_suppressed": True,
+                    "next_action": "reply_with_same_interview_link",
+                },
+            )
+            self.reply_interview_delay_acknowledged(inbox_email, active_application)
             return True
 
         if active_application and not inbox_email.attachments:
@@ -5746,6 +5930,70 @@ def send_interview_link_for_application(application_id: int):
         )
         mailer.send_direct_email(recipient, "Interview link", body)
         print(f"Interview link sent for application {application_id}: {link}")
+    finally:
+        db.close()
+
+
+def send_pending_interview_reminders(
+    hours_after_link: int = 24,
+    reminder_gap_hours: int = 24,
+    max_reminders: int = 1,
+    limit: int = 100,
+) -> int:
+    db = RecruiterDatabase()
+    mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
+    sent_count = 0
+    try:
+        db.init_schema()
+        now = recruiter_now()
+        link_cutoff = now - timedelta(hours=hours_after_link)
+        reminder_cutoff = now - timedelta(hours=reminder_gap_hours)
+        applications = db.pending_interview_reminders(
+            link_cutoff=link_cutoff,
+            reminder_cutoff=reminder_cutoff,
+            max_reminders=max_reminders,
+            limit=limit,
+        )
+        for application in applications:
+            recipient = application_candidate_recipient(application)
+            if not recipient:
+                log_json(
+                    logging.WARNING,
+                    "interview_reminder_skipped_missing_recipient",
+                    application_id=application.get("id"),
+                )
+                continue
+            link = candidate_interview_url(application["interview_link_token"])
+            role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
+            body = recruiter_email_body(
+                "I hope you are doing well.",
+                f"This is a gentle reminder to complete your AI interview{f' for the {role} role' if role else ''}.",
+                f"You can open the interview here: {link}",
+                "Please use Google Chrome on a laptop or desktop, with a working microphone and a quiet place.",
+                "Once you complete it, I will review your interview and get back to you with the next update.",
+            )
+            try:
+                mailer.send_direct_email(recipient, "Reminder: please complete your interview", body)
+                db.mark_interview_reminder_sent(application["id"])
+                sent_count += 1
+                log_json(
+                    logging.INFO,
+                    "interview_reminder_sent",
+                    application_id=application.get("id"),
+                    recipient=recipient,
+                    reminder_count=(application.get("interview_reminder_count") or 0) + 1,
+                    link_created_at=application.get("interview_link_created_at"),
+                )
+            except Exception as exc:
+                LOGGER.exception("Could not send interview reminder for application %s: %s", application.get("id"), exc)
+                log_json(
+                    logging.ERROR,
+                    "interview_reminder_failed",
+                    application_id=application.get("id"),
+                    recipient=recipient,
+                    error=str(exc),
+                )
+        return sent_count
     finally:
         db.close()
 
@@ -6892,6 +7140,11 @@ def main():
     parser.add_argument("--create-interview-link", type=int, help="Create/print the browser AI interview link without sending email")
     parser.add_argument("--reset-interview-link", action="store_true", help="With --create-interview-link, clear previous interview completion and create a fresh token")
     parser.add_argument("--send-interview-link", type=int, help="Send the browser AI interview link for an application id")
+    parser.add_argument("--send-interview-reminders", action="store_true", help="Send reminder emails for AI interview links older than 24 hours")
+    parser.add_argument("--interview-reminder-hours", type=int, default=24, help="Hours after interview link creation before reminder is sent")
+    parser.add_argument("--interview-reminder-gap-hours", type=int, default=24, help="Minimum hours between interview reminder emails")
+    parser.add_argument("--interview-reminder-max", type=int, default=1, help="Maximum reminders per application")
+    parser.add_argument("--interview-reminder-limit", type=int, default=100, help="Maximum reminder emails to send in one job run")
     parser.add_argument("--send-teams-link", type=int, help="Create/send Teams interview link for an application id")
     parser.add_argument("--teams-interview-info", type=int, help="Show Teams meeting metadata for a scheduled application")
     parser.add_argument("--mark-due-hr-rounds", action="store_true", help="Mark completed final HR rounds pending HR decision and notify HR")
@@ -6946,6 +7199,16 @@ def main():
 
     if args.send_interview_link:
         send_interview_link_for_application(args.send_interview_link)
+        return
+
+    if args.send_interview_reminders:
+        sent = send_pending_interview_reminders(
+            hours_after_link=args.interview_reminder_hours,
+            reminder_gap_hours=args.interview_reminder_gap_hours,
+            max_reminders=args.interview_reminder_max,
+            limit=args.interview_reminder_limit,
+        )
+        print(f"Sent {sent} interview reminder email(s).")
         return
 
     if args.send_teams_link:

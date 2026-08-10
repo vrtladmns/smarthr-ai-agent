@@ -480,6 +480,18 @@ Add:
 0 2 * * * cd /home/ubuntu/company-policy-agent && ./venv/bin/python recruiter_agent.py --reset-graph-subscription >> graph-subscription-renew.log 2>&1
 ```
 
+Send AI interview reminders 3 times daily:
+
+```bash
+./venv/bin/python recruiter_agent.py --send-interview-reminders
+```
+
+This sends only one reminder per application, and only when an interview link is older than 24 hours and the interview is not completed. Add this cron entry to run the check at 09:00, 15:00, and 21:00 server time:
+
+```cron
+0 9,15,21 * * * cd /home/ubuntu/company-policy-agent && ./venv/bin/python recruiter_agent.py --send-interview-reminders >> interview-reminders.log 2>&1
+```
+
 Deploy future code changes:
 
 ```bash
