@@ -155,6 +155,8 @@ def parse_decimal(value: str | None):
 
 
 def parse_int(value: str | None):
+    if isinstance(value, int):
+        return value
     value = (value or "").strip()
     return int(value) if value else None
 
@@ -191,6 +193,58 @@ def date_text(value) -> str:
     if isinstance(value, datetime):
         return value.strftime("%d %b %Y, %H:%M")
     return str(value)
+
+
+def parsed_datetime(value) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def requirement_due_info(row: dict) -> dict:
+    days = parse_int(row.get("needed_within_days"))
+    created_at = parsed_datetime(row.get("created_at"))
+    if days is None or created_at is None:
+        return {"has_due": False, "due_at": None, "days_left": None, "days_overdue": None, "is_overdue": False}
+    if created_at.tzinfo:
+        created_at = created_at.astimezone(recruiter_tz())
+    due_at = created_at + timedelta(days=days)
+    today = datetime.now(recruiter_tz()).date()
+    days_left = (due_at.date() - today).days
+    status = str(row.get("status") or "").lower()
+    is_overdue = status == "open" and days_left < 0
+    return {
+        "has_due": True,
+        "due_at": due_at,
+        "days_left": days_left,
+        "days_overdue": abs(days_left) if is_overdue else 0,
+        "is_overdue": is_overdue,
+    }
+
+
+def requirement_due_badge(row: dict) -> str:
+    info = requirement_due_info(row)
+    if not info["has_due"]:
+        return '<span class="muted">No due date</span>'
+    due_text = info["due_at"].strftime("%d %b %Y")
+    if info["is_overdue"]:
+        days = info["days_overdue"]
+        label = f"Overdue by {days} day{'s' if days != 1 else ''}"
+        return f'<span class="due-badge due-overdue">{html_escape(label)}<small>Due {html_escape(due_text)}</small></span>'
+    if info["days_left"] == 0:
+        return f'<span class="due-badge due-today">Due today<small>{html_escape(due_text)}</small></span>'
+    if info["days_left"] > 0:
+        days = info["days_left"]
+        return f'<span class="due-badge due-ok">{html_escape(days)} day{"s" if days != 1 else ""} left<small>Due {html_escape(due_text)}</small></span>'
+    return f'<span class="due-badge"><small>Due {html_escape(due_text)}</small></span>'
 
 
 def parse_date_filter(value: str | None) -> datetime | None:
@@ -611,10 +665,10 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
                 self.redirect(f"/requirements/{requirement_id}")
             elif parsed.path == "/requirements/status":
                 self.update_requirement_status(form)
-                self.redirect("/requirements")
+                self.redirect(self.form_redirect_path(form, "/requirements"))
             elif parsed.path == "/requirements/delete":
                 self.delete_requirement(form)
-                self.redirect("/requirements")
+                self.redirect(self.form_redirect_path(form, "/requirements"))
             elif parsed.path == "/candidates/update":
                 candidate_id = parse_int(form.get("id"))
                 if candidate_id is None:
@@ -623,10 +677,10 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
                 self.redirect(f"/candidates/{candidate_id}")
             elif parsed.path == "/candidates/delete":
                 self.delete_candidate(form)
-                self.redirect("/candidates")
+                self.redirect(self.form_redirect_path(form, "/candidates"))
             elif parsed.path == "/applications/status":
                 self.update_application_status(form)
-                self.redirect("/applications")
+                self.redirect(self.form_redirect_path(form, "/applications"))
             elif parsed.path == "/applications/update":
                 application_id = parse_int(form.get("id"))
                 if application_id is None:
@@ -635,7 +689,7 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
                 self.redirect(f"/applications/{application_id}")
             elif parsed.path == "/applications/delete":
                 self.delete_application(form)
-                self.redirect("/applications")
+                self.redirect(self.form_redirect_path(form, "/applications"))
             elif parsed.path == "/events/update":
                 event_id = parse_int(form.get("id"))
                 if event_id is None:
@@ -644,7 +698,7 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
                 self.redirect(f"/events/{event_id}")
             elif parsed.path == "/events/delete":
                 self.delete_event(form)
-                self.redirect("/events")
+                self.redirect(self.form_redirect_path(form, "/events"))
             elif parsed.path == "/applications/hr-approve":
                 application_id = parse_int(form.get("id"))
                 if application_id is None:
@@ -1969,11 +2023,19 @@ Previous transcript:
             )
             urgent = database.rows(
                 """
-                SELECT id, position_title, needed_within_days, status, urgently_required
+                SELECT id, position_title, needed_within_days, status, urgently_required, created_at
                 FROM recruitment_requirements
                 WHERE LOWER(status) = 'open'
                 ORDER BY urgently_required DESC, needed_within_days NULLS LAST, created_at DESC
                 LIMIT 6
+                """
+            )
+            due_requirements = database.rows(
+                """
+                SELECT id, needed_within_days, status, created_at
+                FROM recruitment_requirements
+                WHERE LOWER(status) = 'open'
+                  AND needed_within_days IS NOT NULL
                 """
             )
             notifications = self.pending_operator_notifications(database)
@@ -1983,8 +2045,10 @@ Previous transcript:
         finally:
             database.close()
 
+        overdue_count = sum(1 for row in due_requirements if requirement_due_info(row)["is_overdue"])
         cards = [
             ("Open Roles", summary["open_roles"], "Roles accepting CVs", "/requirements"),
+            ("Overdue Roles", overdue_count, "Requirement due date missed", "/requirements?overdue=1"),
             ("Candidates", summary["candidates"], "Profiles saved", "/candidates"),
             ("Applications", summary["applications"], "CVs processed", "/applications"),
             ("Matched", summary["matched"], "Linked to requirements", "/applications?matched=1"),
@@ -2009,10 +2073,11 @@ Previous transcript:
                 <td>{status_badge(row["status"])}</td>
                 <td>{'Yes' if row["urgently_required"] else 'No'}</td>
                 <td>{html_escape(row["needed_within_days"] or '-')}</td>
+                <td>{requirement_due_badge(row)}</td>
             </tr>
             """
             for row in urgent
-        ) or '<tr><td colspan="4" class="empty">No open requirements yet.</td></tr>'
+        ) or '<tr><td colspan="5" class="empty">No open requirements yet.</td></tr>'
 
         recent_html = "".join(
             f"""
@@ -2046,7 +2111,7 @@ Previous transcript:
                     <a class="link-button" href="/requirements">Manage</a>
                 </div>
                 <table>
-                    <thead><tr><th>Position</th><th>Status</th><th>Urgent</th><th>Days</th></tr></thead>
+                    <thead><tr><th>Position</th><th>Status</th><th>Urgent</th><th>Days</th><th>Due</th></tr></thead>
                     <tbody>{urgent_html}</tbody>
                 </table>
             </div>
@@ -2122,6 +2187,15 @@ Previous transcript:
         """
 
     def pending_operator_notifications(self, database: DashboardDB) -> list[dict]:
+        due_requirements = database.rows(
+            """
+            SELECT id, needed_within_days, status, created_at
+            FROM recruitment_requirements
+            WHERE LOWER(status) = 'open'
+              AND needed_within_days IS NOT NULL
+            """
+        )
+        overdue_requirement_count = sum(1 for row in due_requirements if requirement_due_info(row)["is_overdue"])
         tasks = [
             {
                 "status": "hr_escalated",
@@ -2173,6 +2247,16 @@ Previous transcript:
             },
         ]
         notifications = []
+        if overdue_requirement_count:
+            notifications.append(
+                {
+                    "title": "Requirement due date missed",
+                    "detail": "One or more open requirements have passed their needed-by date.",
+                    "action": "Review roles",
+                    "count": overdue_requirement_count,
+                    "href": "/requirements?overdue=1",
+                }
+            )
         for task in tasks:
             row = database.one(
                 """
@@ -2206,7 +2290,17 @@ Previous transcript:
                 )
                 """
             )
-            return int(row["count"] or 0) if row else 0
+            application_count = int(row["count"] or 0) if row else 0
+            due_requirements = database.rows(
+                """
+                SELECT id, needed_within_days, status, created_at
+                FROM recruitment_requirements
+                WHERE LOWER(status) = 'open'
+                  AND needed_within_days IS NOT NULL
+                """
+            )
+            overdue_count = sum(1 for item in due_requirements if requirement_due_info(item)["is_overdue"])
+            return application_count + overdue_count
         except Exception:
             return 0
         finally:
@@ -2247,6 +2341,7 @@ Previous transcript:
 
     def render_requirements(self, query: dict[str, list[str]]) -> str:
         q = (query.get("q", [""])[0] or "").strip()
+        overdue_only = (query.get("overdue", [""])[0] or "").strip().lower() in {"1", "true", "yes"}
         params: tuple = ()
         where = ""
         if q:
@@ -2269,6 +2364,9 @@ Previous transcript:
         finally:
             database.close()
 
+        if overdue_only:
+            rows = [row for row in rows if requirement_due_info(row)["is_overdue"]]
+
         table_rows = "".join(
             f"""
             <tr>
@@ -2277,6 +2375,8 @@ Previous transcript:
                 <td>{money(row["budget_min"], row["currency"])} - {money(row["budget_max"], row["currency"])}</td>
                 <td>{'Yes' if row["urgently_required"] else 'No'}</td>
                 <td>{html_escape(row["needed_within_days"] or "-")}</td>
+                <td>{date_text(row["created_at"])}</td>
+                <td>{requirement_due_badge(row)}</td>
                 <td>{status_badge(row["status"])}</td>
                 <td class="description">{html_escape(row["job_description"])}</td>
                 <td>
@@ -2284,6 +2384,7 @@ Previous transcript:
                     <a class="link-button" href="/requirements/{html_escape(row["id"])}">View</a>
                     <form method="post" action="/requirements/status" class="inline-form">
                         <input type="hidden" name="id" value="{html_escape(row["id"])}">
+                        <input type="hidden" name="next" value="{html_escape(self.path)}">
                         <input type="hidden" name="status" value="{'closed' if row["status"] == 'open' else 'open'}">
                         <button type="submit">{'Close' if row["status"] == 'open' else 'Open'}</button>
                     </form>
@@ -2293,10 +2394,30 @@ Previous transcript:
             </tr>
             """
             for row in rows
-        ) or '<tr><td colspan="8" class="empty">No requirements found.</td></tr>'
+        ) or '<tr><td colspan="10" class="empty">No requirements found.</td></tr>'
+
+        overdue_checked = "checked" if overdue_only else ""
+        filter_bar = f"""
+        <form method="get" action="/requirements" class="filter-bar">
+            <input type="hidden" name="q" value="{html_escape(q)}">
+            <label class="checkbox-label">
+                <input type="checkbox" name="overdue" value="1" {overdue_checked}>
+                Overdue only
+            </label>
+            <button type="submit">Apply Filter</button>
+            <a href="/requirements">Clear</a>
+        </form>
+        """
+        filter_label = (
+            '<p class="filter-note">Filtered by overdue requirements <a href="/requirements">Clear</a></p>'
+            if overdue_only
+            else ""
+        )
 
         return f"""
         {self.search_form("/requirements", q, "Search roles or job descriptions")}
+        {filter_bar}
+        {filter_label}
         <section class="panel">
             <div class="panel-head"><h2>Add Requirement</h2></div>
             <form method="post" action="/requirements" class="requirement-form">
@@ -2317,7 +2438,7 @@ Previous transcript:
         <section class="panel">
             <div class="panel-head"><h2>Requirements</h2><span>{len(rows)} shown</span></div>
             <table>
-                <thead><tr><th>Position</th><th>Experience</th><th>Budget</th><th>Urgent</th><th>Days</th><th>Status</th><th>Job Description</th><th>Action</th></tr></thead>
+                <thead><tr><th>Position</th><th>Experience</th><th>Budget</th><th>Urgent</th><th>Days</th><th>Created</th><th>Due</th><th>Status</th><th>Job Description</th><th>Action</th></tr></thead>
                 <tbody>{table_rows}</tbody>
             </table>
         </section>
@@ -2390,6 +2511,7 @@ Previous transcript:
     def application_filter_state(self, query: dict[str, list[str]]) -> dict:
         q = (query.get("q", [""])[0] or "").strip()
         status_filter = (query.get("status", [""])[0] or "").strip()
+        role_filter = parse_int((query.get("role", [""])[0] or "").strip())
         matched_filter = (query.get("matched", [""])[0] or "").strip().lower() in {"1", "true", "yes"}
         created_from_text = (query.get("created_from", [""])[0] or "").strip()
         created_to_text = (query.get("created_to", [""])[0] or "").strip()
@@ -2398,6 +2520,7 @@ Previous transcript:
         return {
             "q": q,
             "status": status_filter,
+            "role": role_filter,
             "matched": matched_filter,
             "created_from_text": created_from_text if created_from else "",
             "created_to_text": created_to_text if created_to else "",
@@ -2427,6 +2550,9 @@ Previous transcript:
         if state["status"]:
             conditions.append("ra.application_status = %s")
             params_list.append(state["status"])
+        if state["role"]:
+            conditions.append("ra.requirement_id = %s")
+            params_list.append(state["role"])
         if state["matched"]:
             conditions.append("ra.requirement_id IS NOT NULL")
         if state["created_from"]:
@@ -2461,6 +2587,34 @@ Previous transcript:
             database.close()
         return rows, state
 
+    def requirement_filter_options(self, selected: int | None) -> str:
+        database = self.db()
+        try:
+            rows = database.rows(
+                """
+                SELECT id, position_title, status
+                FROM recruitment_requirements
+                ORDER BY
+                    CASE WHEN status = 'open' THEN 0 ELSE 1 END,
+                    position_title
+                """
+            )
+        finally:
+            database.close()
+        options = ['<option value="">All roles</option>']
+        options.extend(
+            (
+                f'<option value="{html_escape(row["id"])}" {"selected" if row["id"] == selected else ""}>'
+                f'{html_escape(row["position_title"] or row["id"])}'
+                f'{" (" + html_escape(row["status"]) + ")" if row["status"] and row["status"] != "open" else ""}'
+                "</option>"
+            )
+            for row in rows
+        )
+        if selected and not any(row["id"] == selected for row in rows):
+            options.append(f'<option value="{html_escape(selected)}" selected>Role #{html_escape(selected)}</option>')
+        return "".join(options)
+
     def application_filter_url(self, state: dict, path: str = "/applications", status: str | None = None) -> str:
         params = {}
         if state["q"]:
@@ -2468,6 +2622,8 @@ Previous transcript:
         selected_status = status if status is not None else state["status"]
         if selected_status:
             params["status"] = selected_status
+        if state["role"]:
+            params["role"] = str(state["role"])
         if state["matched"]:
             params["matched"] = "1"
         if state["created_from_text"]:
@@ -2480,6 +2636,7 @@ Previous transcript:
         rows, state = self.fetch_application_rows(query)
         q = state["q"]
         status_filter = state["status"]
+        role_filter = state["role"]
         matched_filter = state["matched"]
 
         def filtered_applications_url(status: str | None = None) -> str:
@@ -2504,6 +2661,7 @@ Previous transcript:
                     <a class="link-button" href="/applications/{html_escape(row["id"])}/cv">Download CV</a>
                     <form method="post" action="/applications/status" class="inline-form">
                         <input type="hidden" name="id" value="{html_escape(row["id"])}">
+                        <input type="hidden" name="next" value="{html_escape(self.path)}">
                         <select name="application_status">
                             {self.status_options(row["application_status"])}
                         </select>
@@ -2520,6 +2678,16 @@ Previous transcript:
         filter_parts = []
         if status_filter:
             filter_parts.append(f"status: {status_badge(status_filter)}")
+        if role_filter:
+            role_label = next(
+                (
+                    row["requirement_position"]
+                    for row in rows
+                    if row.get("requirement_id") == role_filter and row.get("requirement_position")
+                ),
+                f"role #{role_filter}",
+            )
+            filter_parts.append(f"role: {html_escape(role_label)}")
         if matched_filter:
             filter_parts.append("matched to requirement")
         if state["created_from_text"] or state["created_to_text"]:
@@ -2532,6 +2700,7 @@ Previous transcript:
             else ""
         )
         status_filter_options = self.status_filter_options(status_filter)
+        role_filter_options = self.requirement_filter_options(role_filter)
         matched_checked = "checked" if matched_filter else ""
         export_url = self.application_filter_url(state, path="/applications/export")
         filter_bar = f"""
@@ -2540,6 +2709,11 @@ Previous transcript:
             <label>Status
                 <select name="status">
                     {status_filter_options}
+                </select>
+            </label>
+            <label>Role
+                <select name="role">
+                    {role_filter_options}
                 </select>
             </label>
             <label class="checkbox-label">
@@ -2725,6 +2899,7 @@ Previous transcript:
             ("Currency", row["currency"]),
             ("Urgently Required", "Yes" if row["urgently_required"] else "No"),
             ("Needed Within Days", row["needed_within_days"]),
+            ("Due Status", requirement_due_badge(row), "html"),
             ("Created", date_text(row["created_at"])),
             ("Updated", date_text(row["updated_at"])),
             ("Job Description", row["job_description"], "pre-wide"),
@@ -2757,7 +2932,7 @@ Previous transcript:
                 <h2>{html_escape(row["position_title"])}</h2>
                 <div class="action-stack">
                     {status_badge(row["status"])}
-                    {self.delete_form("/requirements/delete", requirement_id, "Delete Requirement", "Delete this requirement? Linked applications will stay, but will be detached from this role.")}
+                    {self.delete_form("/requirements/delete", requirement_id, "Delete Requirement", "Delete this requirement? Linked applications will stay, but will be detached from this role.", "/requirements")}
                 </div>
             </div>
             {self.detail_grid(fields)}
@@ -2867,7 +3042,7 @@ Previous transcript:
                     {status_badge(row["submission_type"])}
                     <a class="link-button" href="/candidates/{html_escape(candidate_id)}/cv/view" target="_blank" rel="noopener">View CV</a>
                     <a class="link-button" href="/candidates/{html_escape(candidate_id)}/cv">Download CV</a>
-                    {self.delete_form("/candidates/delete", candidate_id, "Delete Candidate", "Delete this candidate and all linked applications?")}
+                    {self.delete_form("/candidates/delete", candidate_id, "Delete Candidate", "Delete this candidate and all linked applications?", "/candidates")}
                 </div>
             </div>
             {self.detail_grid(fields)}
@@ -3078,7 +3253,7 @@ Previous transcript:
                     {status_badge(row["application_status"])}
                     <a class="link-button" href="/applications/{html_escape(application_id)}/cv/view" target="_blank" rel="noopener">View CV</a>
                     <a class="link-button" href="/applications/{html_escape(application_id)}/cv">Download CV</a>
-                    {self.delete_form("/applications/delete", application_id, "Delete Application", "Delete this application?")}
+                    {self.delete_form("/applications/delete", application_id, "Delete Application", "Delete this application?", "/applications")}
                     {hr_approve_form}
                     {post_interview_review_forms}
                     {jd_rejection_form}
@@ -4498,7 +4673,7 @@ Previous transcript:
                 <h2>Email Event #{html_escape(event_id)}</h2>
                 <div class="action-stack">
                     {status_badge(row["event_type"])}
-                    {self.delete_form("/events/delete", event_id, "Delete Event", "Delete this email event log?")}
+                    {self.delete_form("/events/delete", event_id, "Delete Event", "Delete this email event log?", "/events")}
                 </div>
             </div>
             {self.detail_grid(fields)}
@@ -4509,23 +4684,28 @@ Previous transcript:
     def status_options(self, selected: str | None) -> str:
         return "".join(
             f'<option value="{html_escape(option)}" {"selected" if option == selected else ""}>{html_escape(option.replace("_", " "))}</option>'
-            for option in self.application_status_values()
+            for option in self.application_status_values(selected)
         )
 
     def status_filter_options(self, selected: str | None) -> str:
         options = ['<option value="">All statuses</option>']
         options.extend(
             f'<option value="{html_escape(option)}" {"selected" if option == selected else ""}>{html_escape(option.replace("_", " "))}</option>'
-            for option in self.application_status_values()
+            for option in self.application_status_values(selected)
         )
         return "".join(options)
 
-    def application_status_values(self) -> list[str]:
-        return [
+    def application_status_values(self, selected: str | None = None) -> list[str]:
+        statuses = [
             "matched_requirement",
+            "screening_under_review",
             "screening_questions_sent",
             "screening_negotiation",
             "hr_escalated",
+            "hr_approved",
+            "interview_link_pending",
+            "interview_link_sent",
+            "interview_started",
             "interview_time_requested",
             "interview_availability_received",
             "interview_scheduled",
@@ -4533,18 +4713,26 @@ Previous transcript:
             "hr_round_time_requested",
             "interview_on_hold_hr_review",
             "interview_rejected",
-            "rejected_jd_score",
-            "manual_hr_review",
+            "final_hr_round_pending",
             "final_hr_round_completed_pending_decision",
             "selected_documents_requested",
             "rejected_after_hr_round",
             "hold_after_hr_round",
+            "rejected_jd_score",
+            "missing_cv",
+            "followup_missing_cv",
+            "unsupported_attachment",
             "no_open_requirement",
+            "manual_hr_review",
             "reviewed",
             "shortlisted",
             "rejected",
             "withdrawn",
         ]
+        selected = (selected or "").strip()
+        if selected and selected not in statuses:
+            statuses.append(selected)
+        return statuses
 
     def detail_grid(self, fields: list[tuple]) -> str:
         rendered = []
@@ -4596,10 +4784,12 @@ Previous transcript:
     def back_link(self, href: str, label: str) -> str:
         return f'<div class="back-row"><a class="link-button" href="{html_escape(href)}">{html_escape(label)}</a></div>'
 
-    def delete_form(self, action: str, record_id, label: str, message: str) -> str:
+    def delete_form(self, action: str, record_id, label: str, message: str, next_path: str | None = None) -> str:
+        redirect_path = next_path or self.path
         return f"""
         <form method="post" action="{html_escape(action)}" class="inline-form" onsubmit="return confirm('{html_escape(message)}');">
             <input type="hidden" name="id" value="{html_escape(record_id)}">
+            <input type="hidden" name="next" value="{html_escape(redirect_path)}">
             <button type="submit" class="danger">{html_escape(label)}</button>
         </form>
         """
@@ -4723,6 +4913,15 @@ Previous transcript:
         self.send_response(303)
         self.send_header("Location", path)
         self.end_headers()
+
+    def form_redirect_path(self, form: dict, fallback: str) -> str:
+        next_path = (form.get("next") or "").strip()
+        if not next_path:
+            return fallback
+        parsed = urlparse(next_path)
+        if parsed.scheme or parsed.netloc or not next_path.startswith("/"):
+            return fallback
+        return next_path
 
     def send_html(self, content: str, status: int = 200):
         data = content.encode("utf-8")
@@ -5034,6 +5233,36 @@ td.description {
 .badge-no_open_requirement, .badge-review, .badge-reviewed, .badge-manual_hr_review {
     background: #fff3d8;
     color: var(--accent-2);
+}
+.due-badge {
+    display: inline-grid;
+    gap: 2px;
+    min-width: 120px;
+    padding: 6px 9px;
+    border-radius: 8px;
+    background: #eef2f7;
+    color: #334155;
+    font-weight: 700;
+    line-height: 1.2;
+}
+.due-badge small {
+    color: #64748b;
+    font-weight: 600;
+}
+.due-overdue {
+    background: #fde8e6;
+    color: var(--danger);
+}
+.due-overdue small {
+    color: #9f2a22;
+}
+.due-today {
+    background: #fff3d8;
+    color: var(--accent-2);
+}
+.due-ok {
+    background: #dff5ef;
+    color: #0f6b58;
 }
 .search {
     display: flex;
