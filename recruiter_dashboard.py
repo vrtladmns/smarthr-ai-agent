@@ -255,6 +255,37 @@ def json_object(value) -> dict:
     return {}
 
 
+def json_list(value) -> list:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
+def parse_recommended_questions(value: str | None) -> list[str]:
+    questions = []
+    seen = set()
+    for line in (value or "").splitlines():
+        question = " ".join(line.strip().lstrip("-*0123456789. )(").split())
+        if not question:
+            continue
+        key = question.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        questions.append(question)
+    return questions
+
+
+def recommended_questions_text(value) -> str:
+    return "\n".join(str(item) for item in json_list(value) if str(item).strip())
+
+
 def extract_json_object(response: str) -> str:
     match = re.search(r"\{.*\}", response or "", flags=re.S)
     if not match:
@@ -855,12 +886,18 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
             "How do you handle mistakes or bugs in your work?",
             "Why are you interested in this role?",
         ]
+        recommended_questions = [
+            " ".join(str(question).split())
+            for question in json_list(application.get("recommended_questions"))
+            if str(question).strip()
+        ]
         llm = make_chat_model(json_mode=True, max_tokens=max(OLLAMA_NUM_PREDICT, 1200))
         response = llm.invoke(
             f"""
 Return one valid JSON object only.
 Create {RECRUITER_INTERVIEW_QUESTION_COUNT} short interview questions.
 Use the CV and job description.
+Do not repeat the recommended questions. They will be added separately.
 Questions must be conversational, easy-to-medium level, and under 15 spoken words.
 Do not ask trick questions.
 
@@ -873,6 +910,7 @@ Context:
 {json.dumps({
     "role": application.get("requirement_position") or application.get("matched_position") or application.get("detected_position"),
     "job_description": (application.get("job_description") or "")[:5000],
+    "recommended_questions": recommended_questions,
     "cv_summary": application.get("cv_summary") or application.get("ai_short_description"),
     "cv_text": (application.get("raw_cv_text") or "")[:7000],
     "screening_details": application.get("screening_details"),
@@ -884,7 +922,15 @@ Context:
         except Exception:
             questions = []
         questions = [" ".join(str(question).split()) for question in questions if str(question).strip()]
-        return (questions or fallback)[:RECRUITER_INTERVIEW_QUESTION_COUNT]
+        combined = []
+        seen = set()
+        for question in [*(questions or fallback), *recommended_questions]:
+            key = question.lower().rstrip("?")
+            if key in seen:
+                continue
+            seen.add(key)
+            combined.append(question)
+        return combined[: RECRUITER_INTERVIEW_QUESTION_COUNT + len(recommended_questions)]
 
     def web_interview_report(self, application: dict, transcript: list[dict], camera_monitoring: dict | None = None) -> dict:
         normalized_camera_monitoring = normalize_camera_monitoring(camera_monitoring)
@@ -1479,6 +1525,7 @@ Previous transcript:
                 parse_decimal(form.get("budget_max")),
                 form.get("currency", "INR").strip() or "INR",
                 form.get("job_description", "").strip(),
+                json.dumps(parse_recommended_questions(form.get("recommended_questions"))),
                 parse_bool(form.get("urgently_required")),
                 parse_int(form.get("needed_within_days")),
                 form.get("status", "open").strip() or "open",
@@ -1499,6 +1546,7 @@ Previous transcript:
                             budget_max = %s,
                             currency = %s,
                             job_description = %s,
+                            recommended_questions = %s,
                             urgently_required = %s,
                             needed_within_days = %s,
                             status = %s,
@@ -1514,9 +1562,9 @@ Previous transcript:
                     (
                         position_title, experience_min_years, experience_max_years,
                         budget_min, budget_max, currency, job_description,
-                        urgently_required, needed_within_days, status
+                        recommended_questions, urgently_required, needed_within_days, status
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     values,
                 )
@@ -1528,9 +1576,9 @@ Previous transcript:
                 (
                     position_title, experience_min_years, experience_max_years,
                     budget_min, budget_max, currency, job_description,
-                    urgently_required, needed_within_days, status
+                    recommended_questions, urgently_required, needed_within_days, status
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
                 ON CONFLICT ((LOWER(position_title)))
                 DO UPDATE SET
                     experience_min_years = EXCLUDED.experience_min_years,
@@ -1539,6 +1587,7 @@ Previous transcript:
                     budget_max = EXCLUDED.budget_max,
                     currency = EXCLUDED.currency,
                     job_description = EXCLUDED.job_description,
+                    recommended_questions = EXCLUDED.recommended_questions,
                     urgently_required = EXCLUDED.urgently_required,
                     needed_within_days = EXCLUDED.needed_within_days,
                     status = EXCLUDED.status,
@@ -1576,6 +1625,7 @@ Previous transcript:
                     budget_max = %s,
                     currency = %s,
                     job_description = %s,
+                    recommended_questions = %s::jsonb,
                     urgently_required = %s,
                     needed_within_days = %s,
                     status = %s,
@@ -1590,6 +1640,7 @@ Previous transcript:
                     parse_decimal(form.get("budget_max")),
                     form.get("currency", "INR").strip() or "INR",
                     form.get("job_description", "").strip(),
+                    json.dumps(parse_recommended_questions(form.get("recommended_questions"))),
                     parse_bool(form.get("urgently_required")),
                     parse_int(form.get("needed_within_days")),
                     form.get("status", "open").strip() or "open",
@@ -2259,6 +2310,7 @@ Previous transcript:
                 <label>Status<select name="status"><option value="open">Open</option><option value="closed">Closed</option></select></label>
                 <label class="check"><input name="urgently_required" type="checkbox"> Urgent</label>
                 <label class="wide">Job Description<textarea name="job_description" required rows="4"></textarea></label>
+                <label class="wide">Recommended Interview Questions<textarea name="recommended_questions" rows="4" placeholder="One question per line"></textarea></label>
                 <button type="submit">Save Requirement</button>
             </form>
         </section>
@@ -2676,6 +2728,7 @@ Previous transcript:
             ("Created", date_text(row["created_at"])),
             ("Updated", date_text(row["updated_at"])),
             ("Job Description", row["job_description"], "pre-wide"),
+            ("Recommended Questions", recommended_questions_text(row.get("recommended_questions")), "pre-wide"),
         ]
         edit_form = f"""
         <section class="panel">
@@ -2692,6 +2745,7 @@ Previous transcript:
                 <label>Status<select name="status"><option value="open" {"selected" if row["status"] == "open" else ""}>Open</option><option value="closed" {"selected" if row["status"] == "closed" else ""}>Closed</option></select></label>
                 <label class="check"><input name="urgently_required" type="checkbox" {"checked" if row["urgently_required"] else ""}> Urgent</label>
                 <label class="wide">Job Description<textarea name="job_description" required rows="6">{html_escape(row["job_description"] or "")}</textarea></label>
+                <label class="wide">Recommended Interview Questions<textarea name="recommended_questions" rows="5" placeholder="One question per line">{html_escape(recommended_questions_text(row.get("recommended_questions")))}</textarea></label>
                 <button type="submit">Save Changes</button>
             </form>
         </section>

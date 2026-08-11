@@ -464,6 +464,7 @@ CREATE TABLE IF NOT EXISTS recruitment_requirements (
     budget_max NUMERIC(12, 2),
     currency TEXT DEFAULT 'INR',
     job_description TEXT NOT NULL,
+    recommended_questions JSONB NOT NULL DEFAULT '[]'::jsonb,
     urgently_required BOOLEAN DEFAULT FALSE,
     needed_within_days INTEGER,
     status TEXT NOT NULL DEFAULT 'open',
@@ -558,6 +559,7 @@ ON recruitment_requirements (LOWER(position_title));
 ALTER TABLE recruiter_candidates ADD COLUMN IF NOT EXISTS candidate_email TEXT;
 ALTER TABLE recruiter_candidates ADD COLUMN IF NOT EXISTS referrer_email TEXT;
 ALTER TABLE recruiter_candidates ADD COLUMN IF NOT EXISTS submission_type TEXT NOT NULL DEFAULT 'self_application';
+ALTER TABLE recruitment_requirements ADD COLUMN IF NOT EXISTS recommended_questions JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS email_thread_id TEXT;
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS candidate_email TEXT;
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS referrer_email TEXT;
@@ -608,6 +610,7 @@ CREATE TABLE recruitment_requirements (
     budget_max DECIMAL(12, 2) NULL,
     currency NVARCHAR(20) DEFAULT 'INR',
     job_description NVARCHAR(MAX) NOT NULL,
+    recommended_questions NVARCHAR(MAX) NOT NULL DEFAULT '[]',
     urgently_required BIT DEFAULT 0,
     needed_within_days INT NULL,
     status NVARCHAR(80) NOT NULL DEFAULT 'open',
@@ -707,6 +710,9 @@ CREATE TABLE recruiter_email_events (
 
 IF COL_LENGTH('recruitment_requirements', 'position_title') IS NOT NULL
 ALTER TABLE recruitment_requirements ALTER COLUMN position_title NVARCHAR(255) NOT NULL;
+
+IF COL_LENGTH('recruitment_requirements', 'recommended_questions') IS NULL
+ALTER TABLE recruitment_requirements ADD recommended_questions NVARCHAR(MAX) NOT NULL DEFAULT '[]';
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'recruitment_requirements_position_title_idx')
 CREATE UNIQUE INDEX recruitment_requirements_position_title_idx
@@ -2344,7 +2350,8 @@ class RecruiterDatabase:
                 rr.budget_max,
                 rr.currency,
                 rr.needed_within_days,
-                rr.job_description
+                rr.job_description,
+                rr.recommended_questions
             FROM recruiter_applications ra
             JOIN recruiter_candidates rc ON rc.id = ra.candidate_id
             LEFT JOIN recruitment_requirements rr ON rr.id = ra.requirement_id
@@ -2430,7 +2437,8 @@ class RecruiterDatabase:
                 rr.budget_max,
                 rr.currency,
                 rr.needed_within_days,
-                rr.job_description
+                rr.job_description,
+                rr.recommended_questions
             FROM recruiter_applications ra
             JOIN recruiter_candidates rc ON rc.id = ra.candidate_id
             LEFT JOIN recruitment_requirements rr ON rr.id = ra.requirement_id
