@@ -480,6 +480,18 @@ Add:
 0 2 * * * cd /home/ubuntu/company-policy-agent && ./venv/bin/python recruiter_agent.py --reset-graph-subscription >> graph-subscription-renew.log 2>&1
 ```
 
+Send AI interview reminders 3 times daily:
+
+```bash
+./venv/bin/python recruiter_agent.py --send-interview-reminders
+```
+
+This sends only one reminder per application, and only when an interview link is older than 24 hours and the interview is not completed. Add this cron entry to run the check at 09:00, 15:00, and 21:00 server time:
+
+```cron
+0 9,15,21 * * * cd /home/ubuntu/company-policy-agent && ./venv/bin/python recruiter_agent.py --send-interview-reminders >> interview-reminders.log 2>&1
+```
+
 Deploy future code changes:
 
 ```bash
@@ -857,7 +869,7 @@ When a candidate passes screening, the email agent sends:
 https://hr.virtualadmins.org/interview/<token>
 ```
 
-The candidate opens the link in Google Chrome, allows microphone/camera access, shares their screen for recording, hears the questions, answers through browser speech recognition, and submits the interview. The dashboard backend generates the HR report and saves it to `recruiter_applications.interview_report`.
+The candidate opens the link in Google Chrome, allows microphone/camera access, then selects this Chrome tab for recording. The app records the candidate microphone and the AI interviewer audio directly, so **Share tab audio is not required**. The dashboard backend generates the HR report and saves it to `recruiter_applications.interview_report`.
 
 Interview screen recordings are uploaded to OneDrive through Microsoft Graph and the OneDrive link is saved under `interview_report.recording`:
 
