@@ -151,7 +151,35 @@ are on a build older than the 2026-08-13 hotfix; pull again.
 
 ---
 
-## 7. Not covered by this deploy
+## 7. Recovering a stuck message
+
+If processing crashed before the 2026-08-13 hotfix, the inbound message stays
+claimed in `recruiter_processed_messages` and is skipped forever:
+
+```
+INFO email_already_processed_skipped {...}
+```
+
+Release it and re-run:
+
+```bash
+venv/bin/python recruiter_agent.py --list-claimed 20
+venv/bin/python recruiter_agent.py --release-message '<the id from the log uid field>'
+venv/bin/python recruiter_agent.py --run-once
+```
+
+Or release everything claimed that never produced a reply:
+
+```bash
+venv/bin/python recruiter_agent.py --release-failed-messages
+```
+
+That is safe: the reply ledger still prevents anything already sent from being
+sent twice.
+
+---
+
+## 8. Not covered by this deploy
 
 - **Rotate the credentials in `.env`** (Graph client secret, DeepSeek, LangSmith,
   dashboard login). They were exposed during the audit and are unchanged.

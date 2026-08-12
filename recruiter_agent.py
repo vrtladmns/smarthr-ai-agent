@@ -8078,6 +8078,22 @@ def main():
     parser = argparse.ArgumentParser(description="AI recruiter inbox agent")
     parser.add_argument("--init-db", action="store_true", help="Create recruiter database tables and exit")
     parser.add_argument("--run-once", action="store_true", help="Process unread inbox emails once")
+    parser.add_argument(
+        "--list-claimed",
+        nargs="?",
+        const=20,
+        type=int,
+        help="List recently claimed inbound message ids (idempotency ledger)",
+    )
+    parser.add_argument(
+        "--release-message",
+        help="Release a claimed message id so it can be processed again",
+    )
+    parser.add_argument(
+        "--release-failed-messages",
+        action="store_true",
+        help="Release every claimed message that has a processing_failed event and no successful reply",
+    )
     parser.add_argument("--watch", action="store_true", help="Continuously watch inbox for unread emails")
     parser.add_argument("--serve-gmail-webhook", action="store_true", help="Receive Gmail Pub/Sub push triggers")
     parser.add_argument("--register-gmail-watch", action="store_true", help="Register Gmail API watch for INBOX")
@@ -8106,6 +8122,53 @@ def main():
         help="Seconds between inbox checks in watch mode",
     )
     args = parser.parse_args()
+
+    if args.list_claimed:
+        db = RecruiterDatabase()
+        try:
+            rows = db.rows(
+                "SELECT provider_message_id, processed_at FROM recruiter_processed_messages "
+                "ORDER BY processed_at DESC LIMIT %s",
+                (args.list_claimed,),
+            )
+            if not rows:
+                print("No claimed messages.")
+            for row in rows:
+                print(f"{row['processed_at']}  {row['provider_message_id']}")
+        finally:
+            db.close()
+        return
+
+    if args.release_message:
+        db = RecruiterDatabase()
+        try:
+            db.release_provider_message(args.release_message)
+            print(f"Released {args.release_message}. It will be processed on the next pass.")
+        finally:
+            db.close()
+        return
+
+    if args.release_failed_messages:
+        db = RecruiterDatabase()
+        try:
+            rows = db.rows(
+                """
+                SELECT provider_message_id FROM recruiter_processed_messages pm
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM recruiter_sent_replies sr
+                    WHERE sr.provider_message_id = pm.provider_message_id
+                )
+                ORDER BY processed_at DESC
+                """
+            )
+            released = 0
+            for row in rows:
+                db.release_provider_message(row["provider_message_id"])
+                released += 1
+            print(f"Released {released} claimed message(s) with no recorded reply.")
+        finally:
+            db.close()
+        return
 
     if args.init_db:
         db = RecruiterDatabase()
