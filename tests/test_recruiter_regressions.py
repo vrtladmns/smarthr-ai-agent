@@ -235,6 +235,117 @@ def test_normalize_evaluation_coerces_scores():
     assert out["jd_match_score"] == 70.0
 
 
+
+
+# --- near-miss routing (production 2026-08-12: CFO vs US Bookkeeper) ----------
+
+OPEN_REQUIREMENTS = [
+    {"id": 1, "position_title": "Business Development Executive",
+     "job_description": "sales pipeline, lead generation, client acquisition"},
+    {"id": 2, "position_title": "US Bookkeeper",
+     "job_description": "QuickBooks, bank reconciliation, AP/AR, month end close"},
+    {"id": 3, "position_title": "US Tax Preparer",
+     "job_description": "1040 1065 1120 preparation"},
+]
+
+
+def test_accounting_candidate_is_a_near_miss_not_a_rejection():
+    """Tushar Gandhi: Fractional CFO, ATS 87, got a flat 'no openings'."""
+    hits = ra.near_miss_requirements(
+        OPEN_REQUIREMENTS,
+        {"primary_role": "Fractional CFO", "role_family": "accounting", "confidence": 0.95},
+        {"current_title": "Fractional Accountant / CFO", "skills": ["US GAAP", "QuickBooks"]},
+        "10+ years in accounting, month end close, multi-entity consolidation",
+    )
+    assert [r["position_title"] for r in hits] == ["US Bookkeeper"]
+
+
+def test_unrelated_candidate_is_not_a_near_miss():
+    hits = ra.near_miss_requirements(
+        OPEN_REQUIREMENTS,
+        {"primary_role": "UI/UX Designer", "role_family": "design", "confidence": 0.9},
+        {"current_title": "Product Designer", "skills": ["Figma", "wireframes"]},
+        "designed mobile app interfaces and design systems",
+    )
+    assert hits == []
+
+
+def test_near_miss_needs_a_known_family():
+    assert ra.near_miss_requirements(OPEN_REQUIREMENTS, {}, {}, "") == []
+
+
+def test_near_miss_is_empty_without_open_requirements():
+    assert ra.near_miss_requirements([], {"role_family": "accounting"}, {}, "") == []
+
+
+
+
+# --- matching on evidence, not job titles (production 2026-08-12) -------------
+
+MATCH_REQUIREMENTS = [
+    {"id": 1, "position_title": "Business Development Executive",
+     "job_description": "sales pipeline, lead generation, client acquisition"},
+    {"id": 2, "position_title": "US Bookkeeper",
+     "job_description": "Minimum 5 years of US bookkeeping. 5 years on QuickBooks Online. "
+                        "Bank reconciliation, AP/AR, month end close."},
+    {"id": 3, "position_title": "US Tax Preparer",
+     "job_description": "Preparation of 1040, 1065 and 1120 returns for US clients."},
+]
+
+TUSHAR_EXTRACTED = {
+    "target_position": "Fractional CFO",
+    "current_title": "Fractional Accountant / CFO",
+    "skills": ["US GAAP & Audit Readiness", "Multi-Entity Consolidation", "QuickBooks", "NetSuite"],
+}
+TUSHAR_CV = (
+    "Fractional CFO & US Bookkeeping | Strategic Finance. QuickBooks, NetSuite, "
+    "Multi-Entity Accounting. Execute full-cycle bookkeeping, month-end close and "
+    "bank reconciliation for US-based SMBs and CPA firms."
+)
+
+
+def test_bookkeeping_evidence_matches_even_when_the_title_says_cfo():
+    """Tushar Gandhi was told 'no openings' despite a CV headed 'US Bookkeeping'."""
+    match = ra.deterministic_requirement_match(
+        TUSHAR_EXTRACTED, {"detected_position": "US Accounting Manager"},
+        MATCH_REQUIREMENTS, source_text=TUSHAR_CV,
+    )
+    assert match["requirement_id"] == 2, match
+
+
+def test_unrelated_candidates_still_do_not_match():
+    for extracted, cls, cv in [
+        ({"target_position": "UI/UX Designer", "current_title": "Product Designer", "skills": ["Figma"]},
+         {"detected_position": "UI/UX Designer"},
+         "Product designer. Figma, wireframes, prototyping, design systems."),
+        ({"target_position": "Python Developer", "current_title": "Backend Engineer", "skills": ["Django"]},
+         {"detected_position": "Python Developer"},
+         "Python developer. Django, FastAPI, PostgreSQL, REST APIs, Docker."),
+    ]:
+        match = ra.deterministic_requirement_match(extracted, cls, MATCH_REQUIREMENTS, source_text=cv)
+        assert match["requirement_id"] is None, (cls, match)
+
+
+def test_exact_title_match_outranks_evidence_match():
+    match = ra.deterministic_requirement_match(
+        {"target_position": "US Bookkeeper", "current_title": "Bookkeeper", "skills": ["QuickBooks Online"]},
+        {"detected_position": "US Bookkeeper"},
+        MATCH_REQUIREMENTS,
+        source_text="US Bookkeeper with 6 years QuickBooks Online and month end close.",
+    )
+    assert match["requirement_id"] == 2
+    assert match["confidence"] == 1.0
+
+
+def test_partial_title_evidence_is_not_enough():
+    """The CV mentions 'tax' but not 'preparer', so Tax Preparer must not win."""
+    match = ra.deterministic_requirement_match(
+        TUSHAR_EXTRACTED, {"detected_position": "US Accounting Manager"},
+        [MATCH_REQUIREMENTS[2]], source_text=TUSHAR_CV + " Coordinated tax filings with external CPAs.",
+    )
+    assert match["requirement_id"] is None, match
+
+
 if __name__ == "__main__":
     import pytest
 

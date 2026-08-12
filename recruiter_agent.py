@@ -317,6 +317,10 @@ THREAD_CONTEXT_PER_MESSAGE_CHARS = int(os.getenv("RECRUITER_THREAD_CONTEXT_PER_M
 # run past 20 messages, and the newest ones are the ones that matter.
 THREAD_FETCH_LIMIT = int(os.getenv("RECRUITER_THREAD_FETCH_LIMIT", "25"))
 
+# Evidence of doing the work counts slightly less than carrying the job title,
+# so an exact title match still wins when both requirements look plausible.
+EVIDENCE_MATCH_WEIGHT = float(os.getenv("RECRUITER_EVIDENCE_MATCH_WEIGHT", "0.9"))
+
 # Never send the same scenario to the same application twice inside this window.
 # This is the backstop that caps the blast radius of any single logic bug.
 REPLY_SCENARIO_COOLDOWN_HOURS = int(os.getenv("RECRUITER_REPLY_SCENARIO_COOLDOWN_HOURS", "24"))
@@ -1843,6 +1847,18 @@ def deterministic_requirement_match(
     if not candidate_role_words:
         return {"requirement_id": None, "confidence": 0, "reason": "No meaningful candidate role detected"}
 
+    # Everything we know about the candidate, not just their job title. A CV
+    # headed "Fractional CFO & US Bookkeeping" was previously matched on the
+    # title alone, so the word "bookkeeping" - the reason they are a fit - never
+    # reached the comparison.
+    evidence_stems = stem_role_tokens(
+        " ".join(
+            value
+            for value in [candidate_role_text, candidate_skill_text, normalize_position_text(source_text[:6000])]
+            if value
+        )
+    )
+
     best_requirement = None
     best_score = 0.0
     best_reason = "No deterministic position-title match"
@@ -1864,6 +1880,19 @@ def deterministic_requirement_match(
             overlap = candidate_role_words & title_words
             score = len(overlap) / max(len(title_words), 1)
             reason = f"Shared meaningful role tokens: {sorted(overlap)}" if overlap else "No shared meaningful role tokens"
+
+        # Fall back to evidence: does the candidate demonstrably do this work,
+        # whatever they call themselves? Stemmed so "bookkeeper" finds
+        # "bookkeeping". Weighted just under a real title match so an exact
+        # title still wins when both are present.
+        title_stems = {stem_role_token(word) for word in title_words}
+        evidence_hits = title_stems & evidence_stems
+        evidence_score = (len(evidence_hits) / max(len(title_stems), 1)) * EVIDENCE_MATCH_WEIGHT
+        if evidence_score > score:
+            score = evidence_score
+            reason = (
+                f"Requirement terms {sorted(evidence_hits)} evidenced in the candidate's CV/skills"
+            )
 
         if score > best_score:
             best_score = score
@@ -2086,6 +2115,50 @@ STEMMED_ROLE_FAMILIES = {
 def role_families_from_text(value: str | None) -> set[str]:
     tokens = stem_role_tokens(value)
     return {family for family, keywords in STEMMED_ROLE_FAMILIES.items() if tokens & keywords}
+
+
+def near_miss_requirements(
+    requirements: list[dict[str, Any]],
+    cv_role_summary: dict[str, Any] | None,
+    extracted: dict[str, Any] | None = None,
+    cv_text: str = "",
+) -> list[dict[str, Any]]:
+    """Open requirements in the same domain as the candidate, when nothing matched.
+
+    A candidate whose role family lines up with an open role but whose title does
+    not is a near miss, not a rejection. Sending "we have no openings" to a
+    ten-year accounting professional because "accountant" and "bookkeeper" share
+    no tokens is the expensive kind of mistake, so these go to a human instead.
+    """
+    if not requirements:
+        return []
+
+    summary = cv_role_summary or {}
+    candidate_families = set()
+    declared_family = str(summary.get("role_family") or "").strip().lower()
+    if declared_family:
+        candidate_families.add(declared_family)
+    candidate_families |= role_families_from_text(
+        " ".join(
+            str(value)
+            for value in [
+                summary.get("primary_role"),
+                (extracted or {}).get("target_position"),
+                (extracted or {}).get("current_title"),
+                " ".join(str(skill) for skill in ensure_list((extracted or {}).get("skills"))),
+                cv_text[:2000],
+            ]
+            if value
+        )
+    )
+    if not candidate_families:
+        return []
+
+    return [
+        requirement
+        for requirement in requirements
+        if requirement_role_families(requirement) & candidate_families
+    ]
 
 
 def requirement_role_families(requirement: dict[str, Any] | None) -> set[str]:
@@ -4144,7 +4217,12 @@ CV text:
         )
 
     @traceable(name="match_requirement")
-    def match_requirement(self, extracted: dict[str, Any], requirements: list[dict[str, Any]]) -> dict[str, Any]:
+    def match_requirement(
+        self,
+        extracted: dict[str, Any],
+        requirements: list[dict[str, Any]],
+        cv_text: str = "",
+    ) -> dict[str, Any]:
         compact_requirements = [
             {
                 "id": row["id"],
@@ -4155,19 +4233,26 @@ CV text:
                 "budget_max": str(row["budget_max"]),
                 "urgently_required": row["urgently_required"],
                 "needed_within_days": row["needed_within_days"],
-                "job_description": row["job_description"][:1000],
+                "job_description": (row["job_description"] or "")[:2500],
             }
             for row in requirements
         ]
         return self.json_call(
             f"""
 Return only valid JSON.
-Choose the best open requirement for this candidate, or null if none fits the target role.
-Match by the candidate's primary role, work history, domain, responsibilities, and the requirement title/JD.
-Do not match based on incidental shared words. A match must be the same role family and meaningfully fit the JD.
-If the candidate belongs to a different function/domain than all open requirements, return null.
-Prefer the most specific requirement over a broader adjacent role.
-Use confidence >= 0.75 only when the role/domain fit is clear; otherwise return null.
+Choose the best open requirement for this candidate, or null if none fits.
+Match by what the candidate actually DOES - their work history, responsibilities and
+skills - against the requirement's job description. Job titles are a weak signal:
+people describe the same work with different titles and seniorities.
+
+- If the CV evidences the core work in the JD, that is a match even when the
+  titles differ (a CV headed "Fractional CFO & US Bookkeeping" fits a Bookkeeper
+  role, because the bookkeeping work is there).
+- Being more senior than the role is NOT a reason to return null. Match it and
+  let a human weigh seniority.
+- Do not match on incidental shared words alone, and return null when the
+  candidate works in a genuinely different function.
+- Use confidence >= 0.75 when the work described in the CV covers the JD.
 
 JSON schema:
 {{
@@ -4178,6 +4263,9 @@ JSON schema:
 
 Candidate:
 {json.dumps(extracted)}
+
+Candidate CV (primary evidence - weigh this above the job title):
+{(cv_text or "")[:4000]}
 
 Open requirements:
 {json.dumps(compact_requirements)}
@@ -4583,7 +4671,12 @@ class AIRecruiterAgent:
             application=application,
         )
 
-    def reply_no_opening(self, inbox_email: InboxEmail, position: str | None):
+    def reply_no_opening(
+        self,
+        inbox_email: InboxEmail,
+        position: str | None,
+        application: dict[str, Any] | None = None,
+    ):
         role_text = f" for {position}" if position else ""
         fallback_body = recruiter_email_body(
             "Thanks for sharing your profile.",
@@ -4600,6 +4693,35 @@ class AIRecruiterAgent:
             f"Application update: {inbox_email.subject}",
             body,
             scenario="no_opening",
+            application=application,
+        )
+
+    def reply_profile_under_review(self, inbox_email: InboxEmail, application: dict[str, Any] | None):
+        """Sent when the candidate is a near miss and a person is deciding.
+
+        Deliberately not a rejection and not a promise. The alternative was
+        telling a relevant candidate we had nothing for them.
+        """
+        fallback_body = recruiter_email_body(
+            "Thanks for sharing your profile.",
+            "Your background looks relevant to the kind of work we hire for, so I am reviewing "
+            "where it fits best against what we have open right now.",
+            "I will come back to you shortly with an update.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "candidate's background is relevant but does not map cleanly to a current opening; "
+            "tell them warmly that you are reviewing where they fit and will come back shortly; "
+            "do not reject them, do not promise a specific role, and do not ask for anything",
+            {"profile_relevant": True, "under_review": True, "ask_for_nothing": True},
+            fallback_body,
+        )
+        self.send_candidate_reply(
+            inbox_email,
+            f"Your application: {inbox_email.subject}",
+            body,
+            scenario="profile_under_review",
+            application=application,
         )
 
     def reply_india_location_only(self, inbox_email: InboxEmail):
@@ -6300,6 +6422,7 @@ class AIRecruiterAgent:
                 match = self.ai.match_requirement(
                     {**extracted, "cv_role_summary": cv_role_summary},
                     requirements,
+                    cv_text=cv_text,
                 )
                 if score_number(match.get("confidence")) is not None and score_number(match.get("confidence")) < 0.75:
                     match = {
@@ -6610,6 +6733,71 @@ class AIRecruiterAgent:
                 else:
                     self.reply_received(inbox_email, {"id": application_id} if application_id else None)
             else:
+                near_misses = near_miss_requirements(requirements, cv_role_summary, extracted, cv_text)
+                if near_misses:
+                    # Same domain, different title. Auto-rejecting these loses
+                    # genuinely relevant people, so a human decides instead.
+                    near_miss_titles = [row.get("position_title") for row in near_misses]
+                    log_json(
+                        logging.INFO,
+                        "near_miss_requirement_handoff_to_hr",
+                        **inbox_email_summary(inbox_email),
+                        application_id=application_id,
+                        candidate_role=cv_role_summary.get("primary_role"),
+                        candidate_role_family=cv_role_summary.get("role_family"),
+                        near_miss_requirements=near_miss_titles,
+                        ats_score=evaluation.get("ats_score"),
+                    )
+                    trace_recruiter_event(
+                        "near_miss_requirement_handoff_to_hr",
+                        inputs=inbox_email_summary(inbox_email),
+                        outputs={
+                            "application_id": application_id,
+                            "candidate_role": cv_role_summary.get("primary_role"),
+                            "near_miss_requirements": near_miss_titles,
+                            "next_action": "hr_decides",
+                        },
+                    )
+                    self.db.log_email_event(
+                        inbox_email,
+                        "near_miss_requirement_handoff_to_hr",
+                        {
+                            "application_id": application_id,
+                            "candidate_role": cv_role_summary.get("primary_role"),
+                            "candidate_role_family": cv_role_summary.get("role_family"),
+                            "near_miss_requirements": near_miss_titles,
+                            "ats_score": evaluation.get("ats_score"),
+                        },
+                    )
+                    self.notify_hr_rate_limited(
+                        inbox_email,
+                        {"id": application_id} if application_id else None,
+                        f"Possible match needs your call: {inbox_email.sender}",
+                        recruiter_email_body(
+                            "A candidate did not match any open role automatically, but works in the same area.",
+                            f"Candidate: {extracted.get('full_name') or inbox_email.sender}",
+                            f"Their role: {cv_role_summary.get('primary_role') or extracted.get('current_title') or '-'}",
+                            f"They asked about: {classification.get('detected_position') or '-'}",
+                            f"ATS score: {evaluation.get('ats_score')}",
+                            f"Open roles in the same area: {', '.join(str(title) for title in near_miss_titles)}",
+                            f"Application: {dashboard_application_url(application_id)}"
+                            if application_id
+                            else RECRUITER_DASHBOARD_BASE_URL,
+                            "Assign a requirement on the dashboard to continue, or reject to close it.",
+                        ),
+                        "near_miss_notice",
+                    )
+                    if application_id:
+                        self.db.mark_manual_hr_review(
+                            application_id,
+                            f"No exact requirement match; same-domain openings: {', '.join(str(t) for t in near_miss_titles)}",
+                        )
+                    self.reply_profile_under_review(
+                        inbox_email,
+                        {"id": application_id} if application_id else None,
+                    )
+                    continue
+
                 log_json(
                     logging.INFO,
                     "reply_no_opening_with_cv",
@@ -6627,7 +6815,11 @@ class AIRecruiterAgent:
                         "current_title": extracted.get("current_title"),
                     },
                 )
-                self.reply_no_opening(inbox_email, extracted.get("target_position"))
+                self.reply_no_opening(
+                    inbox_email,
+                    extracted.get("target_position"),
+                    {"id": application_id} if application_id else None,
+                )
 
         log_json(
             logging.INFO,
