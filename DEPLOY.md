@@ -38,7 +38,7 @@ cd /home/ubuntu/company-policy-agent
 # find the real unit names first - they may differ from the files in deploy/
 systemctl list-units --type=service | grep -i recruiter
 
-sudo systemctl stop recruiter-agent-aws recruiter-dashboard-aws
+sudo systemctl stop recruiter-agent recruiter-dashboard
 
 git pull
 
@@ -49,8 +49,8 @@ venv/bin/pip install -r requirements-recruiter.txt
 venv/bin/python recruiter_agent.py --init-db
 # expect: "Recruiter tables are ready."
 
-sudo systemctl start recruiter-agent-aws recruiter-dashboard-aws
-sudo systemctl status recruiter-agent-aws recruiter-dashboard-aws --no-pager
+sudo systemctl start recruiter-agent recruiter-dashboard
+sudo systemctl status recruiter-agent recruiter-dashboard --no-pager
 ```
 
 If you deploy the agent via Docker instead of systemd, the Dockerfile changed
@@ -76,14 +76,14 @@ psql "$DATABASE_URL" -c "\d recruiter_applications" | grep -E "budget_disclosed_
 # expect all three columns
 
 # no startup errors
-sudo journalctl -u recruiter-agent-aws -n 50 --no-pager
+sudo journalctl -u recruiter-agent -n 50 --no-pager
 ```
 
 Then send a test email to `career@virtualadmins.org` from an address with no
 history and watch:
 
 ```bash
-sudo journalctl -u recruiter-agent-aws -f
+sudo journalctl -u recruiter-agent -f
 ```
 
 **Expected on this tenant:** a warning line
@@ -128,11 +128,11 @@ that thread has a real problem worth looking at.
 
 ```bash
 cd /home/ubuntu/company-policy-agent
-sudo systemctl stop recruiter-agent-aws recruiter-dashboard-aws
+sudo systemctl stop recruiter-agent recruiter-dashboard
 git log --oneline -5          # find the commit before this release
 git checkout <previous-sha>
 venv/bin/pip install -r requirements-recruiter.txt
-sudo systemctl start recruiter-agent-aws recruiter-dashboard-aws
+sudo systemctl start recruiter-agent recruiter-dashboard
 ```
 
 The new tables and columns are additive and the old code ignores them, so a code
@@ -141,7 +141,17 @@ itself is damaged.
 
 ---
 
-## 6. Not covered by this deploy
+## 6. Known-good log lines vs real errors
+
+`graph_thread_orderby_unsupported_paging_instead` — **expected**, means the fix works.
+
+`email_processing_failed` with a `psycopg` error — **real**, investigate. If you
+see `InFailedSqlTransaction` in the *cleanup* handlers after a first error, you
+are on a build older than the 2026-08-13 hotfix; pull again.
+
+---
+
+## 7. Not covered by this deploy
 
 - **Rotate the credentials in `.env`** (Graph client secret, DeepSeek, LangSmith,
   dashboard login). They were exposed during the audit and are unchanged.

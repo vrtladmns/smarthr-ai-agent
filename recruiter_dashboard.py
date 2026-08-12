@@ -4591,7 +4591,7 @@ Conversation so far:
           // once it is clearly speech rather than an echo, stop the audio and
           // hand the floor back. Without this their words were never captured.
           const spoken = (finalTranscript + interim).trim();
-          bargeInWords = spoken ? spoken.split(/\s+/).length : 0;
+          bargeInWords = spoken ? spoken.split(/\\s+/).length : 0;
           if (bargeInWords >= BARGE_IN_MIN_WORDS) {{
             cancelCurrentSpeech();
             setMessage('Go ahead, I am listening.');
