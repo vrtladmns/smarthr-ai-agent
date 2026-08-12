@@ -50,9 +50,6 @@ TTS_VOICE = os.getenv("TTS_VOICE", "en-US-JennyNeural")
 
 DB_PROVIDER = os.getenv("DB_PROVIDER", "postgres").lower()
 DATABASE_URL = os.getenv("DATABASE_URL", "")
-MSSQL_CONNECTION_STRING = os.getenv("MSSQL_CONNECTION_STRING", os.getenv("DefaultConnection", ""))
-MSSQL_ODBC_DRIVER = os.getenv("MSSQL_ODBC_DRIVER", "")
-MSSQL_LOGIN_TIMEOUT_SECONDS = int(os.getenv("MSSQL_LOGIN_TIMEOUT_SECONDS", "60"))
 
 MAIL_PROVIDER = os.getenv("MAIL_PROVIDER", "gmail_imap")
 

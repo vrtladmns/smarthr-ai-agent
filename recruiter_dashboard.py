@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import mimetypes
+import os
 import random
 import re
 import secrets
@@ -24,7 +25,6 @@ import edge_tts
 
 from config import (
     CV_STORAGE_DIR,
-    DB_PROVIDER,
     OLLAMA_NUM_PREDICT,
     RECRUITER_DASHBOARD_LOGIN_EMAIL,
     RECRUITER_DASHBOARD_LOGIN_PASSWORD,
@@ -67,6 +67,12 @@ from recruiter_agent import (
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8090
 WEB_INTERVIEW_SESSIONS: dict[str, dict] = {}
+# Below this, a recording is a stub rather than an interview and must not be
+# scored as if it were one. Roughly 30 seconds of webm/opus video.
+MIN_INTERVIEW_RECORDING_BYTES = int(os.getenv("RECRUITER_MIN_INTERVIEW_RECORDING_BYTES", "400000"))
+# How many times a candidate may start the same interview link.
+MAX_INTERVIEW_ATTEMPTS = int(os.getenv("RECRUITER_MAX_INTERVIEW_ATTEMPTS", "2"))
+INTERVIEW_ATTEMPTS: dict[str, int] = {}
 FINAL_HR_CHECK_SECONDS = 300
 DASHBOARD_SESSION_COOKIE = "recruiter_dashboard_session"
 DASHBOARD_SESSION_SECONDS = 12 * 60 * 60
@@ -378,6 +384,125 @@ def closing_interview_reply() -> str:
             "Thank you, that completes our interview for today. I appreciate the time you gave and the answers you shared. I will review everything and get back to you with feedback soon.",
         ]
     )
+
+
+# Deliberately request-framed. A bare "repeat" also appears inside perfectly
+# good answers ("I repeat the same reconciliation process each month"), so the
+# pattern requires the candidate to be asking rather than describing.
+INTERVIEW_REPEAT_PATTERNS = (
+    r"\b(can|could|would|will)\s+you\b[^.?!]{0,30}\brepeat\b",
+    r"\bplease\s+repeat\b",
+    r"\brepeat\s+(the|that|your|this)\s+(question|one|part)\b",
+    r"\bcome again\b",
+    r"\bsay (that|it) again\b",
+    r"\b(did|could|can)\s*n(o|')?t\s+(hear|catch|get)\b",
+    r"\bnot able to hear\b",
+    r"\bbreaking up\b",
+    r"\bpardon\b",
+    r"\bwhat was the question\b",
+    r"\b(once more|again)\s*,?\s*please\b",
+)
+
+INTERVIEW_THINKING_PATTERNS = (
+    r"\b(give|allow) me (a|one|1|just a|just one)?\s*(minute|moment|second|sec)\b",
+    r"\bone (minute|moment|second|sec)\b",
+    r"\b(i am|i'?m) thinking\b",
+    r"\blet me think\b",
+    r"\bthinking (about|on) (it|this)\b",
+    r"\bhold on\b",
+    r"\bjust a (minute|moment|second|sec)\b",
+    r"\bi need (a|some) (minute|moment|time)\b",
+    r"\bi will (answer|reply)\b.*\b(minute|moment|second)\b",
+)
+
+
+def normalized_words(value: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", (value or "").lower())
+
+
+def text_similarity(left: str, right: str) -> float:
+    """Fraction of the shorter text's words shared with the longer one."""
+    left_words = set(normalized_words(left))
+    right_words = set(normalized_words(right))
+    if not left_words or not right_words:
+        return 0.0
+    smaller = left_words if len(left_words) <= len(right_words) else right_words
+    return len(left_words & right_words) / len(smaller)
+
+
+def classify_interview_turn(answer_text: str, current_question: str) -> str:
+    """What did the candidate actually just do?
+
+    Returns one of: answer, repeat_request, thinking, question_echo.
+
+    Length is deliberately NOT used. The previous implementation only honoured a
+    repeat request between 10 and 12 words, because the browser refused to submit
+    anything shorter and the server refused anything longer, so a natural request
+    like "could you please repeat the question?" could never be delivered.
+    """
+    text = " ".join((answer_text or "").split())
+    if not text:
+        return "answer"
+    lowered = text.lower()
+
+    asked_to_repeat = any(re.search(pattern, lowered) for pattern in INTERVIEW_REPEAT_PATTERNS)
+    thinking = any(re.search(pattern, lowered) for pattern in INTERVIEW_THINKING_PATTERNS)
+
+    # Strip a leading repeat request so the remainder can be judged on its own.
+    # Candidates commonly say "could you repeat? ... so your question is ..."
+    remainder = text
+    if asked_to_repeat:
+        parts = re.split(r"(?<=[.?!])\s+", text)
+        remainder = " ".join(part for part in parts if not any(
+            re.search(pattern, part.lower()) for pattern in INTERVIEW_REPEAT_PATTERNS
+        )).strip()
+
+    echoes_question = bool(current_question) and text_similarity(remainder or text, current_question) >= 0.7
+
+    if echoes_question and not thinking:
+        # Repeating the question back is never an answer, whether or not they
+        # also explicitly asked for a repeat.
+        return "question_echo" if not asked_to_repeat else "repeat_request"
+    if asked_to_repeat and len(normalized_words(remainder)) < 12:
+        return "repeat_request"
+    if thinking and len(normalized_words(remainder)) < 25:
+        return "thinking"
+    if asked_to_repeat and not remainder:
+        return "repeat_request"
+    return "answer"
+
+
+def interview_role_context(application: dict) -> dict:
+    """Compact, stable context for the interview session.
+
+    Built once at session start. The turn prompt used to carry 5000 chars of job
+    description plus 7000 chars of CV text on every single turn, which is most
+    of the reason each turn took tens of seconds.
+    """
+    return {
+        "role": (
+            application.get("requirement_position")
+            or application.get("matched_position")
+            or application.get("detected_position")
+        ),
+        "candidate_name": application.get("full_name"),
+        "cv_summary": str(application.get("cv_summary") or application.get("ai_short_description") or "")[:1200],
+        "job_description": str(application.get("job_description") or "")[:1200],
+    }
+
+
+def interview_transcript_digest(transcript: list[dict], limit: int = 6) -> list[dict]:
+    """Compact recent history for the turn prompt."""
+    digest = []
+    for entry in (transcript or [])[-limit:]:
+        digest.append(
+            {
+                "question": str(entry.get("question") or "")[:300],
+                "answer": str(entry.get("answer") or "")[:600],
+                "status": entry.get("status"),
+            }
+        )
+    return digest
 
 
 def status_badge(status: str | None) -> str:
@@ -995,6 +1120,19 @@ Return one valid JSON object only.
 You are an HR technical interviewer. Evaluate this browser voice interview fairly.
 Use only the candidate answers, CV, and JD context provided.
 Camera monitoring is a browser-side signal only. Do not over-penalize camera issues unless unusual activity is repeated.
+
+CRITICAL - the answers are machine-transcribed from speech:
+- Technical terms are frequently mangled. Real examples from this system:
+  "post gracious girl" = PostgreSQL, "red is" = Redis, "DJ project" / "the Jungle" = Django,
+  "converter CV into Jason" = JSON, "fetch Tata" = fetch data, "verify from looks" = from logs.
+- Score the SUBSTANCE of what the candidate meant, never the fluency, grammar, or
+  coherence of the transcript itself.
+- Never write that an answer was "disjointed", "unclear", "incoherent" or "lacked
+  articulation" when the underlying technical content is present. That is a
+  transcription artefact and penalising it is unfair to the candidate.
+- If a transcript is too garbled to judge the substance, say so in
+  final_notes_for_hr and set needs_human_review to true rather than scoring it low.
+
 Use these final recommendation bands:
 - overall_score > {RECRUITER_INTERVIEW_PASS_SCORE}: hire or strong_hire
 - {RECRUITER_INTERVIEW_HOLD_MIN_SCORE} <= overall_score <= {RECRUITER_INTERVIEW_PASS_SCORE}: hold
@@ -1018,7 +1156,9 @@ JSON schema:
     "eye_movement_summary": "short summary of camera visibility and activity",
     "unusual_activity": []
   }},
-  "final_notes_for_hr": "string"
+  "final_notes_for_hr": "string",
+  "needs_human_review": false,
+  "transcript_quality": "good/poor"
 }}
 
 Application context:
@@ -1035,6 +1175,9 @@ Application context:
 
 Interview transcript:
 {json.dumps(transcript, default=str)}
+
+Answered questions: {len([entry for entry in transcript if entry.get("status") == "answered"])}
+Questions with no usable answer: {len([entry for entry in transcript if entry.get("status") != "answered"])}
 
 Camera monitoring:
 {json.dumps(normalized_camera_monitoring, default=str)}
@@ -1061,6 +1204,29 @@ Camera monitoring:
         report["question_count"] = len(transcript)
         report["transcript"] = transcript
         report["interview_mode"] = "browser_voice_link"
+
+        # A score is only trustworthy if there was enough usable material to
+        # produce one. Flagging beats quietly emitting a confident low number.
+        answered = [entry for entry in transcript if entry.get("status") == "answered"]
+        review_reasons = []
+        if report.get("needs_human_review") is True:
+            review_reasons.append("the evaluator flagged the transcript as hard to judge")
+        if len(answered) < 2:
+            review_reasons.append(f"only {len(answered)} question(s) were actually answered")
+        if str(report.get("transcript_quality") or "").lower() == "poor":
+            review_reasons.append("speech-to-text quality was poor")
+        total_answer_words = sum(len(str(entry.get("answer") or "").split()) for entry in answered)
+        if answered and total_answer_words < 40:
+            review_reasons.append("the answers captured were too short to assess")
+
+        report["needs_human_review"] = bool(review_reasons)
+        report["human_review_reasons"] = review_reasons
+        if review_reasons:
+            report["recommendation"] = "hold"
+            report["final_notes_for_hr"] = (
+                f"{report.get('final_notes_for_hr') or ''} "
+                f"Automatic score withheld: {'; '.join(review_reasons)}. Please review the recording."
+            ).strip()
         return report
 
     def web_interview_turn_decision(self, application: dict, session: dict, answer: str) -> dict:
@@ -1070,15 +1236,43 @@ Camera monitoring:
         transcript = session["transcript"]
         answer_text = (answer or "").strip()
         lowered = answer_text.lower()
-        word_count = len(re.findall(r"\b\w+\b", lowered))
-        repeat_phrases = ["repeat", "come again", "didn't hear", "did not hear", "say that again", "can you repeat"]
-        skip_phrases = ["skip", "next question", "move on", "go next", "ask next", "leave this", "i don't know", "no idea"]
+        skip_phrases = ["skip this", "skip the question", "next question please", "move on", "go next", "ask next", "leave this", "i don't know", "i do not know", "no idea"]
         if not answer_text:
             return {
                 "action": "clarify",
                 "reply": "I could not hear that clearly. Could you answer once more?",
                 "question": current_question,
             }
+
+        intent = classify_interview_turn(answer_text, current_question)
+
+        if intent == "repeat_request":
+            return {
+                "action": "repeat",
+                "reply": f"Of course. {current_question}",
+                "question": current_question,
+            }
+
+        if intent == "thinking":
+            # The candidate asked for a moment. Acknowledge and keep listening on
+            # the same question rather than treating the pause as their answer.
+            return {
+                "action": "wait",
+                "reply": random.choice(
+                    ["Take your time.", "No rush, take a moment.", "Sure, take your time."]
+                ),
+                "question": current_question,
+            }
+
+        if intent == "question_echo":
+            # They repeated the question back, usually to confirm they heard it.
+            # This is not an answer and must never be scored as one.
+            return {
+                "action": "wait",
+                "reply": "That's right. Go ahead whenever you're ready.",
+                "question": current_question,
+            }
+
         if any(phrase in lowered for phrase in skip_phrases):
             acknowledgement = random.choice(["No problem.", "That's okay.", "Alright."])
             if current_index + 1 >= max_questions:
@@ -1090,18 +1284,6 @@ Camera monitoring:
                 "question": next_question,
                 "question_number": current_index + 2,
             }
-        repeat_requested = any(phrase in lowered for phrase in repeat_phrases)
-        mostly_repeat_request = word_count <= 12 or re.search(
-            r"(repeat|come again|say that again|can you repeat)\??$",
-            lowered,
-        )
-        if repeat_requested and mostly_repeat_request:
-            return {
-                "action": "repeat",
-                "reply": f"Sure, let me repeat that. {current_question}",
-                "question": current_question,
-            }
-
         llm = make_chat_model(json_mode=True, max_tokens=max(OLLAMA_NUM_PREDICT, 900))
         response = llm.invoke(
             f"""
@@ -1116,6 +1298,10 @@ Rules:
 - If the answer is weak but attempted, either ask one useful follow-up or move on.
 - If enough has been answered, acknowledge and move to the next main question.
 - If this is the last question and no follow-up is needed, complete the interview warmly.
+- The answer is machine-transcribed. Technical words are often mangled
+  (for example "post gracious girl" is PostgreSQL, "red is" is Redis,
+  "DJ" or "Jungle" is Django, "Jason" is JSON). Interpret intent generously and
+  never treat a transcription artefact as a wrong or incoherent answer.
 
 Allowed action:
 follow_up, next_question, complete, clarify
@@ -1128,14 +1314,8 @@ JSON schema:
   "reason": "short reason"
 }}
 
-Application context:
-{json.dumps({
-    "role": application.get("requirement_position") or application.get("matched_position") or application.get("detected_position"),
-    "job_description": (application.get("job_description") or "")[:5000],
-    "cv_summary": application.get("cv_summary") or application.get("ai_short_description"),
-    "cv_text": (application.get("raw_cv_text") or "")[:7000],
-    "screening_details": application.get("screening_details"),
-}, default=str)}
+Role context:
+{json.dumps(session.get("role_context") or {}, default=str)}
 
 Current question number:
 {current_index + 1} of {max_questions}
@@ -1146,8 +1326,8 @@ Current question:
 Candidate answer:
 {answer_text}
 
-Previous transcript:
-{json.dumps(transcript, default=str)}
+Conversation so far:
+{json.dumps(interview_transcript_digest(transcript), default=str)}
 """
         ).content
         try:
@@ -1200,6 +1380,30 @@ Previous transcript:
         if report and application.get("interview_completed_at"):
             self.send_json({"error": "This interview has already been completed."}, status=409)
             return
+
+        # Application 21 has three separate recordings for one interview because
+        # nothing stopped the link being restarted.
+        attempts = int(INTERVIEW_ATTEMPTS.get(token, 0)) + 1
+        if attempts > MAX_INTERVIEW_ATTEMPTS:
+            log_json(
+                logging.WARNING,
+                "interview_attempt_limit_reached",
+                application_id=application["id"],
+                attempts=attempts,
+                maximum=MAX_INTERVIEW_ATTEMPTS,
+            )
+            self.send_json(
+                {
+                    "error": (
+                        "This interview has already been started the maximum number of times. "
+                        "Please contact us if you had a technical problem."
+                    )
+                },
+                status=429,
+            )
+            return
+        INTERVIEW_ATTEMPTS[token] = attempts
+
         database = self.db()
         try:
             database.db.mark_interview_started(application["id"])
@@ -1215,7 +1419,16 @@ Previous transcript:
             "camera_monitoring": {},
             "followup_for_current": False,
             "last_client_turn_id": 0,
+            # Built once. Re-sending the full CV and job description on every
+            # turn was the single largest contributor to the pauses between
+            # answer and next question.
+            "role_context": interview_role_context(application),
+            "started_at": time.time(),
         }
+        # The upcoming questions are known now, so their audio can be generated
+        # while the candidate is still on the greeting instead of on the wire
+        # during the pause after each answer.
+        self.pregenerate_interview_speech(questions)
         self.send_json(
             {
                 "application_id": application["id"],
@@ -1226,6 +1439,26 @@ Previous transcript:
                 "total_questions": len(questions),
             }
         )
+
+    def pregenerate_interview_speech(self, questions: list[str]):
+        """Warm the TTS cache off the request thread.
+
+        Cache keys are the exact text, so fixed strings already hit; it is the
+        generated questions that always missed and put a full edge-tts round trip
+        on the critical path after every answer.
+        """
+        texts = [question for question in (questions or []) if question]
+        if not texts:
+            return
+
+        def warm():
+            for text in texts:
+                try:
+                    self.ensure_dashboard_speech_file(text)
+                except Exception as exc:
+                    LOGGER.warning("Interview speech pre-generation failed: %s", exc)
+
+        Thread(target=warm, daemon=True).start()
 
     def api_interview_recording(self, token: str):
         application = self.application_for_interview_token(token)
@@ -1367,6 +1600,37 @@ Previous transcript:
                 for chunk_file in chunk_files:
                     output.write(chunk_file.read_bytes())
             recording_bytes = assembled_path.read_bytes()
+            if len(recording_bytes) < MIN_INTERVIEW_RECORDING_BYTES:
+                # Application 89 uploaded a 64 KB stub - a few seconds long -
+                # and it was still treated as a completed interview and scored.
+                log_json(
+                    logging.WARNING,
+                    "interview_recording_too_short",
+                    application_id=application["id"],
+                    size=len(recording_bytes),
+                    minimum=MIN_INTERVIEW_RECORDING_BYTES,
+                )
+                self.save_recording_info(
+                    application["id"],
+                    {
+                        "filename": filename,
+                        "size": len(recording_bytes),
+                        "content_type": content_type,
+                        "uploaded_at": datetime.utcnow().isoformat() + "Z",
+                        "rejected": True,
+                        "rejected_reason": "recording too short to be a usable interview",
+                        "needs_human_review": True,
+                    },
+                )
+                shutil.rmtree(chunk_dir, ignore_errors=True)
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": "The recording was too short to save.",
+                        "needs_human_review": True,
+                    }
+                )
+                return
             log_json(
                 logging.INFO,
                 "interview_recording_upload_started",
@@ -1475,6 +1739,8 @@ Previous transcript:
                 "camera_monitoring": {},
                 "followup_for_current": False,
                 "last_client_turn_id": 0,
+                "role_context": interview_role_context(application),
+                "started_at": time.time(),
             }
             WEB_INTERVIEW_SESSIONS[token] = session
         answer = str(payload.get("answer") or "").strip()
@@ -1501,7 +1767,10 @@ Previous transcript:
             session["last_client_turn_id"] = client_turn_id
         decision = self.web_interview_turn_decision(application, session, answer)
         action = decision.get("action")
-        if action not in {"clarify", "repeat"}:
+        # "wait" means the candidate asked for a moment or echoed the question
+        # back. Neither is an answer, so nothing is recorded and the question
+        # stays open - this is the failure that cost application 91 a question.
+        if action not in {"clarify", "repeat", "wait"}:
             session["transcript"].append(
                 {
                     "question_number": session["current_index"] + 1,
@@ -2240,9 +2509,15 @@ Previous transcript:
                 "action": "Track",
             },
             {
-                "status": "screening_negotiation",
-                "title": "Screening negotiation active",
-                "detail": "Salary or joining details need follow-up.",
+                "status": "budget_disclosed",
+                "title": "Awaiting candidate's answer on budget",
+                "detail": "The salary range was shared once; waiting for a yes or no.",
+                "action": "Track",
+            },
+            {
+                "status": "human_handled",
+                "title": "Taken over by a person",
+                "detail": "A team member replied in this thread, so the agent has stopped.",
                 "action": "Review",
             },
         ]
@@ -2286,7 +2561,8 @@ Previous transcript:
                     'final_hr_round_completed_pending_decision',
                     'interview_availability_received',
                     'hr_round_time_requested',
-                    'screening_negotiation'
+                    'budget_disclosed',
+                    'human_handled'
                 )
                 """
             )
@@ -3174,8 +3450,21 @@ Previous transcript:
         </section>
         """
         hr_approve_form = ""
-        if (row["application_status"] or "").lower() == "hr_escalated":
+        # Any application with an open escalation shows the control, not only
+        # ones whose status still happens to read "hr_escalated". Previously the
+        # button vanished the moment anything moved the status on, leaving HR
+        # holding an email that asked them to act on a page with no action.
+        awaiting_hr_decision = bool(row.get("hr_escalated_at")) and not row.get("hr_approved_at")
+        decidable_statuses = {"hr_escalated", "budget_disclosed", "manual_hr_review", "human_handled"}
+        if awaiting_hr_decision or (row["application_status"] or "").lower() in decidable_statuses:
+            budget_note = ""
+            if row.get("budget_response"):
+                budget_note = (
+                    f'<p class="hint">Candidate\'s answer on budget: '
+                    f'<strong>{html_escape(str(row.get("budget_response")))}</strong></p>'
+                )
             hr_approve_form = f"""
+            {budget_note}
             <form method="post" action="/applications/hr-approve" class="inline-form" onsubmit="return confirm('Approve this candidate and send the interview email?');">
                 <input type="hidden" name="id" value="{html_escape(application_id)}">
                 <button type="submit">Approve For Interview</button>
@@ -3581,6 +3870,13 @@ Previous transcript:
     let processingNudgeSpoken = false;
     let preferredInterviewVoice = null;
     let activeSpeechId = 0;
+    // Barge-in: the mic stays open while the interviewer talks, so a candidate
+    // can interrupt. Previously recognition only started in the speak() onend
+    // callback, so anything said over the agent was lost entirely - it reached
+    // the recording but never the transcript.
+    let aiIsSpeaking = false;
+    let bargeInWords = 0;
+    const BARGE_IN_MIN_WORDS = 3;
     let flowVersion = 0;
     let interviewClosed = false;
     let clientTurnId = 0;
@@ -3613,10 +3909,10 @@ Previous transcript:
       high_motion_events: 0,
       unusual_activity: []
     }};
-    const ANSWER_SILENCE_MS = 2200;
-    const LONG_ANSWER_SILENCE_MS = 3200;
+    const ANSWER_SILENCE_MS = 1200;
+    const LONG_ANSWER_SILENCE_MS = 2000;
     const INCOMPLETE_ANSWER_SILENCE_MS = 7000;
-    const FINAL_TRANSCRIPT_GRACE_MS = 1400;
+    const FINAL_TRANSCRIPT_GRACE_MS = 900;
     const PROCESSING_NUDGE_MS = {int(RECRUITER_BROWSER_PROCESSING_NUDGE_MS)};
     const MIC_ACTIVITY_THRESHOLD = 0.026;
     const RECORDING_MIME_TYPE = 'video/webm;codecs=vp8,opus';
@@ -3737,6 +4033,7 @@ Previous transcript:
       utterance.pitch = 1.08;
       aiStatus.textContent = 'Speaking';
       utterance.onend = () => {{
+        aiIsSpeaking = false;
         if (speechId !== activeSpeechId) return;
         aiStatus.textContent = 'Ready';
         if (onend) onend();
@@ -3751,6 +4048,7 @@ Previous transcript:
 
     function cancelCurrentSpeech() {{
       ++activeSpeechId;
+      aiIsSpeaking = false;
       window.speechSynthesis.cancel();
       if (aiAudioElement) {{
         try {{
@@ -3763,6 +4061,8 @@ Previous transcript:
     function speak(text, onend) {{
       const speechId = ++activeSpeechId;
       window.speechSynthesis.cancel();
+      aiIsSpeaking = true;
+      bargeInWords = 0;
       aiStatus.textContent = 'Speaking';
       if (aiAudioElement) {{
         try {{
@@ -3779,6 +4079,7 @@ Previous transcript:
         audio.onended = () => {{
           URL.revokeObjectURL(audioUrl);
           if (speechId !== activeSpeechId) return;
+          aiIsSpeaking = false;
           aiStatus.textContent = 'Ready';
           if (onend) onend();
         }};
@@ -3860,10 +4161,15 @@ Previous transcript:
 
     function answerCanAutoSubmit() {{
       const words = answerWordCount();
-      if (interviewPhase === 'greeting') return words >= 1;
+      if (words < 1) return false;
+      if (interviewPhase === 'greeting') return true;
       if (answerHasExplicitCompletion()) return true;
+      // Short utterances are usually questions ("can you repeat?") or requests
+      // for time, not incomplete answers. They must reach the server, which is
+      // what decides whether something was an answer at all. The previous
+      // 10-word floor made a natural repeat request impossible to deliver.
       if (answerLooksIncomplete()) return false;
-      return words >= 10;
+      return true;
     }}
 
     function answerSilenceThresholdMs() {{
@@ -4280,6 +4586,21 @@ Previous transcript:
           }}
           else interim += text;
         }}
+        if (aiIsSpeaking) {{
+          // The candidate is talking over the interviewer. Count the words and,
+          // once it is clearly speech rather than an echo, stop the audio and
+          // hand the floor back. Without this their words were never captured.
+          const spoken = (finalTranscript + interim).trim();
+          bargeInWords = spoken ? spoken.split(/\s+/).length : 0;
+          if (bargeInWords >= BARGE_IN_MIN_WORDS) {{
+            cancelCurrentSpeech();
+            setMessage('Go ahead, I am listening.');
+            aiStatus.textContent = 'Listening';
+            if (!isRecording) beginListening();
+          }} else {{
+            return;
+          }}
+        }}
         const nextTranscript = (finalTranscript + interim).trim();
         if (nextTranscript && nextTranscript !== answerEl.value.trim()) {{
           lastTranscriptChangeAt = now;
@@ -4562,8 +4883,8 @@ Previous transcript:
         setMessage('Thank you for your time today. We will review everything and get back to you with feedback soon.');
         const finalReply = reply || 'Thank you so much for your time today. I appreciate you sharing your experience with me. I will review everything and get back to you with feedback soon.';
         const finish = () => speak(finalReply, closeInterviewScreen);
-        if (processingNudgeSpoken) afterCurrentSpeech(finish);
-        else finish();
+        cancelCurrentSpeech();
+        finish();
         return;
       }}
       const nextQuestionText = data.question || currentQuestion;
@@ -4589,6 +4910,19 @@ Previous transcript:
           }});
           return;
         }}
+        if (action === 'wait') {{
+          // Candidate asked for a moment or repeated the question back. Neither
+          // is an answer: acknowledge briefly and keep listening on the same
+          // question instead of scoring the pause and moving on.
+          setMessage('Take your time.');
+          answerEl.value = '';
+          isSubmitting = false;
+          speak(reply || 'Take your time.', () => {{
+            if (interviewClosed || submitFlow !== flowVersion) return;
+            beginListening();
+          }});
+          return;
+        }}
         setMessage(action === 'follow_up' ? 'The interviewer has one follow-up.' : 'Moving to the next question.');
         isSubmitting = false;
         speak(cleanTransitionReply(reply, nextQuestionText), () => {{
@@ -4596,8 +4930,10 @@ Previous transcript:
           showQuestion(nextNumber, nextQuestionText);
         }});
       }};
-      if (processingNudgeSpoken) afterCurrentSpeech(deliverResponse);
-      else deliverResponse();
+      // The real reply always wins over the filler. Waiting for a 2.5s nudge to
+      // finish speaking used to add seconds to every single turn.
+      cancelCurrentSpeech();
+      deliverResponse();
     }}
 
     startBtn.addEventListener('click', startInterview);
@@ -4700,9 +5036,10 @@ Previous transcript:
             "matched_requirement",
             "screening_under_review",
             "screening_questions_sent",
-            "screening_negotiation",
+            "budget_disclosed",
             "hr_escalated",
             "hr_approved",
+            "human_handled",
             "interview_link_pending",
             "interview_link_sent",
             "interview_started",
@@ -4881,15 +5218,8 @@ Previous transcript:
         self.send_html(body)
 
     def render_error(self, exc: Exception):
-        if DB_PROVIDER in {"mssql", "sqlserver", "sql_server"}:
-            help_text = (
-                "SQL Server mode is enabled. Make sure Microsoft ODBC Driver 18 for SQL Server "
-                "and unixODBC are installed, and `MSSQL_CONNECTION_STRING` is set."
-            )
-            command = "sudo ./scripts/install_mssql_odbc_ubuntu.sh"
-        else:
-            help_text = "PostgreSQL mode is enabled. Make sure PostgreSQL is running and `DATABASE_URL` is set."
-            command = "docker compose up -d recruiter-postgres"
+        help_text = "Make sure PostgreSQL is running and `DATABASE_URL` is set."
+        command = "docker compose up -d recruiter-postgres"
         content = f"""
         <!doctype html>
         <html lang="en">
