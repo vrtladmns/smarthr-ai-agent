@@ -1080,6 +1080,27 @@ def score_number(value: Any) -> float | None:
         return None
 
 
+NON_NUMERIC_TOKENS = {"null", "none", "na", "n/a", "nil", "-", "immediate", "fresher", "unknown"}
+
+
+def numeric_value(value: Any) -> float | None:
+    """Coerce whatever the LLM produced into something a numeric column accepts.
+
+    Models routinely return "10+", "85%", "10-12 years" or "6 LPA" for fields
+    typed NUMERIC in Postgres, and the raw string aborts the transaction. The
+    leading number is the useful part, so take it rather than dropping the value.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text or text.lower() in NON_NUMERIC_TOKENS:
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
+    return float(match.group(0)) if match else None
+
+
 def passes_screening_threshold(evaluation: dict[str, Any], requirement: dict[str, Any] | None) -> bool:
     if not requirement:
         return False
@@ -1710,6 +1731,8 @@ def normalize_cv_details(extracted: dict[str, Any]) -> dict[str, Any]:
     normalized = {**defaults, **extracted}
     for key in ["skills", "education", "work_history", "certifications", "projects", "achievements"]:
         normalized[key] = ensure_list(normalized.get(key))
+    # "10+" and friends are typed NUMERIC in the database and abort the insert.
+    normalized["total_experience_years"] = numeric_value(normalized.get("total_experience_years"))
     return normalized
 
 
@@ -1727,6 +1750,8 @@ def normalize_evaluation(evaluation: dict[str, Any]) -> dict[str, Any]:
     normalized = {**defaults, **evaluation}
     for key in ["strengths", "risks", "missing_requirements"]:
         normalized[key] = ensure_list(normalized.get(key))
+    for key in ["ats_score", "jd_match_score"]:
+        normalized[key] = numeric_value(normalized.get(key))
     return normalized
 
 
@@ -2217,19 +2242,40 @@ class RecruiterDatabase:
         except Exception:
             pass
 
+    def rollback(self):
+        """Return the connection to a usable state after a failed statement.
+
+        PostgreSQL aborts the whole transaction on any error, and every later
+        statement then fails with InFailedSqlTransaction. Without this, a single
+        bad insert takes out the error logging and the cleanup that runs after
+        it, turning one recoverable failure into a silent cascade.
+        """
+        try:
+            self.conn.rollback()
+        except Exception as exc:
+            LOGGER.warning("Database rollback failed: %s", exc)
+
     def rows(self, query: str, params: tuple = ()) -> list[dict[str, Any]]:
-        with self.conn.cursor(row_factory=self.psycopg.rows.dict_row) as cursor:
-            cursor.execute(query, params)
-            return list(cursor.fetchall())
+        try:
+            with self.conn.cursor(row_factory=self.psycopg.rows.dict_row) as cursor:
+                cursor.execute(query, params)
+                return list(cursor.fetchall())
+        except Exception:
+            self.rollback()
+            raise
 
     def one(self, query: str, params: tuple = ()) -> dict[str, Any] | None:
         rows = self.rows(query, params)
         return rows[0] if rows else None
 
     def execute(self, query: str, params: tuple = ()):
-        with self.conn.cursor() as cursor:
-            cursor.execute(query, params)
-        self.conn.commit()
+        try:
+            with self.conn.cursor() as cursor:
+                cursor.execute(query, params)
+            self.conn.commit()
+        except Exception:
+            self.rollback()
+            raise
 
     def init_schema(self):
         with self.conn.cursor() as cursor:
@@ -2281,16 +2327,25 @@ class RecruiterDatabase:
         message_id = (provider_message_id or "").strip()
         if not message_id:
             return True
-        row = self.one(
-            """
-            INSERT INTO recruiter_processed_messages (provider_message_id)
-            VALUES (%s)
-            ON CONFLICT (provider_message_id) DO NOTHING
-            RETURNING provider_message_id
-            """,
-            (message_id,),
-        )
-        return row is not None
+        try:
+            with self.conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO recruiter_processed_messages (provider_message_id)
+                    VALUES (%s)
+                    ON CONFLICT (provider_message_id) DO NOTHING
+                    RETURNING provider_message_id
+                    """,
+                    (message_id,),
+                )
+                claimed = cursor.fetchone() is not None
+            # Committed immediately so the claim is durable and independent of
+            # whatever the rest of processing does. Failures release it again.
+            self.conn.commit()
+            return claimed
+        except Exception:
+            self.rollback()
+            raise
 
     def release_provider_message(self, provider_message_id: str):
         """Undo a claim so a genuinely failed message can be retried."""
@@ -2910,19 +2965,20 @@ class RecruiterDatabase:
             extracted.get("portfolio_url"),
             extracted.get("current_title"),
             extracted.get("current_company"),
-            extracted.get("total_experience_years"),
+            numeric_value(extracted.get("total_experience_years")),
             json.dumps(extracted.get("skills", [])),
             json.dumps(extracted.get("education", [])),
             json.dumps(extracted.get("work_history", [])),
             json.dumps(extracted.get("certifications", [])),
-            cv_text,
+            sanitize_db_text(cv_text),
             evaluation.get("short_description"),
-            evaluation.get("ats_score"),
+            numeric_value(evaluation.get("ats_score")),
             json.dumps(evaluation),
         )
-        with self.conn.cursor() as cursor:
-            cursor.execute(
-                """
+        try:
+            with self.conn.cursor() as cursor:
+                cursor.execute(
+                    """
                 INSERT INTO recruiter_candidates
                 (
                     candidate_uid, source_email, candidate_email, referrer_email,
@@ -2941,11 +2997,14 @@ class RecruiterDatabase:
                 )
                 RETURNING id
                 """,
-                values,
-            )
-            candidate_id = cursor.fetchone()[0]
-        self.conn.commit()
-        return candidate_id
+                    values,
+                )
+                candidate_id = cursor.fetchone()[0]
+            self.conn.commit()
+            return candidate_id
+        except Exception:
+            self.rollback()
+            raise
 
     def insert_application(
         self,
@@ -2976,8 +3035,8 @@ class RecruiterDatabase:
             extracted.get("target_position"),
             requirement["position_title"] if requirement else None,
             status,
-            evaluation.get("ats_score"),
-            evaluation.get("jd_match_score"),
+            numeric_value(evaluation.get("ats_score")),
+            numeric_value(evaluation.get("jd_match_score")),
             json.dumps(evaluation.get("strengths", [])),
             json.dumps(evaluation.get("risks", [])),
             json.dumps(evaluation.get("missing_requirements", [])),
@@ -6614,6 +6673,10 @@ class AIRecruiterAgent:
                         default=str,
                     ),
                 )
+                # The failing statement aborted the transaction; without this
+                # every cleanup call below dies with InFailedSqlTransaction and
+                # the message is left claimed and un-retryable.
+                self.db.rollback()
                 try:
                     self.db.log_email_event(
                         inbox_email,
@@ -6722,6 +6785,7 @@ class AIRecruiterAgent:
                 outputs={"graph_message_id": message_id, "error": str(exc)},
                 tags=["graph", "error"],
             )
+            self.db.rollback()
             try:
                 self.inbox.mark_unseen(inbox_email.uid)
             except Exception as mark_exc:

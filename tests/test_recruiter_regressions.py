@@ -195,6 +195,46 @@ def test_prompt_facts_exclude_binary_and_raw_cv():
     assert facts["screening_details"] == {"current_salary": 500000}
 
 
+
+
+# --- LLM values reaching NUMERIC columns (production failure 2026-08-12) -------
+
+def test_experience_with_plus_sign_is_coerced():
+    """`"10+"` aborted the whole transaction on insert."""
+    assert ra.numeric_value("10+") == 10.0
+
+
+def test_common_llm_number_formats_are_coerced():
+    cases = {
+        "10+": 10.0,
+        "85%": 85.0,
+        "10-12 years": 10.0,
+        "6 LPA": 6.0,
+        "1,200,000": 1200000.0,
+        " 7.5 ": 7.5,
+        12: 12.0,
+        3.5: 3.5,
+    }
+    for raw, expected in cases.items():
+        assert ra.numeric_value(raw) == expected, raw
+
+
+def test_non_numeric_values_become_null_not_garbage():
+    for raw in [None, "", "N/A", "null", "Immediate", "fresher", "-", True, False]:
+        assert ra.numeric_value(raw) is None, raw
+
+
+def test_normalize_cv_details_coerces_experience():
+    out = ra.normalize_cv_details({"total_experience_years": "10+ years"})
+    assert out["total_experience_years"] == 10.0
+
+
+def test_normalize_evaluation_coerces_scores():
+    out = ra.normalize_evaluation({"ats_score": "85%", "jd_match_score": "70 percent"})
+    assert out["ats_score"] == 85.0
+    assert out["jd_match_score"] == 70.0
+
+
 if __name__ == "__main__":
     import pytest
 
