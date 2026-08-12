@@ -1,6 +1,5 @@
 psycopg[binary]
 python-dotenv
-pyodbc
 pypdf
 google-api-python-client
 google-auth-oauthlib

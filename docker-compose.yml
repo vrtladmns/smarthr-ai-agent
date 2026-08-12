@@ -22,7 +22,7 @@ services:
 
 # Disabled for AWS recruiter-agent-only deployment.
 # The agent should use the external DB configured in .env, for example:
-# DB_PROVIDER=mssql with MSSQL_CONNECTION_STRING, or an external PostgreSQL DATABASE_URL.
+# an external PostgreSQL DATABASE_URL.
 #
 #  recruiter-postgres:
 #    image: postgres:16-alpine

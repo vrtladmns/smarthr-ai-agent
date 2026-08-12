@@ -6,6 +6,7 @@ import imaplib
 import json
 import logging
 import mimetypes
+import os
 import random
 import re
 import smtplib
@@ -61,9 +62,6 @@ from config import (
     MICROSOFT_GRAPH_BASE_URL,
     MICROSOFT_MAILBOX,
     MICROSOFT_TENANT_ID,
-    MSSQL_CONNECTION_STRING,
-    MSSQL_LOGIN_TIMEOUT_SECONDS,
-    MSSQL_ODBC_DRIVER,
     NGROK_API_URL,
     OLLAMA_NUM_PREDICT,
     ONEDRIVE_RECORDINGS_FOLDER,
@@ -311,6 +309,27 @@ def send_hr_notification(mailer, subject: str, body: str, include_escalation_ema
     for recipient in hr_notification_recipients(include_escalation_email=include_escalation_email):
         mailer.send_direct_email(recipient, subject, body)
 
+
+# Thread rendering budget. build_thread_context() spends this newest-message-first.
+THREAD_CONTEXT_MAX_CHARS = int(os.getenv("RECRUITER_THREAD_CONTEXT_MAX_CHARS", "8000"))
+THREAD_CONTEXT_PER_MESSAGE_CHARS = int(os.getenv("RECRUITER_THREAD_CONTEXT_PER_MESSAGE_CHARS", "1200"))
+# How many messages of a conversation to pull from the mail provider. Real threads
+# run past 20 messages, and the newest ones are the ones that matter.
+THREAD_FETCH_LIMIT = int(os.getenv("RECRUITER_THREAD_FETCH_LIMIT", "25"))
+
+# Never send the same scenario to the same application twice inside this window.
+# This is the backstop that caps the blast radius of any single logic bug.
+REPLY_SCENARIO_COOLDOWN_HOURS = int(os.getenv("RECRUITER_REPLY_SCENARIO_COOLDOWN_HOURS", "24"))
+# Scenarios that must never be repeated for an application, at any interval.
+ONCE_PER_APPLICATION_SCENARIOS = {"budget_disclosure", "holding_reply"}
+
+# Statuses where a human owns the conversation. The agent stores replies and stops.
+HUMAN_HOLD_STATUSES = {
+    "hr_escalated",
+    "manual_hr_review",
+    "interview_on_hold_hr_review",
+    "human_handled",
+}
 
 FINAL_AGENT_STATUSES = {
     "selected_documents_requested",
@@ -596,197 +615,39 @@ CREATE TABLE IF NOT EXISTS recruiter_email_events (
     details JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Idempotency ledger for inbound provider messages. Graph webhooks are
+-- at-least-once and the unread flag is only cleared ~50s after processing
+-- starts, so the flag alone let a single email be answered twice.
+CREATE TABLE IF NOT EXISTS recruiter_processed_messages (
+    provider_message_id TEXT PRIMARY KEY,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Outbound reply ledger. Every candidate-facing send is recorded here first,
+-- which is what makes "never send the same scenario twice" enforceable
+-- independently of whatever the surrounding state machine believes.
+CREATE TABLE IF NOT EXISTS recruiter_sent_replies (
+    id BIGSERIAL PRIMARY KEY,
+    application_id BIGINT,
+    recipient TEXT NOT NULL,
+    scenario TEXT NOT NULL,
+    body_hash TEXT NOT NULL,
+    provider_message_id TEXT,
+    sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS recruiter_sent_replies_app_scenario_idx
+ON recruiter_sent_replies (application_id, scenario, sent_at DESC);
+CREATE INDEX IF NOT EXISTS recruiter_sent_replies_recipient_scenario_idx
+ON recruiter_sent_replies (recipient, scenario, sent_at DESC);
+
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS human_handled_at TIMESTAMPTZ;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS budget_disclosed_at TIMESTAMPTZ;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS budget_response TEXT;
 """
 
 
-MSSQL_CREATE_TABLES_SQL = """
-IF OBJECT_ID('recruitment_requirements', 'U') IS NULL
-CREATE TABLE recruitment_requirements (
-    id BIGINT IDENTITY(1,1) PRIMARY KEY,
-    position_title NVARCHAR(255) NOT NULL,
-    experience_min_years DECIMAL(5, 2) NULL,
-    experience_max_years DECIMAL(5, 2) NULL,
-    budget_min DECIMAL(12, 2) NULL,
-    budget_max DECIMAL(12, 2) NULL,
-    currency NVARCHAR(20) DEFAULT 'INR',
-    job_description NVARCHAR(MAX) NOT NULL,
-    recommended_questions NVARCHAR(MAX) NOT NULL DEFAULT '[]',
-    urgently_required BIT DEFAULT 0,
-    needed_within_days INT NULL,
-    status NVARCHAR(80) NOT NULL DEFAULT 'open',
-    created_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
-    updated_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET()
-);
 
-IF OBJECT_ID('recruiter_candidates', 'U') IS NULL
-CREATE TABLE recruiter_candidates (
-    id BIGINT IDENTITY(1,1) PRIMARY KEY,
-    candidate_uid UNIQUEIDENTIFIER NOT NULL UNIQUE,
-    source_email NVARCHAR(500) NULL,
-    candidate_email NVARCHAR(500) NULL,
-    referrer_email NVARCHAR(500) NULL,
-    submission_type NVARCHAR(120) NOT NULL DEFAULT 'self_application',
-    full_name NVARCHAR(500) NULL,
-    phone NVARCHAR(120) NULL,
-    location NVARCHAR(500) NULL,
-    linkedin_url NVARCHAR(1000) NULL,
-    portfolio_url NVARCHAR(1000) NULL,
-    current_title NVARCHAR(500) NULL,
-    current_company NVARCHAR(500) NULL,
-    total_experience_years DECIMAL(5, 2) NULL,
-    skills NVARCHAR(MAX) NOT NULL DEFAULT '[]',
-    education NVARCHAR(MAX) NOT NULL DEFAULT '[]',
-    work_history NVARCHAR(MAX) NOT NULL DEFAULT '[]',
-    certifications NVARCHAR(MAX) NOT NULL DEFAULT '[]',
-    raw_cv_text NVARCHAR(MAX) NULL,
-    cv_summary NVARCHAR(MAX) NULL,
-    ats_score DECIMAL(5, 2) NULL,
-    ai_evaluation NVARCHAR(MAX) NOT NULL DEFAULT '{}',
-    created_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
-    updated_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET()
-);
-
-IF OBJECT_ID('recruiter_applications', 'U') IS NULL
-CREATE TABLE recruiter_applications (
-    id BIGINT IDENTITY(1,1) PRIMARY KEY,
-    application_uid UNIQUEIDENTIFIER NOT NULL UNIQUE,
-    candidate_id BIGINT NOT NULL REFERENCES recruiter_candidates(id),
-    requirement_id BIGINT NULL REFERENCES recruitment_requirements(id),
-    email_message_id NVARCHAR(1000) NULL,
-    email_thread_id NVARCHAR(1000) NULL,
-    source_email NVARCHAR(500) NULL,
-    candidate_email NVARCHAR(500) NULL,
-    referrer_email NVARCHAR(500) NULL,
-    submission_type NVARCHAR(120) NOT NULL DEFAULT 'self_application',
-    email_subject NVARCHAR(1000) NULL,
-    detected_position NVARCHAR(500) NULL,
-    matched_position NVARCHAR(500) NULL,
-    application_status NVARCHAR(120) NOT NULL,
-    ats_score DECIMAL(5, 2) NULL,
-    jd_match_score DECIMAL(5, 2) NULL,
-    strengths NVARCHAR(MAX) NOT NULL DEFAULT '[]',
-    risks NVARCHAR(MAX) NOT NULL DEFAULT '[]',
-    missing_requirements NVARCHAR(MAX) NOT NULL DEFAULT '[]',
-    ai_short_description NVARCHAR(MAX) NULL,
-    ai_evaluation NVARCHAR(MAX) NOT NULL DEFAULT '{}',
-    attachment_filename NVARCHAR(1000) NULL,
-    attachment_sha256 NVARCHAR(128) NULL,
-    attachment_payload VARBINARY(MAX) NULL,
-    screening_details NVARCHAR(MAX) NOT NULL DEFAULT '{}',
-    screening_current_salary DECIMAL(12, 2) NULL,
-    screening_expected_salary DECIMAL(12, 2) NULL,
-    screening_current_location NVARCHAR(500) NULL,
-    screening_joining_days INT NULL,
-    hr_escalation_reason NVARCHAR(MAX) NULL,
-    hr_escalated_at DATETIMEOFFSET NULL,
-    hr_approved_at DATETIMEOFFSET NULL,
-    interview_availability NVARCHAR(MAX) NULL,
-    interview_scheduled_at DATETIMEOFFSET NULL,
-    hr_interviewer_email NVARCHAR(500) NULL,
-    hr_interviewer_name NVARCHAR(500) NULL,
-    teams_event_id NVARCHAR(1000) NULL,
-    teams_join_url NVARCHAR(2000) NULL,
-    interview_link_token NVARCHAR(200) NULL,
-    interview_link_created_at DATETIMEOFFSET NULL,
-    interview_started_at DATETIMEOFFSET NULL,
-    interview_completed_at DATETIMEOFFSET NULL,
-    interview_reminder_sent_at DATETIMEOFFSET NULL,
-    interview_reminder_count INT NOT NULL DEFAULT 0,
-    interview_report NVARCHAR(MAX) NOT NULL DEFAULT '{}',
-    received_at DATETIMEOFFSET NULL,
-    created_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET()
-);
-
-IF OBJECT_ID('recruiter_email_events', 'U') IS NULL
-CREATE TABLE recruiter_email_events (
-    id BIGINT IDENTITY(1,1) PRIMARY KEY,
-    email_message_id NVARCHAR(1000) NULL,
-    source_email NVARCHAR(500) NULL,
-    email_subject NVARCHAR(1000) NULL,
-    event_type NVARCHAR(200) NOT NULL,
-    details NVARCHAR(MAX) NOT NULL DEFAULT '{}',
-    created_at DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET()
-);
-
-IF COL_LENGTH('recruitment_requirements', 'position_title') IS NOT NULL
-ALTER TABLE recruitment_requirements ALTER COLUMN position_title NVARCHAR(255) NOT NULL;
-
-IF COL_LENGTH('recruitment_requirements', 'recommended_questions') IS NULL
-ALTER TABLE recruitment_requirements ADD recommended_questions NVARCHAR(MAX) NOT NULL DEFAULT '[]';
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'recruitment_requirements_position_title_idx')
-CREATE UNIQUE INDEX recruitment_requirements_position_title_idx
-ON recruitment_requirements (position_title);
-
-IF COL_LENGTH('recruiter_applications', 'attachment_payload') IS NULL
-ALTER TABLE recruiter_applications ADD attachment_payload VARBINARY(MAX) NULL;
-
-IF COL_LENGTH('recruiter_applications', 'email_thread_id') IS NULL
-ALTER TABLE recruiter_applications ADD email_thread_id NVARCHAR(1000) NULL;
-
-IF COL_LENGTH('recruiter_applications', 'screening_details') IS NULL
-ALTER TABLE recruiter_applications ADD screening_details NVARCHAR(MAX) NOT NULL DEFAULT '{}';
-
-IF COL_LENGTH('recruiter_applications', 'screening_current_salary') IS NULL
-ALTER TABLE recruiter_applications ADD screening_current_salary DECIMAL(12, 2) NULL;
-
-IF COL_LENGTH('recruiter_applications', 'screening_expected_salary') IS NULL
-ALTER TABLE recruiter_applications ADD screening_expected_salary DECIMAL(12, 2) NULL;
-
-IF COL_LENGTH('recruiter_applications', 'screening_current_location') IS NULL
-ALTER TABLE recruiter_applications ADD screening_current_location NVARCHAR(500) NULL;
-
-IF COL_LENGTH('recruiter_applications', 'screening_joining_days') IS NULL
-ALTER TABLE recruiter_applications ADD screening_joining_days INT NULL;
-
-IF COL_LENGTH('recruiter_applications', 'hr_escalation_reason') IS NULL
-ALTER TABLE recruiter_applications ADD hr_escalation_reason NVARCHAR(MAX) NULL;
-
-IF COL_LENGTH('recruiter_applications', 'hr_escalated_at') IS NULL
-ALTER TABLE recruiter_applications ADD hr_escalated_at DATETIMEOFFSET NULL;
-
-IF COL_LENGTH('recruiter_applications', 'hr_approved_at') IS NULL
-ALTER TABLE recruiter_applications ADD hr_approved_at DATETIMEOFFSET NULL;
-
-IF COL_LENGTH('recruiter_applications', 'interview_availability') IS NULL
-ALTER TABLE recruiter_applications ADD interview_availability NVARCHAR(MAX) NULL;
-
-IF COL_LENGTH('recruiter_applications', 'interview_scheduled_at') IS NULL
-ALTER TABLE recruiter_applications ADD interview_scheduled_at DATETIMEOFFSET NULL;
-
-IF COL_LENGTH('recruiter_applications', 'hr_interviewer_email') IS NULL
-ALTER TABLE recruiter_applications ADD hr_interviewer_email NVARCHAR(500) NULL;
-
-IF COL_LENGTH('recruiter_applications', 'hr_interviewer_name') IS NULL
-ALTER TABLE recruiter_applications ADD hr_interviewer_name NVARCHAR(500) NULL;
-
-IF COL_LENGTH('recruiter_applications', 'teams_event_id') IS NULL
-ALTER TABLE recruiter_applications ADD teams_event_id NVARCHAR(1000) NULL;
-
-IF COL_LENGTH('recruiter_applications', 'teams_join_url') IS NULL
-ALTER TABLE recruiter_applications ADD teams_join_url NVARCHAR(2000) NULL;
-
-IF COL_LENGTH('recruiter_applications', 'interview_link_token') IS NULL
-ALTER TABLE recruiter_applications ADD interview_link_token NVARCHAR(200) NULL;
-
-IF COL_LENGTH('recruiter_applications', 'interview_link_created_at') IS NULL
-ALTER TABLE recruiter_applications ADD interview_link_created_at DATETIMEOFFSET NULL;
-
-IF COL_LENGTH('recruiter_applications', 'interview_started_at') IS NULL
-ALTER TABLE recruiter_applications ADD interview_started_at DATETIMEOFFSET NULL;
-
-IF COL_LENGTH('recruiter_applications', 'interview_completed_at') IS NULL
-ALTER TABLE recruiter_applications ADD interview_completed_at DATETIMEOFFSET NULL;
-
-IF COL_LENGTH('recruiter_applications', 'interview_reminder_sent_at') IS NULL
-ALTER TABLE recruiter_applications ADD interview_reminder_sent_at DATETIMEOFFSET NULL;
-
-IF COL_LENGTH('recruiter_applications', 'interview_reminder_count') IS NULL
-ALTER TABLE recruiter_applications ADD interview_reminder_count INT NOT NULL DEFAULT 0;
-
-IF COL_LENGTH('recruiter_applications', 'interview_report') IS NULL
-ALTER TABLE recruiter_applications ADD interview_report NVARCHAR(MAX) NOT NULL DEFAULT '{}';
-"""
 
 
 @dataclass
@@ -818,12 +679,6 @@ def require_package(module_name: str, install_hint: str):
     try:
         return __import__(module_name)
     except ImportError as exc:
-        if module_name == "pyodbc" and "libodbc.so" in str(exc):
-            raise RuntimeError(
-                "SQL Server mode needs the system ODBC runtime. Install Microsoft ODBC Driver 18 "
-                "and unixODBC, then restart the app. On Ubuntu/Debian run: "
-                "sudo ./scripts/install_mssql_odbc_ubuntu.sh"
-            ) from exc
         raise RuntimeError(f"Missing dependency `{module_name}`. Install it with: {install_hint}. Original error: {exc}") from exc
 
 
@@ -894,7 +749,17 @@ def parse_thread_message(uid: bytes, parsed: email.message.EmailMessage) -> Thre
     )
 
 
-def build_thread_context(inbox_email: InboxEmail) -> str:
+def build_thread_context(
+    inbox_email: InboxEmail,
+    max_chars: int = THREAD_CONTEXT_MAX_CHARS,
+    per_message_chars: int = THREAD_CONTEXT_PER_MESSAGE_CHARS,
+) -> str:
+    """Render the thread for an LLM prompt, newest-first priority.
+
+    Two properties matter and both were broken before:
+      * quoted history is stripped per message, so the budget is spent on new text
+      * when the budget runs out the OLDEST messages are dropped, never the newest
+    """
     messages = inbox_email.thread_messages or [
         ThreadMessage(
             uid=inbox_email.uid,
@@ -905,17 +770,26 @@ def build_thread_context(inbox_email: InboxEmail) -> str:
             received_at=inbox_email.received_at,
         )
     ]
-    lines = []
+    blocks = []
     for index, message in enumerate(messages, start=1):
         date_text = message.received_at.isoformat() if message.received_at else "unknown date"
-        lines.append(
+        body = latest_reply_text(message.body or "")[:per_message_chars]
+        blocks.append(
             f"Message {index}\n"
             f"From: {message.sender}\n"
             f"Date: {date_text}\n"
             f"Subject: {message.subject}\n"
-            f"Body:\n{message.body[:1800]}"
+            f"Body:\n{body}"
         )
-    return "\n\n---\n\n".join(lines)
+
+    kept: list[str] = []
+    total = 0
+    for block in reversed(blocks):
+        if kept and total + len(block) > max_chars:
+            break
+        kept.append(block)
+        total += len(block)
+    return "\n\n---\n\n".join(reversed(kept))
 
 
 def thread_message_ids(inbox_email: InboxEmail) -> list[str]:
@@ -940,19 +814,31 @@ def thread_message_ids(inbox_email: InboxEmail) -> list[str]:
 
 
 def latest_reply_text(body: str) -> str:
+    """Strip quoted history, leaving only what the sender newly wrote.
+
+    The `On ... wrote:` attribution is matched across line breaks because Gmail
+    and Outlook both wrap it, which the previous single-line pattern missed.
+    """
     if not body:
         return ""
     markers = [
-        r"\n\s*On .+ wrote:\s*$",
+        r"\n\s*On\b[\s\S]{0,300}?\bwrote:",
+        r"\n\s*On\b[\s\S]{0,300}?\b(?:a|é)crit\s*:",
+        r"\n\s*_{5,}\s*\n",
+        r"\n\s*-{5,}\s*\n",
         r"\n\s*From:\s+",
         r"\n\s*Sent:\s+",
         r"\n\s*-{2,}\s*Original Message\s*-{2,}",
+        r"\n\s*Get Outlook for\b",
+        r"\n\s*Sent from my\b",
     ]
     latest = body
     for marker in markers:
         parts = re.split(marker, latest, maxsplit=1, flags=re.I | re.M)
         latest = parts[0]
-    return latest.strip()
+    # Drop any residual quote lines that survived the header split.
+    lines = [line for line in latest.splitlines() if not line.lstrip().startswith(">")]
+    return "\n".join(lines).strip()
 
 
 def extract_attachments(message: email.message.EmailMessage) -> list[tuple[str, bytes]]:
@@ -1329,44 +1215,6 @@ def screening_fit(answers: dict[str, Any], requirement: dict[str, Any] | None) -
     return not issues, issues
 
 
-def latest_reply_accepts_budget(text: str, requirement: dict[str, Any] | None) -> bool:
-    latest_raw = latest_reply_text(text)
-    latest = normalize_position_text(latest_raw)
-    if not latest:
-        return False
-    if any(phrase in latest for phrase in ["not okay", "not ok", "not comfortable", "cannot", "can't", "cant"]):
-        return False
-    budget_max = score_number(requirement.get("budget_max") if requirement else None)
-    numbers = [float(match.group(0)) for match in re.finditer(r"\b\d+(?:\.\d+)?\b", latest_raw.replace(",", ""))]
-    if budget_max is not None:
-        saw_salary_number = False
-        for number in numbers:
-            annual_number = number * 100000 if number <= 200 and re.search(r"\b(lpa|lakh|lac)\b", latest, flags=re.I) else number
-            if annual_number >= 10000:
-                saw_salary_number = True
-            if annual_number <= budget_max:
-                return True
-        if saw_salary_number:
-            return False
-    if "negotiate" in latest and not any(phrase in latest for phrase in ["proceed", "comfortable", "agree", "within budget"]):
-        return False
-    acceptance_phrases = [
-        "yes please proceed",
-        "please proceed",
-        "go ahead",
-        "i agree",
-        "agreed",
-        "i am ok",
-        "i am okay",
-        "i am comfortable",
-        "comfortable with",
-        "within budget",
-        "budget works",
-        "no issues",
-    ]
-    return any(phrase in latest for phrase in acceptance_phrases)
-
-
 def parse_iso_datetime(value: Any) -> datetime | None:
     if not value:
         return None
@@ -1500,19 +1348,319 @@ def is_withdrawal_request(latest_body: str) -> bool:
 
 
 def is_status_followup(latest_body: str) -> bool:
-    text = normalize_position_text(latest_body)
-    patterns = [
-        r"\bstatus\b",
-        r"\bupdate\b",
-        r"\bfollow up\b",
+    """True only for a genuine enquiry about progress.
+
+    The bare word "interview" used to match, so a candidate writing "thank you
+    for inviting me to interview" was treated as chasing an update and had the
+    interview link re-sent to them.
+    """
+    raw = latest_reply_text(latest_body or "")
+    text = normalize_position_text(raw)
+    if not text:
+        return False
+    if is_pure_acknowledgement(raw):
+        return False
+    enquiry_patterns = [
         r"\bany update\b",
-        r"\bshortlisted\b",
-        r"\bnext step\b",
-        r"\bnext steps\b",
-        r"\binterview\b",
+        r"\bany news\b",
+        r"\bstatus of (my|the) (application|profile|candidature)\b",
+        r"\b(what|whats|what is) the status\b",
+        r"\bcurrent status\b",
+        r"\bplease (share|provide|update) .{0,20}status\b",
         r"\bwhen can i expect\b",
+        r"\bwhen will i (hear|know|get)\b",
+        r"\bhave(nt| not)? (you )?(heard|got) back\b",
+        r"\bhaven t heard\b",
+        r"\bawaiting (your )?(response|reply|update)\b",
+        r"\bfollowing up\b",
+        r"\bjust checking\b",
+        r"\bchecking in\b",
+        r"\bkindly update\b",
+        r"\bwhat(s| is) the next step\b",
+        r"\bam i shortlisted\b",
+        r"\bwas i shortlisted\b",
     ]
-    return any(re.search(pattern, text) for pattern in patterns)
+    if any(re.search(pattern, text) for pattern in enquiry_patterns):
+        return True
+    # A question mark plus a progress word is also a genuine enquiry.
+    if "?" in raw and re.search(r"\b(status|update|shortlisted|next step|next steps|progress)\b", text):
+        return True
+    return False
+
+
+ACKNOWLEDGEMENT_PHRASES = (
+    "thank you",
+    "thanks",
+    "thankyou",
+    "noted",
+    "sure",
+    "okay",
+    "ok",
+    "will do",
+    "got it",
+    "received",
+    "acknowledged",
+    "great",
+    "perfect",
+    "looking forward",
+    "appreciate it",
+    "much appreciated",
+)
+
+ACKNOWLEDGEMENT_FILLER = {
+    "hi",
+    "hello",
+    "dear",
+    "sir",
+    "madam",
+    "team",
+    "hr",
+    "regards",
+    "best",
+    "kind",
+    "warm",
+    "thanks",
+    "thank",
+    "you",
+    "your",
+    "yours",
+    "i",
+    "me",
+    "my",
+    "we",
+    "for",
+    "the",
+    "and",
+    "so",
+    "very",
+    "much",
+    "a",
+    "lot",
+    "it",
+    "this",
+    "that",
+    "to",
+    "of",
+    "sincerely",
+    "sir/madam",
+}
+
+# Anything here means the message carries real content and deserves a reply.
+ACKNOWLEDGEMENT_CONTENT_PATTERN = re.compile(
+    r"\b(salary|ctc|lpa|lakh|notice|period|join|joining|location|relocat|shift|"
+    r"resume|cv|attach|experience|expected|current|budget|available|availability|"
+    r"reschedul|cancel|withdraw|interview link|not able|unable|issue|problem|"
+    r"when|where|what|why|how|which|who)\b"
+)
+
+
+def is_pure_acknowledgement(latest_body: str) -> bool:
+    """True when the message is a courtesy note that needs no reply.
+
+    Replying to "Thanks, I will do that" is what made the agent feel relentless;
+    the candidate had no way to end the exchange except by going silent.
+    """
+    raw = latest_reply_text(latest_body or "").strip()
+    if not raw:
+        return False
+    if "?" in raw:
+        return False
+    text = normalize_position_text(raw)
+    if not text:
+        return False
+    words = text.split()
+    if len(words) > 25:
+        return False
+    if not any(phrase in text for phrase in ACKNOWLEDGEMENT_PHRASES):
+        return False
+    if ACKNOWLEDGEMENT_CONTENT_PATTERN.search(text):
+        return False
+    if re.search(r"\b\d{3,}\b", raw):
+        return False
+    substantive = [word for word in words if word not in ACKNOWLEDGEMENT_FILLER]
+    return len(substantive) <= 4
+
+
+def screening_issue_kind(issues: list[str]) -> str | None:
+    """Classify why screening_fit failed, so every failure has a route.
+
+    Previously only a salary failure could reach HR; a work-terms failure
+    re-entered the negotiation state forever with no exit.
+    """
+    if not issues:
+        return None
+    joined = " ".join(str(issue).lower() for issue in issues)
+    if "budget" in joined or "salary" in joined:
+        return "budget"
+    if "shift" in joined or "office" in joined or "terms" in joined or "location" in joined:
+        return "terms"
+    return "other"
+
+
+BUDGET_REJECTION_PATTERNS = (
+    r"\bcan(no|')?t\b",
+    r"\bcannot\b",
+    r"\bnot (ok|okay|comfortable|possible|acceptable|feasible|workable)\b",
+    r"\btoo low\b",
+    r"\btoo less\b",
+    r"\bvery low\b",
+    r"\bnot interested\b",
+    r"\bwon(')?t work\b",
+    r"\bdoes ?n(o|')?t work\b",
+    r"\bbelow my\b",
+    r"\bless than my\b",
+    r"\bnot able to\b",
+)
+
+BUDGET_ACCEPTANCE_PATTERNS = (
+    r"\b(i )?agree\b",
+    r"\bagreed\b",
+    r"\bi accept\b",
+    r"\bacceptable\b",
+    r"\bthat works\b",
+    r"\bworks for me\b",
+    r"\bfine (with|by) me\b",
+    r"\bi am fine\b",
+    r"\bi'?m fine\b",
+    r"\b(i am|i'?m) (ok|okay|comfortable)\b",
+    r"\bno issue\b",
+    r"\bno problem\b",
+    r"\bplease proceed\b",
+    r"\bproceed further\b",
+    r"\bgo ahead\b",
+    r"\bmove ahead\b",
+    r"\bmove forward\b",
+    r"\bready to (work|join|proceed)\b",
+    r"\bcan adjust\b",
+    r"\bwithin (my )?budget\b",
+)
+
+
+def deterministic_budget_signal(text: str, requirement: dict[str, Any] | None = None) -> str | None:
+    """Cheap, high-precision read of a budget answer, or None if unclear.
+
+    Deliberately does NOT scan for bare numbers. The previous implementation
+    returned "accepted" for any figure below the ceiling, so "my notice period
+    is 90 days" silently bypassed HR approval.
+    """
+    raw = latest_reply_text(text or "")
+    lowered = normalize_position_text(raw)
+    if not lowered:
+        return None
+    if any(re.search(pattern, lowered) for pattern in BUDGET_REJECTION_PATTERNS):
+        return "rejects"
+    if any(re.search(pattern, lowered) for pattern in BUDGET_ACCEPTANCE_PATTERNS):
+        return "accepts"
+    if re.fullmatch(r"(yes|yeah|yep|sure|ok|okay)\b.{0,20}", lowered.strip()):
+        return "accepts"
+    return None
+
+
+# Phrases that reveal the sender is not who the signature claims to be. The
+# mailbox signs as "HR Team", so telling a candidate their profile will be
+# "shared with the team" announces a forward to itself.
+PERSONA_LEAK_PATTERNS = (
+    r"\b(our|the|your) (hr )?team (will|would|can|is|are|has|have)\b",
+    r"\bwith (our|the) team\b",
+    r"\bto (our|the) (hr )?team\b",
+    r"\bhr team\b",
+    r"\bpass(ing|ed)? (this|it|your|the) .{0,20}(on|to|along)\b",
+    r"\bforward(ing|ed)? (this|it|your|the)\b",
+    r"\bescalat(e|es|ed|ing|ion)\b",
+    r"\binternal(ly)?\b",
+    r"\bour system\b",
+    r"\bin our records\b",
+    r"\bthe recruiter\b",
+    r"\bconcerned (department|team|person)\b",
+    r"\bai\b",
+    r"\bautomated\b",
+    r"\bbot\b",
+    r"\balgorithm\b",
+    r"\bats score\b",
+    r"\bdatabase\b",
+)
+
+# Legitimate references to a genuinely different, named human.
+PERSONA_LEAK_ALLOWLIST = (
+    r"\bhr manager\b",
+    r"\bhiring manager\b",
+)
+
+
+def persona_leak(body: str) -> str | None:
+    """Return the offending phrase if the reply breaks the HR persona."""
+    text = " ".join((body or "").split()).lower()
+    if not text:
+        return None
+    for allowed in PERSONA_LEAK_ALLOWLIST:
+        text = re.sub(allowed, " ", text)
+    for pattern in PERSONA_LEAK_PATTERNS:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(0)
+    return None
+
+
+def strip_persona_leak_lines(body: str) -> str:
+    """Drop the sentences that break persona, keeping the rest of the reply."""
+    kept_paragraphs = []
+    for paragraph in (body or "").split("\n\n"):
+        sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+        clean = [sentence for sentence in sentences if not persona_leak(sentence)]
+        rebuilt = " ".join(part.strip() for part in clean if part.strip()).strip()
+        if rebuilt:
+            kept_paragraphs.append(rebuilt)
+    result = "\n\n".join(kept_paragraphs).strip()
+    if not result or len(result.split()) < 6:
+        return recruiter_email_body(
+            "Thanks for getting back to me.",
+            "I have everything I need for now and will come back to you shortly with the next step.",
+        )
+    if not result.lower().startswith("hi"):
+        result = f"Hi,\n\n{result}"
+    return result
+
+
+# Fields safe to hand an LLM. Everything else on the application row - notably
+# attachment_payload (the raw CV bytes) and raw_cv_text - used to be serialized
+# straight into prompts by json.dumps(application, default=str).
+APPLICATION_PROMPT_FIELDS = (
+    "id",
+    "detected_position",
+    "matched_position",
+    "requirement_position",
+    "application_status",
+    "ats_score",
+    "jd_match_score",
+    "budget_min",
+    "budget_max",
+    "currency",
+    "needed_within_days",
+    "screening_details",
+    "screening_current_salary",
+    "screening_expected_salary",
+    "screening_current_location",
+    "screening_joining_days",
+    "interview_availability",
+    "interview_scheduled_at",
+    "budget_disclosed_at",
+    "budget_response",
+    "full_name",
+)
+
+
+def application_prompt_facts(application: dict[str, Any] | None) -> dict[str, Any]:
+    if not application:
+        return {}
+    facts = {
+        key: application.get(key)
+        for key in APPLICATION_PROMPT_FIELDS
+        if application.get(key) is not None
+    }
+    summary = application.get("cv_summary") or application.get("ai_short_description")
+    if summary:
+        facts["cv_summary"] = str(summary)[:1200]
+    return facts
 
 
 def is_interview_delay_reply(latest_body: str) -> bool:
@@ -1808,36 +1956,6 @@ def application_role_is_compatible(
     return roles_are_compatible(application_role, requested_role, thread_context)
 
 
-def is_design_role_text(value: str | None) -> bool:
-    tokens = position_tokens(value)
-    text = normalize_position_text(value)
-    design_tokens = {
-        "ui",
-        "ux",
-        "designer",
-        "design",
-        "figma",
-        "wireframe",
-        "wireframes",
-        "prototype",
-        "prototyping",
-        "usability",
-        "interface",
-    }
-    if tokens & design_tokens:
-        return True
-    return any(
-        phrase in text
-        for phrase in [
-            "user interface",
-            "user experience",
-            "product designer",
-            "visual designer",
-            "interaction designer",
-        ]
-    )
-
-
 ROLE_FAMILY_KEYWORDS = {
     "hr": {
         "hr",
@@ -1879,16 +1997,26 @@ ROLE_FAMILY_KEYWORDS = {
         "accountant",
         "accounting",
         "bookkeeping",
+        "bookkeeper",
         "gst",
         "tds",
         "tally",
         "ledger",
         "reconciliation",
         "payable",
+        "payables",
         "receivable",
+        "receivables",
+        "invoice",
+        "invoicing",
+        "quickbooks",
+        "xero",
+        "journal",
+        "audit",
     },
     "tax": {
         "tax",
+        "taxation",
         "irs",
         "1040",
         "1065",
@@ -1898,25 +2026,59 @@ ROLE_FAMILY_KEYWORDS = {
     },
     "it_support": {
         "desktop",
-        "support",
         "helpdesk",
-        "active",
-        "directory",
         "gpo",
         "troubleshooting",
         "hardware",
-        "network",
     },
+}
+
+# Suffixes stripped before family lookup so that bookkeeper/bookkeeping,
+# payable/payables and designer/design collapse onto the same key. The previous
+# exact-match lookup meant "US Bookkeeper" matched no family at all, which
+# silently skipped the family check and rejected every bookkeeping CV.
+ROLE_TOKEN_SUFFIXES = ("ers", "er", "ing", "ors", "or", "ists", "ist", "s")
+
+
+def stem_role_token(token: str) -> str:
+    lowered = (token or "").lower()
+    for suffix in ROLE_TOKEN_SUFFIXES:
+        if len(lowered) > len(suffix) + 3 and lowered.endswith(suffix):
+            return lowered[: -len(suffix)]
+    return lowered
+
+
+def stem_role_tokens(value: str | None) -> set[str]:
+    return {stem_role_token(token) for token in position_tokens(value)}
+
+
+STEMMED_ROLE_FAMILIES = {
+    family: {stem_role_token(word) for word in words}
+    for family, words in ROLE_FAMILY_KEYWORDS.items()
 }
 
 
 def role_families_from_text(value: str | None) -> set[str]:
-    tokens = position_tokens(value)
-    families = set()
-    for family, keywords in ROLE_FAMILY_KEYWORDS.items():
-        if tokens & keywords:
-            families.add(family)
-    return families
+    tokens = stem_role_tokens(value)
+    return {family for family, keywords in STEMMED_ROLE_FAMILIES.items() if tokens & keywords}
+
+
+def requirement_role_families(requirement: dict[str, Any] | None) -> set[str]:
+    """Role families implied by the requirement row itself.
+
+    Role knowledge belongs in the requirement HR created, not in this module.
+    Title and job description are both consulted so a newly added opening works
+    without touching the code.
+    """
+    if not requirement:
+        return set()
+    return role_families_from_text(
+        " ".join(
+            str(value)
+            for value in [requirement.get("position_title"), requirement.get("job_description")]
+            if value
+        )
+    )
 
 
 def roles_are_compatible(requested_role: str | None, cv_role: str | None, cv_text: str = "") -> bool:
@@ -1925,8 +2087,11 @@ def roles_are_compatible(requested_role: str | None, cv_role: str | None, cv_tex
         return True
 
     cv_role_text = normalize_position_text(cv_role)
-    cv_search_text = normalize_position_text(f"{cv_role or ''} {cv_text[:2500]}")
-    requested_words = position_tokens(requested_text)
+    cv_search_text = normalize_position_text(f"{cv_role or ''} {cv_text[:4000]}")
+    # Generic words like "us", "senior", "full" and "cycle" must not count toward
+    # the overlap ratio; "US Bookkeeper" would otherwise be half-satisfied by the
+    # letter pair "us" appearing anywhere in the CV.
+    requested_words = meaningful_role_tokens(requested_text)
     if not requested_words:
         return True
 
@@ -1935,33 +2100,14 @@ def roles_are_compatible(requested_role: str | None, cv_role: str | None, cv_tex
     if cv_role_text and cv_role_text in requested_text:
         return True
 
-    if "accountant" in requested_words:
-        accounting_keywords = {
-            "accountant",
-            "tally",
-            "gst",
-            "tds",
-            "invoice",
-            "invoices",
-            "bookkeeping",
-            "reconciliation",
-            "ledger",
-            "payable",
-            "receivable",
-        }
-        if accounting_keywords & position_tokens(cv_search_text):
-            return True
-
-    if is_design_role_text(requested_text) and is_design_role_text(cv_search_text):
-        return True
-
     requested_families = role_families_from_text(requested_text)
     cv_families = role_families_from_text(cv_search_text)
     if requested_families and requested_families & cv_families:
         return True
 
-    overlap = requested_words & position_tokens(cv_search_text)
-    return len(overlap) / len(requested_words) >= 0.66
+    cv_stems = stem_role_tokens(cv_search_text)
+    overlap = {word for word in requested_words if stem_role_token(word) in cv_stems}
+    return len(overlap) / len(requested_words) >= 0.5
 
 
 def extract_docx_text(path: Path) -> str:
@@ -1987,6 +2133,19 @@ def extract_pdf_text(path: Path) -> str:
     return "\n".join(pages).strip()
 
 
+def sanitize_db_text(value: Any) -> str:
+    """Strip bytes PostgreSQL refuses in a text column.
+
+    Some PDFs yield NUL and other C0 control characters. Inserting them raises
+    DataError mid-flight, which aborts processing after replies have already been
+    sent and leaves the message to be retried and re-answered.
+    """
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else str(value)
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+
+
 def extract_cv_text(filename: str, payload: bytes) -> str:
     suffix = Path(filename.lower()).suffix
     with TemporaryDirectory() as directory:
@@ -1994,11 +2153,11 @@ def extract_cv_text(filename: str, payload: bytes) -> str:
         path.write_bytes(payload)
 
         if suffix == ".txt":
-            return payload.decode("utf-8", errors="ignore")
+            return sanitize_db_text(payload.decode("utf-8", errors="ignore"))
         if suffix == ".docx":
-            return extract_docx_text(path)
+            return sanitize_db_text(extract_docx_text(path))
         if suffix == ".pdf":
-            return extract_pdf_text(path)
+            return sanitize_db_text(extract_pdf_text(path))
 
     return ""
 
@@ -2036,108 +2195,21 @@ def save_cv_attachment_file(application_id: int, filename: str, payload: bytes) 
 
 
 class RecruiterDatabase:
+    """PostgreSQL-backed store for the recruiter agent.
+
+    The SQL Server path was removed: it required rewriting every query by string
+    substitution (%s -> ?, NOW() -> SYSDATETIMEOFFSET(), LIMIT -> TOP), which
+    forced all SQL to the lowest common denominator and had already drifted out
+    of sync with the migrations.
+    """
+
     def __init__(self):
-        self.provider = DB_PROVIDER
-        if self.provider in {"mssql", "sqlserver", "sql_server"}:
-            if not MSSQL_CONNECTION_STRING:
-                raise RuntimeError("MSSQL_CONNECTION_STRING is required when DB_PROVIDER=mssql.")
-            pyodbc = require_package("pyodbc", "./venv/bin/python -m pip install pyodbc")
-            self.pyodbc = pyodbc
-            self.psycopg = None
-            try:
-                self.conn = pyodbc.connect(
-                    self.mssql_connection_string(MSSQL_CONNECTION_STRING),
-                    timeout=MSSQL_LOGIN_TIMEOUT_SECONDS,
-                )
-            except Exception as exc:
-                error_text = str(exc)
-                if "Can't open lib" in error_text or "Data source name not found" in error_text:
-                    raise RuntimeError(
-                        "SQL Server mode could not find a registered SQL Server ODBC driver. "
-                        f"Installed ODBC drivers: {self.pyodbc.drivers() or 'none'}. "
-                        "Install Microsoft ODBC Driver 18 with: sudo ./scripts/install_mssql_odbc_ubuntu.sh"
-                    ) from exc
-                if "Invalid value specified for connection string attribute" in error_text:
-                    raise RuntimeError(
-                        "SQL Server rejected one of the connection string attributes. "
-                        "For ODBC, use values like Encrypt=yes and TrustServerCertificate=yes. "
-                        "The app normalizes common .NET values automatically; check MSSQL_CONNECTION_STRING "
-                        f"if this still appears. Original error: {exc}"
-                    ) from exc
-                raise
-            self.provider = "mssql"
-        else:
-            if not DATABASE_URL:
-                raise RuntimeError("DATABASE_URL is required when DB_PROVIDER=postgres.")
-            psycopg = require_package("psycopg", "./venv/bin/python -m pip install psycopg[binary]")
-            self.pyodbc = None
-            self.psycopg = psycopg
-            self.conn = psycopg.connect(DATABASE_URL)
-            self.provider = "postgres"
-
-    def mssql_connection_string(self, value: str) -> str:
-        connection_string = self.normalize_mssql_connection_string(value)
-        if "driver=" not in connection_string.lower():
-            driver = MSSQL_ODBC_DRIVER.strip() or self.detect_mssql_driver()
-            connection_string = f"DRIVER={{{driver}}};{connection_string}"
-        if "connection timeout=" not in connection_string.lower() and "timeout=" not in connection_string.lower():
-            connection_string += f"Connection Timeout={MSSQL_LOGIN_TIMEOUT_SECONDS};"
-        if "login timeout=" not in connection_string.lower():
-            connection_string += f"Login Timeout={MSSQL_LOGIN_TIMEOUT_SECONDS};"
-        return connection_string
-
-    def normalize_mssql_connection_string(self, value: str) -> str:
-        normalized_parts = []
-        for raw_part in value.strip().split(";"):
-            part = raw_part.strip()
-            if not part:
-                continue
-            if "=" not in part:
-                normalized_parts.append(part)
-                continue
-            key, raw_value = part.split("=", 1)
-            key = key.strip()
-            raw_value = raw_value.strip()
-            key_lower = key.lower().replace(" ", "")
-            value_lower = raw_value.lower()
-
-            if key_lower in {"server", "datasource", "address", "addr", "networkaddress"}:
-                key = "SERVER"
-            elif key_lower in {"database", "initialcatalog"}:
-                key = "DATABASE"
-            elif key_lower in {"userid", "user", "uid"}:
-                key = "UID"
-            elif key_lower in {"password", "pwd"}:
-                key = "PWD"
-            if key_lower in {"encrypt", "trustservercertificate"} and value_lower in {"true", "false"}:
-                raw_value = "yes" if value_lower == "true" else "no"
-            if key_lower == "multipleactiveresultsets":
-                key = "MARS_Connection"
-                if value_lower in {"true", "false"}:
-                    raw_value = "yes" if value_lower == "true" else "no"
-
-            normalized_parts.append(f"{key}={raw_value}")
-        return ";".join(normalized_parts) + ";"
-
-    def detect_mssql_driver(self) -> str:
-        drivers = self.pyodbc.drivers() if self.pyodbc else []
-        preferred = [
-            "ODBC Driver 18 for SQL Server",
-            "ODBC Driver 17 for SQL Server",
-            "SQL Server Native Client 11.0",
-            "SQL Server",
-        ]
-        for driver in preferred:
-            if driver in drivers:
-                return driver
-        sql_drivers = [driver for driver in drivers if "sql server" in driver.lower()]
-        if sql_drivers:
-            return sql_drivers[-1]
-        raise RuntimeError(
-            "No SQL Server ODBC driver is registered on this machine. "
-            "Run: sudo ./scripts/install_mssql_odbc_ubuntu.sh. "
-            "Then verify with: python -c \"import pyodbc; print(pyodbc.drivers())\""
-        )
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL is required.")
+        psycopg = require_package("psycopg", "./venv/bin/python -m pip install psycopg[binary]")
+        self.psycopg = psycopg
+        self.conn = psycopg.connect(DATABASE_URL)
+        self.provider = "postgres"
 
     def close(self):
         try:
@@ -2145,43 +2217,7 @@ class RecruiterDatabase:
         except Exception:
             pass
 
-    def is_mssql(self) -> bool:
-        return self.provider == "mssql"
-
-    def sql(self, query: str) -> str:
-        if not self.is_mssql():
-            return query
-        query = query.replace("%s::jsonb", "?")
-        query = query.replace("%s", "?")
-        query = query.replace("::jsonb", "")
-        query = query.replace("NOW()", "SYSDATETIMEOFFSET()")
-        query = query.replace("LOWER(status) = 'open' DESC", "CASE WHEN LOWER(status) = 'open' THEN 1 ELSE 0 END DESC")
-        query = query.replace("LOWER(TRIM(status))", "LOWER(LTRIM(RTRIM(status)))")
-        query = query.replace(
-            "needed_within_days NULLS LAST",
-            "CASE WHEN needed_within_days IS NULL THEN 1 ELSE 0 END, needed_within_days",
-        )
-        return self.apply_mssql_limit(query)
-
-    def apply_mssql_limit(self, query: str) -> str:
-        match = re.search(r"\s+LIMIT\s+(\d+)\s*$", query, flags=re.I)
-        if not match:
-            return query
-        limit = match.group(1)
-        without_limit = query[: match.start()]
-        if re.search(r"\bORDER\s+BY\b", without_limit, flags=re.I):
-            return f"{without_limit} OFFSET 0 ROWS FETCH NEXT {limit} ROWS ONLY"
-        return re.sub(r"^\s*SELECT\b", f"SELECT TOP {limit}", without_limit, count=1, flags=re.I)
-
     def rows(self, query: str, params: tuple = ()) -> list[dict[str, Any]]:
-        if self.is_mssql():
-            cursor = self.conn.cursor()
-            try:
-                cursor.execute(self.sql(query), params)
-                columns = [column[0] for column in cursor.description]
-                return [dict(zip(columns, row)) for row in cursor.fetchall()]
-            finally:
-                cursor.close()
         with self.conn.cursor(row_factory=self.psycopg.rows.dict_row) as cursor:
             cursor.execute(query, params)
             return list(cursor.fetchall())
@@ -2191,30 +2227,11 @@ class RecruiterDatabase:
         return rows[0] if rows else None
 
     def execute(self, query: str, params: tuple = ()):
-        if self.is_mssql():
-            cursor = self.conn.cursor()
-            try:
-                cursor.execute(self.sql(query), params)
-                self.conn.commit()
-            finally:
-                cursor.close()
-            return
         with self.conn.cursor() as cursor:
-            cursor.execute(self.sql(query), params)
+            cursor.execute(query, params)
         self.conn.commit()
 
     def init_schema(self):
-        if self.is_mssql():
-            cursor = self.conn.cursor()
-            try:
-                for statement in MSSQL_CREATE_TABLES_SQL.split(";"):
-                    statement = statement.strip()
-                    if statement:
-                        cursor.execute(statement)
-                self.conn.commit()
-            finally:
-                cursor.close()
-            return
         with self.conn.cursor() as cursor:
             for statement in CREATE_TABLES_SQL.split(";"):
                 statement = statement.strip()
@@ -2254,6 +2271,202 @@ class RecruiterDatabase:
             (source, *event_types, datetime.now(timezone.utc) - timedelta(hours=hours)),
         )
         return int(row["count"] or 0) if row else 0
+
+    def claim_provider_message(self, provider_message_id: str) -> bool:
+        """Atomically claim an inbound message. False means it was already handled.
+
+        This is the guard against duplicate Graph notifications; it must not be
+        replaced by an in-process lock, which does not survive a restart.
+        """
+        message_id = (provider_message_id or "").strip()
+        if not message_id:
+            return True
+        row = self.one(
+            """
+            INSERT INTO recruiter_processed_messages (provider_message_id)
+            VALUES (%s)
+            ON CONFLICT (provider_message_id) DO NOTHING
+            RETURNING provider_message_id
+            """,
+            (message_id,),
+        )
+        return row is not None
+
+    def release_provider_message(self, provider_message_id: str):
+        """Undo a claim so a genuinely failed message can be retried."""
+        message_id = (provider_message_id or "").strip()
+        if not message_id:
+            return
+        self.execute(
+            "DELETE FROM recruiter_processed_messages WHERE provider_message_id = %s",
+            (message_id,),
+        )
+
+    def record_sent_reply(
+        self,
+        application_id: int | None,
+        recipient: str,
+        scenario: str,
+        body: str,
+        provider_message_id: str | None = None,
+    ):
+        self.execute(
+            """
+            INSERT INTO recruiter_sent_replies
+            (application_id, recipient, scenario, body_hash, provider_message_id)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                application_id,
+                clean_email(recipient) or (recipient or ""),
+                scenario,
+                hashlib.sha256((body or "").encode("utf-8")).hexdigest(),
+                provider_message_id,
+            ),
+        )
+
+    def sent_reply_count(
+        self,
+        application_id: int | None,
+        recipient: str,
+        scenario: str,
+        hours: int = REPLY_SCENARIO_COOLDOWN_HOURS,
+    ) -> int:
+        since = datetime.now(timezone.utc) - timedelta(hours=hours)
+        if application_id:
+            row = self.one(
+                """
+                SELECT COUNT(*) AS count FROM recruiter_sent_replies
+                WHERE application_id = %s AND scenario = %s AND sent_at >= %s
+                """,
+                (application_id, scenario, since),
+            )
+        else:
+            row = self.one(
+                """
+                SELECT COUNT(*) AS count FROM recruiter_sent_replies
+                WHERE recipient = %s AND scenario = %s AND sent_at >= %s
+                """,
+                (clean_email(recipient) or (recipient or ""), scenario, since),
+            )
+        return int(row["count"] or 0) if row else 0
+
+    def scenario_ever_sent(self, application_id: int | None, recipient: str, scenario: str) -> bool:
+        """Has this scenario ever been sent for this application?
+
+        Used for genuinely once-per-application messages such as the budget
+        disclosure, where a 24h cooldown is not strong enough.
+        """
+        if application_id:
+            row = self.one(
+                "SELECT 1 AS hit FROM recruiter_sent_replies WHERE application_id = %s AND scenario = %s LIMIT 1",
+                (application_id, scenario),
+            )
+        else:
+            row = self.one(
+                "SELECT 1 AS hit FROM recruiter_sent_replies WHERE recipient = %s AND scenario = %s LIMIT 1",
+                (clean_email(recipient) or (recipient or ""), scenario),
+            )
+        return row is not None
+
+    def agent_sent_message_ids(self, limit: int = 500) -> set[str]:
+        rows = self.rows(
+            """
+            SELECT provider_message_id FROM recruiter_sent_replies
+            WHERE provider_message_id IS NOT NULL
+            ORDER BY sent_at DESC LIMIT %s
+            """,
+            (limit,),
+        )
+        return {str(row["provider_message_id"]) for row in rows if row.get("provider_message_id")}
+
+    def mark_human_handled(self, application_id: int, reason: str):
+        self.execute(
+            """
+            UPDATE recruiter_applications
+            SET application_status = 'human_handled',
+                human_handled_at = NOW(),
+                hr_escalation_reason = COALESCE(hr_escalation_reason, %s)
+            WHERE id = %s
+            """,
+            (reason, application_id),
+        )
+
+    def mark_interview_link_sent(self, application_id: int):
+        """Explicit, idempotent transition for 'the candidate has the link'.
+
+        Previously this only happened as a side effect of minting a new token
+        inside ensure_interview_link(), so re-sending an existing link left the
+        status untouched and the candidate stuck in a resend loop.
+        """
+        self.execute(
+            """
+            UPDATE recruiter_applications
+            SET application_status = 'interview_link_sent',
+                interview_link_created_at = COALESCE(interview_link_created_at, NOW())
+            WHERE id = %s
+              AND LOWER(COALESCE(application_status, '')) NOT IN
+                  ('interview_started', 'interview_completed', 'interview_on_hold_hr_review',
+                   'interview_rejected', 'interview_scheduled', 'human_handled')
+            """,
+            (application_id,),
+        )
+
+    def mark_budget_disclosed(self, application_id: int, screening_details: dict[str, Any]):
+        self.execute(
+            """
+            UPDATE recruiter_applications
+            SET application_status = 'budget_disclosed',
+                screening_details = %s::jsonb,
+                budget_disclosed_at = COALESCE(budget_disclosed_at, NOW())
+            WHERE id = %s
+            """,
+            (json.dumps(screening_details), application_id),
+        )
+
+    def record_budget_response(self, application_id: int, response: str, screening_details: dict[str, Any]):
+        self.execute(
+            """
+            UPDATE recruiter_applications
+            SET budget_response = %s,
+                screening_details = %s::jsonb
+            WHERE id = %s
+            """,
+            (response, json.dumps(screening_details), application_id),
+        )
+
+    def open_application_for_candidate(self, candidate_email: str, requirement_id: int | None) -> dict[str, Any] | None:
+        """Find an existing live application for this person and role.
+
+        Without this, a candidate who starts a second email thread for the same
+        opening gets a brand new application with no memory of the first, and is
+        asked for a CV they already sent.
+        """
+        email_address = clean_email(candidate_email)
+        if not email_address:
+            return None
+        closed = tuple(FINAL_AGENT_STATUSES | {"human_handled"})
+        placeholders = ", ".join(["%s"] * len(closed))
+        params: list[Any] = [email_address, email_address]
+        requirement_clause = ""
+        if requirement_id:
+            requirement_clause = "AND ra.requirement_id = %s"
+            params.append(requirement_id)
+        params.extend(closed)
+        return self.one(
+            f"""
+            SELECT ra.*, rr.position_title AS requirement_position
+            FROM recruiter_applications ra
+            LEFT JOIN recruitment_requirements rr ON rr.id = ra.requirement_id
+            WHERE (LOWER(COALESCE(ra.candidate_email, '')) = %s
+                   OR LOWER(COALESCE(ra.source_email, '')) = %s)
+              {requirement_clause}
+              AND LOWER(COALESCE(ra.application_status, '')) NOT IN ({placeholders})
+            ORDER BY ra.created_at DESC
+            LIMIT 1
+            """,
+            tuple(params),
+        )
 
     def mark_manual_hr_review(self, application_id: int, reason: str):
         self.execute(
@@ -2707,37 +2920,6 @@ class RecruiterDatabase:
             evaluation.get("ats_score"),
             json.dumps(evaluation),
         )
-        if self.is_mssql():
-            cursor = self.conn.cursor()
-            try:
-                cursor.execute(
-                    """
-                    INSERT INTO recruiter_candidates
-                    (
-                        candidate_uid, source_email, candidate_email, referrer_email,
-                        submission_type, full_name, phone, location,
-                        linkedin_url, portfolio_url, current_title, current_company,
-                        total_experience_years, skills, education, work_history,
-                        certifications, raw_cv_text, cv_summary, ats_score, ai_evaluation
-                    )
-                    OUTPUT INSERTED.id
-                    VALUES
-                    (
-                        ?, ?, ?, ?,
-                        ?, ?, ?, ?,
-                        ?, ?, ?, ?,
-                        ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?
-                    )
-                    """,
-                    values,
-                )
-                candidate_id = cursor.fetchone()[0]
-                self.conn.commit()
-                return candidate_id
-            finally:
-                cursor.close()
-
         with self.conn.cursor() as cursor:
             cursor.execute(
                 """
@@ -2806,50 +2988,6 @@ class RecruiterDatabase:
             attachment_payload,
             inbox_email.received_at,
         )
-        if self.is_mssql():
-            existing = self.one(
-                """
-                SELECT id
-                FROM recruiter_applications
-                WHERE email_message_id = %s AND attachment_sha256 = %s
-                LIMIT 1
-                """,
-                (inbox_email.message_id, attachment_sha256),
-            )
-            if existing:
-                return existing["id"]
-            cursor = self.conn.cursor()
-            try:
-                cursor.execute(
-                    """
-                    INSERT INTO recruiter_applications
-                    (
-                        application_uid, candidate_id, requirement_id, email_message_id,
-                        email_thread_id, source_email, candidate_email, referrer_email, submission_type,
-                        email_subject, detected_position, matched_position,
-                        application_status, ats_score, jd_match_score, strengths, risks,
-                        missing_requirements, ai_short_description, ai_evaluation,
-                        attachment_filename, attachment_sha256, attachment_payload, received_at
-                    )
-                    OUTPUT INSERTED.id
-                    VALUES
-                    (
-                        ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?,
-                        ?, ?, ?,
-                        ?, ?, ?, ?, ?,
-                        ?, ?, ?,
-                        ?, ?, ?, ?
-                    )
-                    """,
-                    values,
-                )
-                application_id = cursor.fetchone()[0]
-                self.conn.commit()
-                return application_id
-            finally:
-                cursor.close()
-
         with self.conn.cursor() as cursor:
             cursor.execute(
                 """
@@ -2982,7 +3120,7 @@ class RecruiterInbox:
         inbox: imaplib.IMAP4_SSL,
         provider_thread_id: str,
         parsed: email.message.EmailMessage,
-        limit: int = 10,
+        limit: int = THREAD_FETCH_LIMIT,
     ) -> list[ThreadMessage]:
         return [parse_thread_message(b"", parsed)]
 
@@ -3030,7 +3168,7 @@ class GmailIMAPProvider(RecruiterInbox):
         inbox: imaplib.IMAP4_SSL,
         provider_thread_id: str,
         parsed: email.message.EmailMessage,
-        limit: int = 10,
+        limit: int = THREAD_FETCH_LIMIT,
     ) -> list[ThreadMessage]:
         gmail_thread_id = provider_thread_id
         if not gmail_thread_id:
@@ -3152,9 +3290,11 @@ class MicrosoftGraphProvider:
         timeout = kwargs.pop("timeout", 30)
         headers["Authorization"] = f"Bearer {self.token()}"
         headers.setdefault("Accept", "application/json")
+        # @odata.nextLink values are absolute URLs and must not be prefixed again.
+        url = path if path.lower().startswith("http") else f"{self.base_url}{path}"
         response = self.requests.request(
             method,
-            f"{self.base_url}{path}",
+            url,
             headers=headers,
             timeout=timeout,
             **kwargs,
@@ -3275,23 +3415,74 @@ class MicrosoftGraphProvider:
             messages.append(self.message_to_inbox_email(message))
         return messages
 
-    def fetch_thread_messages(self, conversation_id: str, limit: int = 10) -> list[ThreadMessage]:
+    def fetch_thread_messages(self, conversation_id: str, limit: int = THREAD_FETCH_LIMIT) -> list[ThreadMessage]:
+        """Return the NEWEST `limit` messages of a conversation, oldest-first.
+
+        Microsoft Graph returns a filtered /messages collection in ascending
+        receivedDateTime order, so `$top` alone yields the OLDEST messages and
+        freezes the agent's view of any thread longer than `limit`. The explicit
+        descending `$orderby` is what makes this correct.
+        """
         if not conversation_id:
             return []
         safe_conversation_id = conversation_id.replace("'", "''")
+        select = "id,internetMessageId,subject,body,bodyPreview,from,receivedDateTime"
         params = {
             "$filter": f"conversationId eq '{safe_conversation_id}'",
+            "$orderby": "receivedDateTime desc",
             "$top": str(limit),
-            "$select": "id,internetMessageId,subject,body,bodyPreview,from,receivedDateTime",
+            "$select": select,
         }
-        data = self.request(
-            "GET",
-            f"/users/{self.mailbox}/messages",
-            params=params,
-            headers={"Prefer": 'outlook.body-content-type="text"'},
-        )
-        messages = [parse_graph_thread_message(message) for message in data.get("value", [])]
-        return sorted(messages, key=lambda item: item.received_at.isoformat() if item.received_at else "")
+        try:
+            data = self.request(
+                "GET",
+                f"/users/{self.mailbox}/messages",
+                params=params,
+                headers={"Prefer": 'outlook.body-content-type="text"'},
+            )
+            messages = [parse_graph_thread_message(message) for message in data.get("value", [])]
+        except RuntimeError as exc:
+            # Some tenants reject $filter + $orderby on /messages with an
+            # InefficientFilter error. Fall back to paging and keeping the tail.
+            log_json(
+                logging.WARNING,
+                "graph_thread_orderby_unsupported_paging_instead",
+                conversation_id=conversation_id,
+                error=str(exc)[:300],
+            )
+            messages = self.fetch_thread_messages_by_paging(safe_conversation_id, select, limit)
+
+        messages.sort(key=lambda item: item.received_at.isoformat() if item.received_at else "")
+        return messages[-limit:]
+
+    def fetch_thread_messages_by_paging(
+        self,
+        safe_conversation_id: str,
+        select: str,
+        limit: int,
+    ) -> list[ThreadMessage]:
+        """Page an ascending conversation and keep only the newest `limit` messages."""
+        collected: list[ThreadMessage] = []
+        params = {
+            "$filter": f"conversationId eq '{safe_conversation_id}'",
+            "$top": "50",
+            "$select": select,
+        }
+        path = f"/users/{self.mailbox}/messages"
+        for _ in range(20):  # hard page cap; 1000 messages is far beyond any real thread
+            data = self.request(
+                "GET",
+                path,
+                params=params,
+                headers={"Prefer": 'outlook.body-content-type="text"'},
+            )
+            collected.extend(parse_graph_thread_message(message) for message in data.get("value", []))
+            next_link = data.get("@odata.nextLink")
+            if not next_link:
+                break
+            path = next_link
+            params = None
+        return collected[-limit:] if len(collected) > limit else collected
 
     def fetch_attachments(self, message_id: str) -> list[tuple[str, bytes]]:
         data = self.request(
@@ -3326,11 +3517,17 @@ class MicrosoftGraphProvider:
             json={"isRead": False},
         )
 
-    def send_reply(self, inbox_email: InboxEmail, subject: str, body: str, to_email: str | None = None):
+    def send_reply(self, inbox_email: InboxEmail, subject: str, body: str, to_email: str | None = None) -> str | None:
+        """Send a threaded reply. Returns the internetMessageId when known.
+
+        The returned id is recorded in the reply ledger so the agent can later
+        tell its own outbound messages apart from ones a human typed into the
+        shared mailbox.
+        """
         recipient = to_email or inbox_email.sender
         if not RECRUITER_REPLY_ENABLED:
             print(f"[reply disabled] To: {recipient} | Subject: {subject}\n{body}")
-            return
+            return None
 
         body = body.replace("\n", "\r\n").replace("\r\r\n", "\r\n")
         message_id = inbox_email.uid.decode()
@@ -3343,6 +3540,7 @@ class MicrosoftGraphProvider:
             draft_id = draft.get("id")
             if not draft_id:
                 raise RuntimeError(f"Microsoft Graph createReply did not return a draft id: {draft}")
+            sent_internet_id = draft.get("internetMessageId")
             draft_body = (draft.get("body") or {}).get("content") or ""
             reply_html = append_signature_if_needed(email_body_to_html(body), draft_body)
             content = f"{reply_html}<br>{draft_body}" if draft_body else reply_html
@@ -3359,7 +3557,17 @@ class MicrosoftGraphProvider:
                 f"/users/{self.mailbox}/messages/{quote(draft_id, safe='')}/send",
                 json={},
             )
-            return
+            if not sent_internet_id:
+                try:
+                    sent = self.request(
+                        "GET",
+                        f"/users/{self.mailbox}/messages/{quote(draft_id, safe='')}",
+                        params={"$select": "internetMessageId"},
+                    )
+                    sent_internet_id = sent.get("internetMessageId")
+                except Exception:
+                    sent_internet_id = None
+            return sent_internet_id
 
         base_subject = inbox_email.subject or subject
         reply_subject = base_subject if base_subject.lower().startswith("re:") else f"Re: {base_subject}"
@@ -3376,6 +3584,7 @@ class MicrosoftGraphProvider:
                 "saveToSentItems": True,
             },
         )
+        return None
 
     def send_direct_email(self, to_email: str, subject: str, body: str):
         if not RECRUITER_REPLY_ENABLED:
@@ -3701,11 +3910,24 @@ Rules:
 - Use short paragraphs with blank lines between them.
 - Be warm, concise, and professional.
 - Do not sound automated.
-- Do not mention internal systems, database, ATS, AI, LLM, logs, matching logic, or scores.
+
+Voice (important):
+- You ARE the HR team for this company. Write in the first person ("I", "we").
+- Never refer to "the team", "our team", "our HR team", "the recruiter", or "the
+  concerned department" as if they were someone else. You are them.
+- Never say a message will be forwarded, passed on, escalated, shared internally,
+  reviewed internally, or sent to anyone else. Decisions happen with you.
+- Never say "in our records", "in our system", or "our system shows".
+- Never mention systems, tools, automation, AI, databases, scores, or matching.
+
+Content:
 - Do not invent interviews, shortlisting, salaries, deadlines, or openings that are not in the facts.
+- Never ask for information that already appears in the facts as received or known.
+  If the facts list what is still missing, ask only for those items and briefly
+  acknowledge what you already have.
 - If the facts say CV is required, clearly ask for the CV as PDF, DOCX, or TXT.
-- If the facts say no active opening, say it politely and say we will keep the profile for future suitable roles.
-- If the facts say application received, acknowledge receipt and say the team will review it.
+- If the facts say no active opening, say so politely and say you will keep the profile for future suitable roles.
+- If the facts say application received, acknowledge receipt and say you will come back to them.
 - Do not include a signature. The mailer adds the HR signature separately.
 
 Scenario:
@@ -3939,16 +4161,23 @@ CV text:
 
     @traceable(name="extract_screening_answers")
     def extract_screening_answers(self, inbox_email: InboxEmail, application: dict[str, Any]) -> dict[str, Any]:
+        """Extract only what is NEW in the latest reply.
+
+        Values already stored on the application are supplied as known facts
+        rather than re-derived from the thread, so a value cannot be "un-learned"
+        when the message that carried it falls outside the context window. The
+        caller merges the result over the stored answers.
+        """
         thread_context = build_thread_context(inbox_email)
+        known = json_dict(application.get("screening_details"))
         return self.json_call(
             f"""
 Return only valid JSON.
-Read the full thread and extract the latest known screening answers.
-If the candidate corrected a previous value, use the latest corrected value.
-If a value was given earlier and not changed later, keep the earlier value.
-For salary, return numeric annual amount in the same broad unit as the requirement budget when possible.
-If candidate says 6 LPA or 6 lakh, return 600000.
-If unknown, use null.
+Extract the candidate's screening answers.
+Prefer the newest message. If the candidate corrected a value, use the corrected one.
+Anything listed under "Already known" is confirmed; repeat it unless the candidate changed it.
+For salary, return the numeric annual amount. If candidate says 6 LPA or 6 lakh, return 600000.
+If a value is genuinely unknown, use null.
 
 JSON schema:
 {{
@@ -3961,16 +4190,63 @@ JSON schema:
   "notes": "short notes"
 }}
 
-Requirement/application:
-{json.dumps(application, default=str)}
+Already known (do not lose these):
+{json.dumps(known, default=str)}
+
+Role and budget:
+{json.dumps(application_prompt_facts(application), default=str)}
 
 Work terms:
 {json.dumps(screening_work_terms())}
+
+Candidate's latest message:
+{latest_reply_text(inbox_email.body)[:2000]}
 
 Email thread:
 {thread_context[:8000]}
 """
         )
+
+    @traceable(name="classify_budget_response")
+    def classify_budget_response(self, inbox_email: InboxEmail, application: dict[str, Any]) -> dict[str, Any]:
+        """Read one thing only: did the candidate accept the stated range?
+
+        Deliberately scoped to the latest reply. Handing this the whole thread is
+        what let unrelated numbers and older messages contaminate the decision.
+        """
+        latest = latest_reply_text(inbox_email.body)[:1500]
+        try:
+            return self.json_call(
+                f"""
+Return only valid JSON.
+The candidate was told the salary range for this role and asked whether it works for them.
+Classify ONLY their answer to that question.
+
+Ignore notice periods, dates, years of experience, phone numbers, and any other
+number that is not a salary. A number alone is never an answer.
+
+  "accepts"  - they agree to the stated range
+  "rejects"  - they decline it
+  "counter"  - they propose a different figure
+  "unclear"  - anything else, including no direct answer
+
+JSON schema:
+{{
+  "response": "accepts|rejects|counter|unclear",
+  "counter_amount": null,
+  "evidence": "the exact words that decided it"
+}}
+
+Stated range:
+{requirement_budget_text(application)}
+
+Candidate's reply:
+{latest}
+"""
+            )
+        except Exception as exc:
+            log_json(logging.WARNING, "classify_budget_response_failed", error=str(exc)[:300])
+            return {}
 
     @traceable(name="extract_interview_schedule")
     def extract_interview_schedule(self, inbox_email: InboxEmail, application: dict[str, Any]) -> dict[str, Any]:
@@ -3996,7 +4272,7 @@ Current local datetime:
 {now_text}
 
 Application:
-{json.dumps(application, default=str)}
+{json.dumps(application_prompt_facts(application), default=str)}
 
 Email thread:
 {thread_context[:8000]}
@@ -4016,6 +4292,118 @@ class AIRecruiterAgent:
 
     def init_schema(self):
         self.db.init_schema()
+
+    def send_candidate_reply(
+        self,
+        inbox_email: InboxEmail,
+        subject: str,
+        body: str,
+        scenario: str,
+        application: dict[str, Any] | None = None,
+        to_email: str | None = None,
+    ) -> bool:
+        """The single gate every candidate-facing email passes through.
+
+        Three guarantees are enforced here rather than in each caller, because
+        the callers are exactly what kept getting them wrong:
+          1. the same scenario is never repeated inside the cooldown window
+          2. some scenarios are never repeated at all
+          3. a reply that breaks the HR persona is downgraded, not sent
+
+        Returns True if an email actually went out.
+        """
+        application_id = (application or {}).get("id")
+        recipient = to_email or inbox_email.sender
+
+        if scenario in ONCE_PER_APPLICATION_SCENARIOS:
+            already_sent = self.db.scenario_ever_sent(application_id, recipient, scenario)
+        else:
+            already_sent = self.db.sent_reply_count(application_id, recipient, scenario) > 0
+
+        if already_sent:
+            log_json(
+                logging.WARNING,
+                "duplicate_reply_suppressed",
+                **inbox_email_summary(inbox_email),
+                scenario=scenario,
+                application_id=application_id,
+            )
+            trace_recruiter_event(
+                "duplicate_reply_suppressed",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={"scenario": scenario, "application_id": application_id},
+                tags=["guardrail"],
+            )
+            self.db.log_email_event(
+                inbox_email,
+                "duplicate_reply_suppressed",
+                {
+                    "scenario": scenario,
+                    "application_id": application_id,
+                    "no_candidate_reply_sent": True,
+                },
+            )
+            # The agent wanted to repeat itself. That is the signal that this
+            # thread has stopped making progress, so hand it to a human.
+            self.notify_manual_hr_review(
+                inbox_email,
+                application,
+                f"The agent tried to send the '{scenario}' message again. "
+                "The conversation is not progressing and needs a person.",
+                event_type="repeat_reply_handoff_to_hr",
+                mark_application=bool(application_id),
+            )
+            return False
+
+        leak = persona_leak(body)
+        if leak:
+            log_json(
+                logging.WARNING,
+                "persona_leak_detected",
+                **inbox_email_summary(inbox_email),
+                scenario=scenario,
+                phrase=leak,
+            )
+            trace_recruiter_event(
+                "persona_leak_detected",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={"scenario": scenario, "phrase": leak},
+                tags=["guardrail"],
+            )
+            body = strip_persona_leak_lines(body)
+
+        provider_message_id = self.mailer.send_reply(inbox_email, subject, body, to_email=to_email)
+        self.db.record_sent_reply(application_id, recipient, scenario, body, provider_message_id)
+        log_json(
+            logging.INFO,
+            "candidate_reply_sent",
+            **inbox_email_summary(inbox_email),
+            scenario=scenario,
+            application_id=application_id,
+        )
+        return True
+
+    def thread_taken_over_by_human(self, inbox_email: InboxEmail) -> bool:
+        """True when the newest outbound message in this thread was not ours.
+
+        A colleague replying from the shared mailbox leaves no status behind, so
+        without this the agent talks straight over them.
+        """
+        messages = inbox_email.thread_messages or []
+        if not messages:
+            return False
+        mailbox = clean_email(MICROSOFT_MAILBOX) or clean_email(RECRUITER_FROM_EMAIL)
+        outbound = [
+            message
+            for message in messages
+            if mailbox and clean_email(message.sender) == mailbox
+        ]
+        if not outbound:
+            return False
+        latest_outbound = outbound[-1]
+        if not latest_outbound.message_id:
+            return False
+        return latest_outbound.message_id not in self.db.agent_sent_message_ids()
 
     def notify_manual_hr_review(
         self,
@@ -4070,19 +4458,25 @@ class AIRecruiterAgent:
             {"cv_required": True, "supported_cv_formats": ["PDF", "DOCX", "TXT"]},
             fallback_body,
         )
-        self.mailer.send_reply(
+        self.send_candidate_reply(
             inbox_email,
             f"CV required: {inbox_email.subject}",
             body,
+            scenario="missing_cv",
         )
 
-    def reply_followup_missing_cv(self, inbox_email: InboxEmail, requirement: dict[str, Any] | None):
+    def reply_followup_missing_cv(
+        self,
+        inbox_email: InboxEmail,
+        requirement: dict[str, Any] | None,
+        application: dict[str, Any] | None = None,
+    ):
         role = requirement["position_title"] if requirement else None
         role_text = f" for {role}" if role else ""
         fallback_body = recruiter_email_body(
             "Thanks for following up.",
-            f"I checked this thread. We still need your updated CV{role_text} before we can review your application properly.",
-            "Please send it as a PDF, DOCX, or TXT attachment, and we will take it from there.",
+            f"I still need your updated CV{role_text} before I can take your application further.",
+            "Please send it as a PDF, DOCX, or TXT attachment and I will pick it up from there.",
         )
         body = self.ai.draft_reply(
             inbox_email,
@@ -4090,19 +4484,27 @@ class AIRecruiterAgent:
             {"cv_required": True, "role": role, "supported_cv_formats": ["PDF", "DOCX", "TXT"]},
             fallback_body,
         )
-        self.mailer.send_reply(
+        self.send_candidate_reply(
             inbox_email,
             f"CV required: {inbox_email.subject}",
             body,
+            scenario="followup_missing_cv",
+            application=application,
         )
 
-    def reply_wrong_cv(self, inbox_email: InboxEmail, requested_position: str | None, cv_position: str | None):
+    def reply_wrong_cv(
+        self,
+        inbox_email: InboxEmail,
+        requested_position: str | None,
+        cv_position: str | None,
+        application: dict[str, Any] | None = None,
+    ):
         requested_text = f" for {requested_position}" if requested_position else ""
-        cv_text = f" The CV looks closer to a {cv_position} profile." if cv_position else ""
+        cv_text = f" It reads closer to a {cv_position} profile." if cv_position else ""
         fallback_body = recruiter_email_body(
             "Thanks for sharing the CV.",
-            f"I checked it against this email thread, and we were expecting a CV{requested_text}. This attachment does not seem to match that role.{cv_text}",
-            "Could you please verify and send the correct CV? We will review it as soon as we receive the right one.",
+            f"I was expecting a CV{requested_text}, and this attachment does not look like a match.{cv_text}",
+            "Could you check and send the right one? I will review it as soon as it arrives.",
         )
         body = self.ai.draft_reply(
             inbox_email,
@@ -4114,17 +4516,19 @@ class AIRecruiterAgent:
             },
             fallback_body,
         )
-        self.mailer.send_reply(
+        self.send_candidate_reply(
             inbox_email,
             f"Correct CV required: {inbox_email.subject}",
             body,
+            scenario="wrong_cv",
+            application=application,
         )
 
     def reply_no_opening(self, inbox_email: InboxEmail, position: str | None):
         role_text = f" for {position}" if position else ""
         fallback_body = recruiter_email_body(
             "Thanks for sharing your profile.",
-            f"At the moment, we do not have an active opening{role_text}. I have saved your details, and we will reach out if a suitable role opens up.",
+            f"I do not have an active opening{role_text} at the moment. I have kept your details on file and will reach out if a suitable role opens up.",
         )
         body = self.ai.draft_reply(
             inbox_email,
@@ -4132,16 +4536,17 @@ class AIRecruiterAgent:
             {"active_opening": False, "position": position, "profile_saved": True},
             fallback_body,
         )
-        self.mailer.send_reply(
+        self.send_candidate_reply(
             inbox_email,
             f"Application update: {inbox_email.subject}",
             body,
+            scenario="no_opening",
         )
 
     def reply_india_location_only(self, inbox_email: InboxEmail):
         fallback_body = recruiter_email_body(
             "Thanks for sharing your CV.",
-            "At the moment, we are hiring only for candidates based in India. Because the contact details in the CV do not appear to be for India, we will not be able to proceed with this application right now.",
+            "At the moment I am hiring only for candidates based in India. The contact details in the CV do not appear to be Indian, so I will not be able to take this application forward right now.",
             "Wishing you all the best in your job search.",
         )
         body = self.ai.draft_reply(
@@ -4150,30 +4555,38 @@ class AIRecruiterAgent:
             {"india_only_hiring": True, "do_not_proceed": True},
             fallback_body,
         )
-        self.mailer.send_reply(
+        self.send_candidate_reply(
             inbox_email,
             f"Application update: {inbox_email.subject}",
             body,
+            scenario="india_location_only",
         )
 
-    def reply_received(self, inbox_email: InboxEmail):
+    def reply_received(self, inbox_email: InboxEmail, application: dict[str, Any] | None = None):
         fallback_body = recruiter_email_body(
             "Thanks for applying and sharing your CV.",
-            "We have received your application. Our team will review it and contact you if your profile matches the role.",
+            "I have received your application and will come back to you shortly with the next step.",
         )
         body = self.ai.draft_reply(
             inbox_email,
             "candidate applied for an active role and shared a CV",
-            {"application_received": True, "next_step": "internal review"},
+            {"application_received": True, "next_step": "under review"},
             fallback_body,
         )
-        self.mailer.send_reply(
+        self.send_candidate_reply(
             inbox_email,
             f"Application received: {inbox_email.subject}",
             body,
+            scenario="application_received",
+            application=application,
         )
 
-    def reply_screening_questions(self, inbox_email: InboxEmail, requirement: dict[str, Any] | None):
+    def reply_screening_questions(
+        self,
+        inbox_email: InboxEmail,
+        requirement: dict[str, Any] | None,
+        application: dict[str, Any] | None = None,
+    ):
         role = requirement["position_title"] if requirement else None
         fallback_body = recruiter_email_body(
             "Thanks for applying and sharing your CV.",
@@ -4191,24 +4604,54 @@ class AIRecruiterAgent:
             },
             fallback_body,
         )
-        self.mailer.send_reply(
+        self.send_candidate_reply(
             inbox_email,
             f"Application next steps: {inbox_email.subject}",
             body,
+            scenario="screening_questions",
+            application=application,
         )
 
-    def reply_screening_missing_details(self, inbox_email: InboxEmail, answers: dict[str, Any]):
+    def reply_screening_missing_details(
+        self,
+        inbox_email: InboxEmail,
+        answers: dict[str, Any],
+        application: dict[str, Any] | None = None,
+    ):
+        missing = [
+            label
+            for key, label in [
+                ("current_salary", "current salary"),
+                ("expected_salary", "expected salary"),
+                ("current_location", "current location"),
+                ("joining_days", "joining time"),
+                ("comfortable_with_terms", "confirmation that the work terms suit you"),
+            ]
+            if answers.get(key) in (None, "", [])
+        ]
+        missing_text = ", ".join(missing) if missing else "a few remaining details"
         fallback_body = recruiter_email_body(
             "Thanks for sharing the details.",
-            "Could you please also confirm your current salary, expected salary, current location, joining time, and whether you are comfortable with night shift and work from office in Mohali?",
+            f"I still need {missing_text} to move your application forward.",
         )
         body = self.ai.draft_reply(
             inbox_email,
-            "candidate replied to screening questions but some required details are still missing",
-            {"answers_received": answers, "missing_complete_screening_details": True, "work_terms": screening_work_terms()},
+            "candidate replied to screening questions but some required details are still missing; "
+            "ask ONLY for the fields listed as still_missing and acknowledge the ones already received",
+            {
+                "already_received": {key: value for key, value in (answers or {}).items() if value not in (None, "", [])},
+                "still_missing": missing,
+                "work_terms": screening_work_terms(),
+            },
             fallback_body,
         )
-        self.mailer.send_reply(inbox_email, f"Screening details required: {inbox_email.subject}", body)
+        self.send_candidate_reply(
+            inbox_email,
+            f"Screening details required: {inbox_email.subject}",
+            body,
+            scenario="screening_missing_details",
+            application=application,
+        )
 
     def reply_location_not_fit(self, inbox_email: InboxEmail, application: dict[str, Any] | None):
         role = None
@@ -4232,20 +4675,75 @@ class AIRecruiterAgent:
             },
             fallback_body,
         )
-        self.mailer.send_reply(inbox_email, f"Application update: {inbox_email.subject}", body)
+        self.send_candidate_reply(
+            inbox_email,
+            f"Application update: {inbox_email.subject}",
+            body,
+            scenario="location_not_fit",
+            application=application,
+        )
 
-    def reply_negotiate_screening(self, inbox_email: InboxEmail, requirement: dict[str, Any] | None, issues: list[str]):
+    def reply_budget_disclosure(self, inbox_email: InboxEmail, application: dict[str, Any]):
+        """State the range once and ask a closed question.
+
+        This replaces the old open-ended negotiation, which had no exit state and
+        re-asked the same question every time the candidate replied. It is sent
+        at most once per application, enforced both here and by the reply ledger.
+        """
+        budget_text = requirement_budget_text(application)
         fallback_body = recruiter_email_body(
-            "Thanks for sharing the details.",
-            f"The current budget for this role is {requirement_budget_text(requirement)}. Please let us know if this works for you, along with the joining timeline you can commit to.",
+            "Thanks for sharing your details.",
+            f"For this role the approved range is {budget_text}. I know that is below the figure "
+            "you mentioned, so I wanted to be upfront before we go any further.",
+            "Could you let me know if that works for you? A simple yes or no is fine. "
+            "If it does not, tell me what you had in mind and I will see what I can do.",
         )
         body = self.ai.draft_reply(
             inbox_email,
-            "candidate screening details do not fit budget or joining timeline; negotiate politely once",
-            {"issues": issues, "budget": requirement_budget_text(requirement), "requirement": requirement},
+            "state the approved salary range for this role exactly once and ask the candidate a "
+            "direct yes/no question about whether it works for them; do not negotiate, do not "
+            "invite an open discussion, and do not mention anyone else being involved",
+            {
+                "budget": budget_text,
+                "candidate_expected_salary": (application or {}).get("screening_expected_salary"),
+                "ask_yes_or_no": True,
+                "role": (application or {}).get("requirement_position"),
+            },
             fallback_body,
         )
-        self.mailer.send_reply(inbox_email, f"Application discussion: {inbox_email.subject}", body)
+        return self.send_candidate_reply(
+            inbox_email,
+            f"Compensation for this role: {inbox_email.subject}",
+            body,
+            scenario="budget_disclosure",
+            application=application,
+        )
+
+    def reply_holding(self, inbox_email: InboxEmail, application: dict[str, Any] | None):
+        """One short acknowledgement while a human owns the thread.
+
+        Not silence (which is what candidates got before) and not a negotiation
+        (which is what created the race). Sent at most once per application.
+        """
+        fallback_body = recruiter_email_body(
+            "Thanks for getting back to me.",
+            "I have everything I need for now and I am looking into it. I will come back to you shortly.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "acknowledge the candidate's reply warmly in one or two sentences and tell them you "
+            "will come back to them shortly; ask for nothing, promise no specific date, and do "
+            "not mention anyone else being involved",
+            {"acknowledge_only": True, "ask_for_nothing": True},
+            fallback_body,
+        )
+        return self.send_candidate_reply(
+            inbox_email,
+            f"Thanks for your reply: {inbox_email.subject}",
+            body,
+            scenario="holding_reply",
+            application=application,
+        )
 
     def reply_interview_availability_request(self, inbox_email: InboxEmail, application: dict[str, Any] | None = None):
         if application:
@@ -4255,34 +4753,68 @@ class AIRecruiterAgent:
                 "Thanks for confirming the details.",
                 "We are good to move ahead with your interview.",
                 f"You can start it here whenever you are ready: {link}",
-                "Please use a laptop or desktop with a working microphone, and choose a quiet place before starting.",
+                "Please use Google Chrome on a laptop or desktop with a working microphone, and choose a quiet place before starting.",
             )
             body = self.ai.draft_reply(
                 inbox_email,
                 "candidate screening details are acceptable; send candidate the AI interview link",
-                {"ready_for_interview": True, "application": application, "interview_link": link},
+                {
+                    "ready_for_interview": True,
+                    "application": application_prompt_facts(application),
+                    "interview_link": link,
+                },
                 fallback_body,
             )
-            self.mailer.send_reply(inbox_email, f"Interview link: {inbox_email.subject}", body)
-            self.db.log_email_event(
+            sent = self.send_candidate_reply(
                 inbox_email,
-                "interview_link_sent",
-                {"application_id": application["id"], "interview_link": link},
+                f"Interview link: {inbox_email.subject}",
+                body,
+                scenario="interview_link",
+                application=application,
             )
+            if sent:
+                # Explicit transition. Previously this only happened as a side
+                # effect of minting a token, so a resent link left the status
+                # unchanged and the candidate looped forever.
+                self.db.mark_interview_link_sent(application["id"])
+                self.db.log_email_event(
+                    inbox_email,
+                    "interview_link_sent",
+                    {"application_id": application["id"], "interview_link": link},
+                )
             return
         fallback_body = recruiter_email_body(
             "Thanks for confirming the details.",
-            "We are good to move ahead with an interview. Please share a few time slots when you will be available, and we will schedule it accordingly.",
+            "We are good to move ahead with an interview. Please share a few time slots when you will be available, and I will schedule it accordingly.",
         )
         body = self.ai.draft_reply(
             inbox_email,
             "candidate screening details are acceptable; ask candidate for interview availability",
-            {"ready_for_interview": True, "application": application},
+            {"ready_for_interview": True},
             fallback_body,
         )
-        self.mailer.send_reply(inbox_email, f"Interview availability: {inbox_email.subject}", body)
+        self.send_candidate_reply(
+            inbox_email,
+            f"Interview availability: {inbox_email.subject}",
+            body,
+            scenario="interview_availability_request",
+        )
 
-    def escalate_to_hr(self, inbox_email: InboxEmail, application: dict[str, Any], answers: dict[str, Any], issues: list[str]):
+    def escalate_to_hr(
+        self,
+        inbox_email: InboxEmail,
+        application: dict[str, Any],
+        answers: dict[str, Any],
+        issues: list[str],
+        candidate_reply: str | None = None,
+    ):
+        """Hand the application to a human and stop candidate-facing automation.
+
+        This used to email HR *and* invite the candidate to keep negotiating,
+        which is what created the race: whichever side answered first silently
+        decided the outcome. Now the candidate gets one holding note and nothing
+        else until a person acts.
+        """
         application_id = application["id"]
         dashboard_url = dashboard_application_url(application_id)
         reason = "; ".join(issues)
@@ -4294,15 +4826,64 @@ class AIRecruiterAgent:
             f"Candidate email: {application.get('candidate_email') or application.get('source_email') or '-'}",
             f"Role: {application.get('requirement_position') or application.get('matched_position') or application.get('detected_position') or '-'}",
             f"Screening details: {json.dumps(answers, default=str)}",
+            f"Candidate's latest reply: {candidate_reply}" if candidate_reply else "",
         )
-        send_hr_notification(self.mailer, subject, body)
+        self.notify_hr_rate_limited(inbox_email, application, subject, body, "hr_escalation_notice")
         self.db.update_application_screening(application_id, "hr_escalated", answers, reason)
         self.db.log_email_event(
             inbox_email,
             "hr_escalated",
-            {"application_id": application_id, "issues": issues, "answers": answers, "dashboard_url": dashboard_url},
+            {
+                "application_id": application_id,
+                "issues": issues,
+                "answers": answers,
+                "dashboard_url": dashboard_url,
+                "candidate_reply": (candidate_reply or "")[:1000],
+            },
         )
-        self.reply_negotiate_screening(inbox_email, application, issues)
+        trace_recruiter_event(
+            "hr_escalated",
+            inputs=inbox_email_summary(inbox_email),
+            outputs={
+                "application_id": application_id,
+                "issues": issues,
+                "next_action": "hold_until_human_acts",
+            },
+        )
+        self.reply_holding(inbox_email, application)
+
+    def notify_hr_rate_limited(
+        self,
+        inbox_email: InboxEmail,
+        application: dict[str, Any] | None,
+        subject: str,
+        body: str,
+        scenario: str,
+        hours: int = 24,
+    ):
+        """One HR email per application per day; further replies land in the dashboard.
+
+        Without this, every candidate follow-up on an escalated thread produced
+        another "manual review needed" email.
+        """
+        application_id = (application or {}).get("id")
+        recipients = hr_notification_recipients()
+        key_recipient = recipients[0] if recipients else RECRUITER_HR_ESCALATION_EMAIL
+        if self.db.sent_reply_count(application_id, key_recipient, scenario, hours=hours) > 0:
+            log_json(
+                logging.INFO,
+                "hr_notification_rate_limited",
+                **inbox_email_summary(inbox_email),
+                scenario=scenario,
+                application_id=application_id,
+            )
+            return
+        send_hr_notification(
+            self.mailer if hasattr(self.mailer, "send_direct_email") else RecruiterMailer(),
+            subject,
+            body,
+        )
+        self.db.record_sent_reply(application_id, key_recipient, scenario, body)
 
     def handle_interview_availability_reply(self, inbox_email: InboxEmail, application: dict[str, Any]) -> bool:
         schedule = self.ai.extract_interview_schedule(inbox_email, application)
@@ -4328,7 +4909,7 @@ class AIRecruiterAgent:
                 "interview_time_requested",
                 availability=availability,
             )
-            self.mailer.send_reply(
+            self.send_candidate_reply(
                 inbox_email,
                 f"Interview timing required: {inbox_email.subject}",
                 self.ai.draft_reply(
@@ -4337,9 +4918,11 @@ class AIRecruiterAgent:
                     {"availability_text": availability, "needs_clear_datetime": True},
                     recruiter_email_body(
                         "Thanks for sharing this.",
-                        "Could you please share a clear date and time slot for the interview? Once we have that, we will schedule it and share the Teams link.",
+                        "Could you please share a clear date and time slot for the interview? Once I have that I will confirm it and send the Teams link.",
                     ),
                 ),
+                scenario="interview_timing_required",
+                application=application,
             )
             return True
 
@@ -4425,10 +5008,12 @@ class AIRecruiterAgent:
             )
             scenario = "candidate shared clear interview availability, but Teams link is not created yet"
             facts = {"scheduled_at": scheduled_at.isoformat(), "teams_link_pending": True}
-        self.mailer.send_reply(
+        self.send_candidate_reply(
             inbox_email,
             f"Interview schedule: {inbox_email.subject}",
             self.ai.draft_reply(inbox_email, scenario, facts, fallback),
+            scenario="interview_scheduled",
+            application=application,
         )
         return True
 
@@ -4436,7 +5021,7 @@ class AIRecruiterAgent:
         role_text = f" for {position}" if position else ""
         fallback_body = recruiter_email_body(
             f"Your CV has been shared with us{role_text}.",
-            "We have received it and will review your profile. If it matches the role, our team will contact you with the next steps.",
+            "I have received it and will review your profile. If it matches the role, I will come back to you with the next steps.",
         )
         body = self.ai.draft_reply(
             inbox_email,
@@ -4444,10 +5029,11 @@ class AIRecruiterAgent:
             {"candidate_email": candidate_email, "position": position, "application_received": True},
             fallback_body,
         )
-        self.mailer.send_reply(
+        self.send_candidate_reply(
             inbox_email,
             f"Application received: {inbox_email.subject}",
             body,
+            scenario="referral_received",
             to_email=candidate_email,
         )
 
@@ -4455,7 +5041,7 @@ class AIRecruiterAgent:
         role_text = f" for {position}" if position else ""
         fallback_body = recruiter_email_body(
             f"Thanks for sharing your friend's CV{role_text}.",
-            "I could not find the candidate's email address in the CV. Please share their email address, or ask them to send the CV directly, so we can continue the review.",
+            "I could not find the candidate's email address in the CV. Please share it, or ask them to send the CV directly, so I can continue the review.",
         )
         body = self.ai.draft_reply(
             inbox_email,
@@ -4463,10 +5049,11 @@ class AIRecruiterAgent:
             {"position": position, "candidate_email_required": True},
             fallback_body,
         )
-        self.mailer.send_reply(
+        self.send_candidate_reply(
             inbox_email,
             f"Candidate email required: {inbox_email.subject}",
             body,
+            scenario="referral_missing_candidate_email",
         )
 
     def reply_status_followup(self, inbox_email: InboxEmail, application: dict[str, Any] | None):
@@ -4479,7 +5066,7 @@ class AIRecruiterAgent:
                 link = candidate_interview_url(token) if token else None
                 fallback_lines = [
                     "Thanks for following up.",
-                    f"Your AI interview{position_text} is still pending in our records.",
+                    f"Your AI interview{position_text} is still pending.",
                 ]
                 if link:
                     fallback_lines.append(f"You can complete it here: {link}")
@@ -4503,42 +5090,47 @@ class AIRecruiterAgent:
                     },
                     fallback_body,
                 )
-                self.mailer.send_reply(
+                self.send_candidate_reply(
                     inbox_email,
                     f"AI interview pending: {inbox_email.subject}",
                     body,
+                    scenario="interview_pending_reminder",
+                    application=application,
                 )
                 return
             fallback_body = recruiter_email_body(
                 "Thanks for following up.",
-                f"We have your application{position_text} in our records. It is still under review, and our team will contact you if your profile is shortlisted.",
+                f"I have your application{position_text} and it is still under review. I will come back to you as soon as I have an update.",
             )
             body = self.ai.draft_reply(
                 inbox_email,
-                "candidate is asking for an update on an application already in our records",
+                "candidate is asking for an update on an application you already have",
                 {"application_found": True, "position": position, "status": application.get("application_status")},
                 fallback_body,
             )
-            self.mailer.send_reply(
+            self.send_candidate_reply(
                 inbox_email,
                 f"Application status: {inbox_email.subject}",
                 body,
+                scenario="status_followup",
+                application=application,
             )
         else:
             fallback_body = recruiter_email_body(
                 "Thanks for following up.",
-                "I could not find a previous application linked to this email address. Please share your CV and the role you are interested in, and we will review it.",
+                "I could not find an earlier application linked to this email address. Please share your CV and the role you are interested in, and I will review it.",
             )
             body = self.ai.draft_reply(
                 inbox_email,
-                "candidate is asking for an update, but no application is found in our records",
+                "candidate is asking for an update, but you have no earlier application from this address",
                 {"application_found": False, "ask_for_cv_and_role": True},
                 fallback_body,
             )
-            self.mailer.send_reply(
+            self.send_candidate_reply(
                 inbox_email,
                 f"Application status: {inbox_email.subject}",
                 body,
+                scenario="status_followup_no_application",
             )
 
     def reply_interview_delay_acknowledged(self, inbox_email: InboxEmail, application: dict[str, Any]):
@@ -4566,10 +5158,12 @@ class AIRecruiterAgent:
             },
             fallback_body,
         )
-        self.mailer.send_reply(
+        self.send_candidate_reply(
             inbox_email,
             f"AI interview link: {inbox_email.subject}",
             body,
+            scenario="interview_delay_acknowledged",
+            application=application,
         )
 
     def reply_withdrawal_confirmed(self, inbox_email: InboxEmail, application: dict[str, Any] | None):
@@ -4578,8 +5172,8 @@ class AIRecruiterAgent:
             position = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
         position_text = f" for {position}" if position else ""
         fallback_body = recruiter_email_body(
-            "Thanks for letting us know.",
-            f"We have noted your request and marked your application{position_text} as withdrawn. Wishing you all the best.",
+            "Thanks for letting me know.",
+            f"I have marked your application{position_text} as withdrawn. Wishing you all the best.",
         )
         body = self.ai.draft_reply(
             inbox_email,
@@ -4587,16 +5181,18 @@ class AIRecruiterAgent:
             {"application_found": application is not None, "position": position, "withdrawn": True},
             fallback_body,
         )
-        self.mailer.send_reply(
+        self.send_candidate_reply(
             inbox_email,
             f"Application withdrawn: {inbox_email.subject}",
             body,
+            scenario="withdrawal_confirmed",
+            application=application,
         )
 
     def reply_supported_cv_required(self, inbox_email: InboxEmail):
         fallback_body = recruiter_email_body(
             "Thanks for your message.",
-            "I could not find a readable CV attachment. Please send the CV as a PDF, DOCX, or TXT file, and we will review it.",
+            "I could not open the attachment you sent. Please send the CV as a PDF, DOCX, or TXT file and I will review it.",
         )
         body = self.ai.draft_reply(
             inbox_email,
@@ -4604,11 +5200,180 @@ class AIRecruiterAgent:
             {"supported_cv_formats": ["PDF", "DOCX", "TXT"], "ask_for_readable_cv": True},
             fallback_body,
         )
-        self.mailer.send_reply(
+        self.send_candidate_reply(
             inbox_email,
             f"CV attachment required: {inbox_email.subject}",
             body,
+            scenario="unsupported_attachment",
         )
+
+    def route_completed_screening(
+        self,
+        inbox_email: InboxEmail,
+        application: dict[str, Any],
+        answers: dict[str, Any],
+    ) -> bool:
+        """Decide what happens once all screening answers are in.
+
+        Exactly three outcomes, and every failure mode has an exit:
+          fit                       -> interview
+          budget gap, not yet told  -> state the range once
+          anything else             -> a human decides
+
+        The old code had a fourth path that re-entered "screening_negotiation"
+        forever whenever the blocker was the work terms rather than salary.
+        """
+        application_id = application["id"]
+        is_fit, issues = screening_fit(answers, application)
+        if is_fit:
+            self.db.update_application_screening(application_id, "interview_link_pending", answers)
+            self.reply_interview_availability_request(inbox_email, application)
+            return True
+
+        issue_kind = screening_issue_kind(issues)
+        already_disclosed = bool(application.get("budget_disclosed_at")) or self.db.scenario_ever_sent(
+            application_id,
+            inbox_email.sender,
+            "budget_disclosure",
+        )
+
+        if issue_kind == "budget" and not already_disclosed:
+            self.db.mark_budget_disclosed(application_id, {**answers, "issues": issues})
+            self.db.log_email_event(
+                inbox_email,
+                "budget_disclosed",
+                {
+                    "application_id": application_id,
+                    "issues": issues,
+                    "budget_max": application.get("budget_max"),
+                    "candidate_expected_salary": answers.get("expected_salary"),
+                },
+            )
+            trace_recruiter_event(
+                "budget_disclosed",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={"application_id": application_id, "next_action": "await_yes_or_no"},
+            )
+            self.reply_budget_disclosure(inbox_email, application)
+            return True
+
+        self.escalate_to_hr(
+            inbox_email,
+            application,
+            answers,
+            issues,
+            candidate_reply=latest_reply_text(inbox_email.body)[:1500],
+        )
+        return True
+
+    def handle_budget_response(self, inbox_email: InboxEmail, application: dict[str, Any]) -> bool:
+        """Classify the answer to the one budget question, then act once.
+
+        Intent is read from the latest reply only. The previous implementation
+        scanned for any number below the ceiling, so "my notice period is 90
+        days" counted as accepting the salary and skipped HR entirely.
+        """
+        application_id = application["id"]
+        answers = json_dict(application.get("screening_details"))
+        latest = latest_reply_text(inbox_email.body)
+
+        decision = self.ai.classify_budget_response(inbox_email, application)
+        response = str(decision.get("response") or "").lower().strip()
+        if response not in {"accepts", "rejects", "counter", "unclear"}:
+            response = deterministic_budget_signal(latest, application) or "unclear"
+
+        counter_amount = score_number(decision.get("counter_amount"))
+        evidence = str(decision.get("evidence") or "")[:500]
+        answers = {
+            **answers,
+            "budget_response": response,
+            "budget_response_evidence": evidence,
+        }
+        if counter_amount is not None:
+            answers["budget_counter_amount"] = counter_amount
+
+        log_json(
+            logging.INFO,
+            "budget_response_classified",
+            **inbox_email_summary(inbox_email),
+            application_id=application_id,
+            response=response,
+            counter_amount=counter_amount,
+        )
+        trace_recruiter_event(
+            "budget_response_classified",
+            inputs=inbox_email_summary(inbox_email),
+            outputs={
+                "application_id": application_id,
+                "response": response,
+                "counter_amount": counter_amount,
+                "evidence": evidence,
+            },
+        )
+        self.db.log_email_event(
+            inbox_email,
+            "budget_response_classified",
+            {
+                "application_id": application_id,
+                "response": response,
+                "counter_amount": counter_amount,
+                "evidence": evidence,
+                "latest_reply": latest[:1000],
+            },
+        )
+
+        if response == "accepts":
+            # The candidate's own expected salary is preserved. Only the fact of
+            # acceptance is recorded; the figure they stated is never overwritten
+            # with the budget ceiling the way it used to be.
+            answers["accepted_budget"] = True
+            budget_max = score_number(application.get("budget_max"))
+            if budget_max is not None:
+                answers["agreed_salary"] = budget_max
+            self.db.record_budget_response(application_id, response, answers)
+            self.db.update_application_screening(application_id, "interview_link_pending", answers)
+            self.reply_interview_availability_request(inbox_email, application)
+            return True
+
+        if response == "unclear":
+            clarified_before = self.db.sent_reply_count(
+                application_id,
+                inbox_email.sender,
+                "budget_clarification",
+                hours=24 * 365,
+            )
+            if not clarified_before:
+                self.db.record_budget_response(application_id, response, answers)
+                fallback_body = recruiter_email_body(
+                    "Thanks for getting back to me.",
+                    f"Just to confirm before I take the next step: does the range of "
+                    f"{requirement_budget_text(application)} work for you? A yes or no is all I need.",
+                )
+                body = self.ai.draft_reply(
+                    inbox_email,
+                    "the candidate did not clearly answer whether the stated salary range works "
+                    "for them; ask that one question again in a single short sentence and ask "
+                    "nothing else",
+                    {"budget": requirement_budget_text(application), "ask_yes_or_no": True},
+                    fallback_body,
+                )
+                self.send_candidate_reply(
+                    inbox_email,
+                    f"Quick confirmation: {inbox_email.subject}",
+                    body,
+                    scenario="budget_clarification",
+                    application=application,
+                )
+                return True
+
+        reason = {
+            "rejects": "candidate declined the stated budget",
+            "counter": f"candidate countered at {counter_amount}" if counter_amount else "candidate proposed a different figure",
+            "unclear": "candidate did not give a clear answer on the budget after being asked twice",
+        }.get(response, "candidate response to the budget needs a human decision")
+        self.db.record_budget_response(application_id, response, answers)
+        self.escalate_to_hr(inbox_email, application, answers, [reason], candidate_reply=latest[:1500])
+        return True
 
     @traceable(name="process_recruiting_email")
     def process_email(self, inbox_email: InboxEmail) -> bool:
@@ -4619,6 +5384,42 @@ class AIRecruiterAgent:
             inputs=inbox_email_summary(inbox_email),
         )
         thread_context = build_thread_context(inbox_email)
+
+        # A colleague replying from the shared mailbox leaves no status behind,
+        # so this is checked before anything else. Once a human has spoken in a
+        # thread, the agent stays out of it permanently.
+        if self.thread_taken_over_by_human(inbox_email):
+            handover_application = self.db.latest_application_for_inbox_email(inbox_email)
+            if handover_application:
+                self.db.mark_human_handled(
+                    handover_application["id"],
+                    "A team member replied to this thread directly.",
+                )
+            log_json(
+                logging.INFO,
+                "human_takeover_detected",
+                **inbox_email_summary(inbox_email),
+                application_id=handover_application["id"] if handover_application else None,
+            )
+            trace_recruiter_event(
+                "human_takeover_detected",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={
+                    "application_id": handover_application["id"] if handover_application else None,
+                    "next_action": "no_auto_reply_ever",
+                },
+                tags=["guardrail"],
+            )
+            self.db.log_email_event(
+                inbox_email,
+                "human_takeover_no_auto_reply",
+                {
+                    "application_id": handover_application["id"] if handover_application else None,
+                    "no_candidate_reply_sent": True,
+                },
+            )
+            return True
+
         classification = self.ai.classify_email(inbox_email)
         thread_application = self.db.latest_application_for_thread(inbox_email)
         latest_application = thread_application or self.db.latest_application_for_email(inbox_email.sender)
@@ -4700,6 +5501,82 @@ class AIRecruiterAgent:
                     inputs=inbox_email_summary(inbox_email),
                     outputs={"classification": classification},
                 )
+
+        # A human owns this application. Store the reply, tell HR at most once a
+        # day, and send the candidate one holding note. No screening, no status
+        # changes, no negotiation - that parallel track is what created the race
+        # between HR approving and the candidate replying.
+        if active_application and (active_application.get("application_status") or "").lower() in HUMAN_HOLD_STATUSES:
+            status = (active_application.get("application_status") or "").lower()
+            budget_signal = deterministic_budget_signal(inbox_email.body, active_application)
+            self.db.log_email_event(
+                inbox_email,
+                "candidate_reply_while_on_hold",
+                {
+                    **classification,
+                    "application_id": active_application["id"],
+                    "application_status": status,
+                    "budget_signal": budget_signal,
+                    "latest_reply": latest_reply_text(inbox_email.body)[:1000],
+                },
+            )
+            trace_recruiter_event(
+                "candidate_reply_while_on_hold",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={
+                    "application_id": active_application["id"],
+                    "status": status,
+                    "budget_signal": budget_signal,
+                    "next_action": "hold_for_human",
+                },
+            )
+            if status != "human_handled":
+                hint = ""
+                if budget_signal == "accepts":
+                    hint = " The reply reads like the candidate accepting the stated budget."
+                elif budget_signal == "rejects":
+                    hint = " The reply reads like the candidate declining the stated budget."
+                self.notify_hr_rate_limited(
+                    inbox_email,
+                    active_application,
+                    f"Candidate replied while awaiting your decision: {inbox_email.sender}",
+                    recruiter_email_body(
+                        "This application is waiting on a decision from you and the candidate has replied.",
+                        f"Candidate: {inbox_email.sender}",
+                        f"Status: {status}",
+                        f"Application: {dashboard_application_url(active_application['id'])}",
+                        f"Their message:{hint}",
+                        latest_reply_text(inbox_email.body)[:1500] or "-",
+                    ),
+                    "hold_reply_notice",
+                )
+                self.reply_holding(inbox_email, active_application)
+            return True
+
+        # Courtesy notes need no answer. Replying to "Thanks, I will do that" is
+        # what made the agent feel relentless and gave candidates no way out.
+        if is_pure_acknowledgement(inbox_email.body) and not inbox_email.attachments:
+            log_json(
+                logging.INFO,
+                "acknowledgement_no_reply",
+                **inbox_email_summary(inbox_email),
+                application_id=active_application["id"] if active_application else None,
+            )
+            trace_recruiter_event(
+                "acknowledgement_no_reply",
+                inputs=inbox_email_summary(inbox_email),
+                outputs={"next_action": "no_reply"},
+            )
+            self.db.log_email_event(
+                inbox_email,
+                "acknowledgement_no_reply",
+                {
+                    **classification,
+                    "application_id": active_application["id"] if active_application else None,
+                    "no_candidate_reply_sent": True,
+                },
+            )
+            return True
 
         if active_application and is_final_agent_status(active_application.get("application_status")):
             trace_recruiter_event(
@@ -4825,44 +5702,16 @@ class AIRecruiterAgent:
 
         if active_application and not inbox_email.attachments:
             current_status = (active_application.get("application_status") or "").lower()
-            candidate_accepted_escalated_budget = (
-                current_status == "hr_escalated"
-                and latest_reply_accepts_budget(inbox_email.body, active_application)
-            )
-            if current_status in {"screening_questions_sent", "screening_under_review", "screening_negotiation"} or candidate_accepted_escalated_budget:
+
+            # The candidate is answering the one budget question we asked.
+            # Exactly one of three things happens: proceed, escalate, or a single
+            # clarification. There is no state to loop back into.
+            if current_status == "budget_disclosed":
+                return self.handle_budget_response(inbox_email, active_application)
+
+            if current_status in {"screening_questions_sent", "screening_under_review"}:
                 extracted_answers = self.ai.extract_screening_answers(inbox_email, active_application)
                 answers = merge_screening_answers(active_application.get("screening_details"), extracted_answers)
-                if candidate_accepted_escalated_budget:
-                    budget_max = score_number(active_application.get("budget_max"))
-                    if budget_max is not None:
-                        answers = {**answers, "expected_salary": budget_max, "accepted_budget": True}
-                    self.db.log_email_event(
-                        inbox_email,
-                        "hr_escalated_budget_accepted",
-                        {
-                            "application_id": active_application["id"],
-                            "extracted_answers": extracted_answers,
-                            "merged_answers": answers,
-                            "budget_max": budget_max,
-                            "latest_reply": latest_reply_text(inbox_email.body)[:1000],
-                        },
-                    )
-                    log_json(
-                        logging.INFO,
-                        "hr_escalated_budget_accepted",
-                        **inbox_email_summary(inbox_email),
-                        application_id=active_application["id"],
-                        budget_max=budget_max,
-                    )
-                    trace_recruiter_event(
-                        "hr_escalated_budget_accepted",
-                        inputs=inbox_email_summary(inbox_email),
-                        outputs={
-                            "application_id": active_application["id"],
-                            "budget_max": budget_max,
-                            "next_action": "resume_screening_flow",
-                        },
-                    )
                 if candidate_declined_required_location(inbox_email.body) or extracted_answers.get("comfortable_with_terms") is False:
                     answers = {**answers, "comfortable_with_terms": False}
                     reason = "candidate declined Mohali/work-from-office location terms"
@@ -4911,51 +5760,10 @@ class AIRecruiterAgent:
                 )
                 if not screening_answers_complete(answers):
                     self.db.update_application_screening(active_application["id"], "screening_questions_sent", answers)
-                    self.reply_screening_missing_details(inbox_email, answers)
+                    self.reply_screening_missing_details(inbox_email, answers, active_application)
                     return True
 
-                if current_status == "screening_negotiation" and latest_reply_accepts_budget(
-                    inbox_email.body,
-                    active_application,
-                ):
-                    budget_max = score_number(active_application.get("budget_max"))
-                    if budget_max is not None:
-                        answers = {**answers, "expected_salary": budget_max, "accepted_budget": True}
-                    self.db.log_email_event(
-                        inbox_email,
-                        "screening_budget_accepted",
-                        {
-                            "application_id": active_application["id"],
-                            "merged_answers": answers,
-                            "budget_max": budget_max,
-                            "latest_reply": latest_reply_text(inbox_email.body)[:1000],
-                        },
-                    )
-
-                is_fit, issues = screening_fit(answers, active_application)
-                if is_fit:
-                    self.db.update_application_screening(active_application["id"], "interview_link_pending", answers)
-                    self.reply_interview_availability_request(inbox_email, active_application)
-                    return True
-
-                expected_salary = score_number(answers.get("expected_salary"))
-                budget_max = score_number(active_application.get("budget_max"))
-                if (
-                    current_status == "screening_negotiation"
-                    and expected_salary is not None
-                    and budget_max is not None
-                    and expected_salary > budget_max
-                ):
-                    self.escalate_to_hr(inbox_email, active_application, answers, issues)
-                    return True
-
-                self.db.update_application_screening(
-                    active_application["id"],
-                    "screening_negotiation",
-                    {**answers, "issues": issues},
-                )
-                self.reply_negotiate_screening(inbox_email, active_application, issues)
-                return True
+                return self.route_completed_screening(inbox_email, active_application, answers)
 
             if current_status in {"interview_time_requested", "interview_link_pending"}:
                 self.reply_interview_availability_request(inbox_email, active_application)
@@ -5033,16 +5841,6 @@ class AIRecruiterAgent:
                 else None
             )
             if existing_application_followup:
-                existing_status = (existing_application_followup.get("application_status") or "").lower()
-                if existing_status == "hr_escalated":
-                    self.notify_manual_hr_review(
-                        inbox_email,
-                        existing_application_followup,
-                        "Candidate replied while this application is escalated to HR. The reply was not an accepted-budget response, so HR should handle it manually.",
-                        event_type="hr_escalated_candidate_reply_handoff",
-                        mark_application=False,
-                    )
-                    return True
                 self.db.log_email_event(
                     inbox_email,
                     "existing_application_followup_without_cv",
@@ -5191,7 +5989,7 @@ class AIRecruiterAgent:
                             "no_candidate_reply_sent": False,
                         },
                     )
-                    self.reply_followup_missing_cv(inbox_email, requirement)
+                    self.reply_followup_missing_cv(inbox_email, requirement, active_application)
                 else:
                     if self.db.recent_event_count(inbox_email.sender, ["status_followup_no_application"], hours=72):
                         self.notify_manual_hr_review(
@@ -5415,7 +6213,7 @@ class AIRecruiterAgent:
                         "use_cv_role_override": use_cv_role_override,
                     },
                 )
-                self.reply_wrong_cv(inbox_email, requested_position, cv_position)
+                self.reply_wrong_cv(inbox_email, requested_position, cv_position, active_application)
                 continue
 
             if not extracted.get("target_position") and not use_cv_role_override:
@@ -5534,6 +6332,45 @@ class AIRecruiterAgent:
             )
             attachment_sha256 = hashlib.sha256(payload).hexdigest()
             status = "matched_requirement" if requirement else "no_open_requirement"
+
+            existing_open = self.db.open_application_for_candidate(
+                candidate_email or inbox_email.sender,
+                requirement.get("id") if requirement else None,
+            )
+            if existing_open and not thread_application:
+                # Same person, same opening, new email thread. Continue the
+                # existing application rather than re-running intake and asking
+                # again for a CV we already hold.
+                log_json(
+                    logging.INFO,
+                    "existing_application_reused_for_new_thread",
+                    **inbox_email_summary(inbox_email),
+                    application_id=existing_open["id"],
+                    status=existing_open.get("application_status"),
+                )
+                trace_recruiter_event(
+                    "existing_application_reused_for_new_thread",
+                    inputs=inbox_email_summary(inbox_email),
+                    outputs={
+                        "application_id": existing_open["id"],
+                        "status": existing_open.get("application_status"),
+                        "next_action": "reply_status_followup",
+                    },
+                )
+                self.db.log_email_event(
+                    inbox_email,
+                    "existing_application_reused_for_new_thread",
+                    {
+                        "application_id": existing_open["id"],
+                        "application_status": existing_open.get("application_status"),
+                    },
+                )
+                self.reply_status_followup(
+                    inbox_email,
+                    self.db.application_with_requirement(existing_open["id"]) or existing_open,
+                )
+                continue
+
             application_id = self.db.insert_application(
                 inbox_email,
                 candidate_id,
@@ -5657,7 +6494,11 @@ class AIRecruiterAgent:
                             "work_terms": screening_work_terms(),
                         },
                     )
-                    self.reply_screening_questions(inbox_email, requirement)
+                    self.reply_screening_questions(
+                        inbox_email,
+                        requirement,
+                        {"id": application_id} if application_id else None,
+                    )
                     continue
                 if application_id:
                     reason = jd_rejection_reason(evaluation, requirement)
@@ -5708,7 +6549,7 @@ class AIRecruiterAgent:
                 elif is_referral:
                     self.reply_referral_missing_candidate_email(inbox_email, requirement["position_title"])
                 else:
-                    self.reply_received(inbox_email)
+                    self.reply_received(inbox_email, {"id": application_id} if application_id else None)
             else:
                 log_json(
                     logging.INFO,
@@ -5752,13 +6593,19 @@ class AIRecruiterAgent:
 
         for inbox_email in emails:
             try:
-                should_mark_seen = self.process_email(inbox_email)
-                if should_mark_seen:
+                if not self.db.claim_provider_message(inbox_email.uid.decode(errors="ignore")):
+                    log_json(logging.INFO, "email_already_processed_skipped", **inbox_email_summary(inbox_email))
                     self.inbox.mark_seen(inbox_email.uid)
+                    continue
+                should_mark_seen = self.process_email(inbox_email)
+                # Ignored mail is marked read too. Leaving it unread meant a
+                # handful of non-recruiting emails permanently filled the poll
+                # window and starved every new candidate email behind them.
+                self.inbox.mark_seen(inbox_email.uid)
+                if should_mark_seen:
                     log_json(logging.INFO, "email_processed_marked_seen", **inbox_email_summary(inbox_email))
                 else:
-                    self.inbox.mark_unseen(inbox_email.uid)
-                    log_json(logging.INFO, "email_ignored_left_unread", **inbox_email_summary(inbox_email))
+                    log_json(logging.INFO, "email_ignored_marked_seen", **inbox_email_summary(inbox_email))
             except Exception as exc:
                 LOGGER.exception(
                     "email_processing_failed %s",
@@ -5775,12 +6622,32 @@ class AIRecruiterAgent:
                     )
                 except Exception as log_exc:
                     LOGGER.exception("Could not log processing failure: %s", log_exc)
+                try:
+                    self.db.release_provider_message(inbox_email.uid.decode(errors="ignore"))
+                except Exception as release_exc:
+                    LOGGER.exception("Could not release message claim: %s", release_exc)
 
     def process_one_graph_message(self, message_id: str, resource_path: str | None = None) -> bool:
         self.init_schema()
         if not isinstance(self.inbox, MicrosoftGraphProvider):
             LOGGER.error("Single-message Graph processing is only available with MAIL_PROVIDER=microsoft_graph.")
             return False
+
+        # Graph webhooks are at-least-once, and isRead is only set ~50s after
+        # processing begins, so the unread flag alone let one email be answered
+        # twice. Claiming the id is atomic and survives a restart.
+        if not self.db.claim_provider_message(message_id):
+            log_json(
+                logging.INFO,
+                "graph_message_already_processed",
+                graph_message_id=message_id,
+            )
+            trace_recruiter_event(
+                "graph_message_already_processed",
+                inputs={"graph_message_id": message_id},
+                tags=["graph", "guardrail"],
+            )
+            return True
 
         log_json(
             logging.INFO,
@@ -5806,6 +6673,7 @@ class AIRecruiterAgent:
                 inputs={"graph_message_id": message_id, "resource_path": resource_path},
                 tags=["graph", "warning"],
             )
+            self.db.release_provider_message(message_id)
             return False
 
         try:
@@ -5866,6 +6734,12 @@ class AIRecruiterAgent:
                 )
             except Exception as log_exc:
                 LOGGER.exception("Could not log processing failure: %s", log_exc)
+            # Release the claim so a genuine failure can be retried. The reply
+            # ledger stops the retry from re-sending anything already sent.
+            try:
+                self.db.release_provider_message(message_id)
+            except Exception as release_exc:
+                LOGGER.exception("Could not release message claim: %s", release_exc)
             return False
 
     def run_forever(self, poll_seconds: int):
@@ -5901,6 +6775,10 @@ def send_interview_request_after_hr_approval(application_id: int):
         db.mark_hr_approved_for_interview(application_id)
         token = db.ensure_interview_link(application_id)
         link = candidate_interview_url(token)
+        # ensure_interview_link only sets the status when it mints a NEW token,
+        # so an existing link left the row in interview_time_requested and every
+        # later candidate reply re-sent the link. Set it explicitly.
+        db.mark_interview_link_sent(application_id)
         role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
         body = recruiter_email_body(
             "Thanks for confirming the details.",
@@ -5929,6 +6807,7 @@ def send_interview_link_for_application(application_id: int):
             raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
         token = db.ensure_interview_link(application_id)
         link = candidate_interview_url(token)
+        db.mark_interview_link_sent(application_id)
         role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
         body = recruiter_email_body(
             "We are good to move ahead with your interview.",
@@ -6530,7 +7409,7 @@ def hold_candidate_after_hr_round(application_id: int):
             f"Interview update{f' - {role}' if role else ''}",
             recruiter_email_body(
                 "Thank you for your time in the final discussion.",
-                "We are still reviewing internally and will update you soon with the next step.",
+                "I am still going through this and will update you soon with the next step.",
             ),
         )
         print(f"Final HR hold email sent for application {application_id}.")
