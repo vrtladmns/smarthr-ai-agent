@@ -1142,6 +1142,21 @@ def screening_work_terms() -> dict[str, Any]:
     }
 
 
+SCREENING_FIELD_LABELS = (
+    ("comfortable_with_terms", "confirmation of the shift/office work terms"),
+    ("current_salary", "current salary"),
+    ("expected_salary", "expected salary"),
+    ("current_location", "current location"),
+    ("joining_days", "joining time / notice period"),
+)
+
+
+def missing_screening_fields(application: dict[str, Any] | None) -> list[str]:
+    """Which screening answers are still unknown for this application."""
+    answers = json_dict((application or {}).get("screening_details"))
+    return [label for key, label in SCREENING_FIELD_LABELS if answers.get(key) in (None, "", [])]
+
+
 def screening_answers_complete(answers: dict[str, Any]) -> bool:
     return all(
         answers.get(key) not in (None, "", [])
@@ -7171,7 +7186,8 @@ def send_interview_request_after_hr_approval(application_id: int):
         # otherwise we interview someone whose salary, location, notice period
         # and shift availability are all still unknown.
         answers = json_dict(application.get("screening_details"))
-        if not screening_answers_complete(answers):
+        missing = missing_screening_fields(application)
+        if missing:
             role_title = (
                 application.get("requirement_position")
                 or application.get("matched_position")
@@ -7198,6 +7214,7 @@ def send_interview_request_after_hr_approval(application_id: int):
                 "hr_approved_screening_questions_sent",
                 application_id=application_id,
                 reason="screening answers were incomplete, so no interview link was sent yet",
+                missing=missing,
             )
             trace_recruiter_event(
                 "hr_approved_screening_questions_sent",
@@ -7239,6 +7256,19 @@ def send_interview_link_for_application(application_id: int):
         recipient = application_candidate_recipient(application)
         if not recipient:
             raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
+
+        # Same rule as the approval path: never interview someone whose salary,
+        # location, notice period and shift availability are unknown. If HR
+        # already has these, entering them on the application unblocks the send.
+        missing = missing_screening_fields(application)
+        if missing:
+            raise RuntimeError(
+                f"Cannot send the interview link for application {application_id}: "
+                f"screening is incomplete ({', '.join(missing)}). "
+                "Use 'Approve For Interview' to ask the candidate for these, "
+                "or fill them in on this application and try again."
+            )
+
         token = db.ensure_interview_link(application_id)
         link = candidate_interview_url(token)
         db.mark_interview_link_sent(application_id)
