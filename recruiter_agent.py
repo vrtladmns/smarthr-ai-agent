@@ -7062,6 +7062,97 @@ class AIRecruiterAgent:
         self.run_once()
 
 
+def reevaluate_application_against_requirement(application_id: int) -> dict[str, Any] | None:
+    """Re-score a CV against the requirement it is now assigned to.
+
+    When HR assigns a requirement by hand, the stored jd_match_score, strengths,
+    risks and missing_requirements still describe whatever the CV was originally
+    compared against - usually nothing at all. Without this the candidate reaches
+    the interview with a null JD score and HR is deciding on stale data.
+    """
+    db = RecruiterDatabase()
+    try:
+        application = db.application_with_requirement(application_id)
+        if not application:
+            raise RuntimeError(f"Application not found: {application_id}")
+        if not application.get("requirement_id"):
+            return None
+
+        cv_text = application.get("raw_cv_text") or ""
+        if not cv_text:
+            log_json(
+                logging.WARNING,
+                "reevaluate_skipped_no_cv_text",
+                application_id=application_id,
+            )
+            return None
+
+        requirement = db.one(
+            "SELECT * FROM recruitment_requirements WHERE id = %s",
+            (application["requirement_id"],),
+        )
+        if not requirement:
+            return None
+
+        ai = RecruiterAI()
+        extracted = normalize_cv_details(
+            {
+                "full_name": application.get("full_name"),
+                "current_title": application.get("detected_position"),
+                "target_position": application.get("matched_position") or application.get("detected_position"),
+                "total_experience_years": None,
+            }
+        )
+        evaluation = ai.evaluate_cv(cv_text, extracted, requirement)
+
+        db.execute(
+            """
+            UPDATE recruiter_applications
+            SET matched_position = %s,
+                ats_score = COALESCE(%s, ats_score),
+                jd_match_score = %s,
+                strengths = %s::jsonb,
+                risks = %s::jsonb,
+                missing_requirements = %s::jsonb,
+                ai_short_description = COALESCE(%s, ai_short_description),
+                ai_evaluation = %s::jsonb
+            WHERE id = %s
+            """,
+            (
+                requirement.get("position_title"),
+                numeric_value(evaluation.get("ats_score")),
+                numeric_value(evaluation.get("jd_match_score")),
+                json.dumps(ensure_list(evaluation.get("strengths"))),
+                json.dumps(ensure_list(evaluation.get("risks"))),
+                json.dumps(ensure_list(evaluation.get("missing_requirements"))),
+                evaluation.get("short_description"),
+                json.dumps(evaluation),
+                application_id,
+            ),
+        )
+        log_json(
+            logging.INFO,
+            "application_reevaluated_against_requirement",
+            application_id=application_id,
+            requirement=requirement.get("position_title"),
+            ats_score=evaluation.get("ats_score"),
+            jd_match_score=evaluation.get("jd_match_score"),
+            recommendation=evaluation.get("recommendation"),
+        )
+        trace_recruiter_event(
+            "application_reevaluated_against_requirement",
+            inputs={"application_id": application_id, "requirement": requirement.get("position_title")},
+            outputs={
+                "ats_score": evaluation.get("ats_score"),
+                "jd_match_score": evaluation.get("jd_match_score"),
+                "recommendation": evaluation.get("recommendation"),
+            },
+        )
+        return evaluation
+    finally:
+        db.close()
+
+
 def send_interview_request_after_hr_approval(application_id: int):
     db = RecruiterDatabase()
     mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
@@ -7073,6 +7164,48 @@ def send_interview_request_after_hr_approval(application_id: int):
         recipient = application_candidate_recipient(application)
         if not recipient:
             raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
+
+        # HR approving a candidate means "pursue this person", not "skip the
+        # pipeline". A candidate who reached HR without ever being screened must
+        # answer the screening questions before an interview link goes out,
+        # otherwise we interview someone whose salary, location, notice period
+        # and shift availability are all still unknown.
+        answers = json_dict(application.get("screening_details"))
+        if not screening_answers_complete(answers):
+            role_title = (
+                application.get("requirement_position")
+                or application.get("matched_position")
+                or application.get("detected_position")
+            )
+            terms = screening_work_terms()
+            body = recruiter_email_body(
+                "Thanks for your patience while I reviewed your profile.",
+                f"I would like to take your application{f' for {role_title}' if role_title else ''} forward.",
+                f"Before we set up the interview, could you confirm you are comfortable with "
+                f"{terms['shift']}, {terms['work_mode']} in {terms['office_location']}, "
+                f"{terms['working_days']}, with cab facility {terms['cab_facility']}?",
+                "Please also share your current salary, expected salary, current location, "
+                "and how soon you could join.",
+            )
+            if hasattr(mailer, "send_direct_email"):
+                mailer.send_direct_email(recipient, "Next steps on your application", body)
+            else:
+                RecruiterMailer().send_direct_email(recipient, "Next steps on your application", body)
+            db.update_application_screening(application_id, "screening_questions_sent", answers)
+            db.record_sent_reply(application_id, recipient, "screening_questions", body)
+            log_json(
+                logging.INFO,
+                "hr_approved_screening_questions_sent",
+                application_id=application_id,
+                reason="screening answers were incomplete, so no interview link was sent yet",
+            )
+            trace_recruiter_event(
+                "hr_approved_screening_questions_sent",
+                inputs={"application_id": application_id},
+                outputs={"next_action": "await_screening_answers"},
+            )
+            return
+
         db.mark_hr_approved_for_interview(application_id)
         token = db.ensure_interview_link(application_id)
         link = candidate_interview_url(token)
