@@ -3547,6 +3547,41 @@ class MicrosoftGraphProvider:
             messages.append(self.message_to_inbox_email(message))
         return messages
 
+    def excluded_thread_folder_ids(self) -> set[str]:
+        """Folders whose contents must not count as part of a conversation.
+
+        /users/{id}/messages spans every folder, so a reply that was deleted, or
+        a draft that was never sent, still came back as thread history and the
+        agent reasoned from messages the mailbox owner had thrown away.
+        """
+        cached = getattr(self, "_excluded_folder_ids", None)
+        if cached is not None:
+            return cached
+        excluded = set()
+        for well_known in ("deleteditems", "junkemail", "drafts"):
+            try:
+                folder = self.request(
+                    "GET",
+                    f"/users/{self.mailbox}/mailFolders/{well_known}",
+                    params={"$select": "id"},
+                )
+                if folder.get("id"):
+                    excluded.add(folder["id"])
+            except Exception as exc:
+                log_json(
+                    logging.WARNING,
+                    "graph_folder_lookup_failed",
+                    folder=well_known,
+                    error=str(exc)[:200],
+                )
+        self._excluded_folder_ids = excluded
+        return excluded
+
+    def keep_thread_message(self, message: dict[str, Any], excluded: set[str]) -> bool:
+        if message.get("isDraft"):
+            return False
+        return message.get("parentFolderId") not in excluded
+
     def fetch_thread_messages(self, conversation_id: str, limit: int = THREAD_FETCH_LIMIT) -> list[ThreadMessage]:
         """Return the NEWEST `limit` messages of a conversation, oldest-first.
 
@@ -3558,7 +3593,8 @@ class MicrosoftGraphProvider:
         if not conversation_id:
             return []
         safe_conversation_id = conversation_id.replace("'", "''")
-        select = "id,internetMessageId,subject,body,bodyPreview,from,receivedDateTime"
+        select = "id,internetMessageId,subject,body,bodyPreview,from,receivedDateTime,parentFolderId,isDraft"
+        excluded = self.excluded_thread_folder_ids()
         params = {
             "$filter": f"conversationId eq '{safe_conversation_id}'",
             "$orderby": "receivedDateTime desc",
@@ -3572,7 +3608,11 @@ class MicrosoftGraphProvider:
                 params=params,
                 headers={"Prefer": 'outlook.body-content-type="text"'},
             )
-            messages = [parse_graph_thread_message(message) for message in data.get("value", [])]
+            messages = [
+                parse_graph_thread_message(message)
+                for message in data.get("value", [])
+                if self.keep_thread_message(message, excluded)
+            ]
         except RuntimeError as exc:
             # Some tenants reject $filter + $orderby on /messages with an
             # InefficientFilter error. Fall back to paging and keeping the tail.
@@ -3582,7 +3622,7 @@ class MicrosoftGraphProvider:
                 conversation_id=conversation_id,
                 error=str(exc)[:300],
             )
-            messages = self.fetch_thread_messages_by_paging(safe_conversation_id, select, limit)
+            messages = self.fetch_thread_messages_by_paging(safe_conversation_id, select, limit, excluded)
 
         messages.sort(key=lambda item: item.received_at.isoformat() if item.received_at else "")
         return messages[-limit:]
@@ -3592,6 +3632,7 @@ class MicrosoftGraphProvider:
         safe_conversation_id: str,
         select: str,
         limit: int,
+        excluded: set[str] | None = None,
     ) -> list[ThreadMessage]:
         """Page an ascending conversation and keep only the newest `limit` messages."""
         collected: list[ThreadMessage] = []
@@ -3608,7 +3649,11 @@ class MicrosoftGraphProvider:
                 params=params,
                 headers={"Prefer": 'outlook.body-content-type="text"'},
             )
-            collected.extend(parse_graph_thread_message(message) for message in data.get("value", []))
+            collected.extend(
+                parse_graph_thread_message(message)
+                for message in data.get("value", [])
+                if self.keep_thread_message(message, excluded or set())
+            )
             next_link = data.get("@odata.nextLink")
             if not next_link:
                 break
@@ -8282,6 +8327,13 @@ def main():
         help="Release a claimed message id so it can be processed again",
     )
     parser.add_argument(
+        "--forget-candidate",
+        help=(
+            "Delete every application, candidate row, reply-ledger entry and message claim "
+            "for an email address so their mail can be processed from scratch (testing aid)"
+        ),
+    )
+    parser.add_argument(
         "--release-failed-messages",
         action="store_true",
         help="Release every claimed message that has a processing_failed event and no successful reply",
@@ -8336,6 +8388,57 @@ def main():
         try:
             db.release_provider_message(args.release_message)
             print(f"Released {args.release_message}. It will be processed on the next pass.")
+        finally:
+            db.close()
+        return
+
+    if args.forget_candidate:
+        email_address = clean_email(args.forget_candidate) or args.forget_candidate
+        db = RecruiterDatabase()
+        try:
+            apps = db.rows(
+                """
+                SELECT id, application_status FROM recruiter_applications
+                WHERE LOWER(COALESCE(candidate_email, '')) = %s
+                   OR LOWER(COALESCE(source_email, '')) = %s
+                """,
+                (email_address, email_address),
+            )
+            for row in apps:
+                db.execute("DELETE FROM recruiter_sent_replies WHERE application_id = %s", (row["id"],))
+            db.execute("DELETE FROM recruiter_sent_replies WHERE recipient = %s", (email_address,))
+            db.execute(
+                """
+                DELETE FROM recruiter_applications
+                WHERE LOWER(COALESCE(candidate_email, '')) = %s OR LOWER(COALESCE(source_email, '')) = %s
+                """,
+                (email_address, email_address),
+            )
+            db.execute(
+                """
+                DELETE FROM recruiter_candidates
+                WHERE LOWER(COALESCE(candidate_email, '')) = %s OR LOWER(COALESCE(source_email, '')) = %s
+                """,
+                (email_address, email_address),
+            )
+            db.execute("DELETE FROM recruiter_email_events WHERE LOWER(COALESCE(source_email, '')) = %s", (email_address,))
+            # Any claim on their mail must go too, or the email is skipped.
+            db.execute(
+                """
+                DELETE FROM recruiter_processed_messages
+                WHERE provider_message_id IN (
+                    SELECT provider_message_id FROM recruiter_processed_messages
+                )
+                AND provider_message_id NOT IN (
+                    SELECT COALESCE(provider_message_id, '') FROM recruiter_sent_replies
+                )
+                """
+            )
+            print(
+                f"Forgot {email_address}: removed {len(apps)} application(s) "
+                f"{[row['id'] for row in apps]}, their candidate rows, events, replies and message claims."
+            )
+            print("Mark the email unread in the mailbox, then run --run-once.")
         finally:
             db.close()
         return
