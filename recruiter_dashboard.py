@@ -3913,10 +3913,10 @@ Conversation so far:
       high_motion_events: 0,
       unusual_activity: []
     }};
-    const ANSWER_SILENCE_MS = 1200;
-    const LONG_ANSWER_SILENCE_MS = 2000;
+    const ANSWER_SILENCE_MS = 1800;
+    const LONG_ANSWER_SILENCE_MS = 2600;
     const INCOMPLETE_ANSWER_SILENCE_MS = 7000;
-    const FINAL_TRANSCRIPT_GRACE_MS = 900;
+    const FINAL_TRANSCRIPT_GRACE_MS = 1200;
     const PROCESSING_NUDGE_MS = {int(RECRUITER_BROWSER_PROCESSING_NUDGE_MS)};
     const MIC_ACTIVITY_THRESHOLD = 0.026;
     const RECORDING_MIME_TYPE = 'video/webm;codecs=vp8,opus';
@@ -4138,7 +4138,18 @@ Conversation so far:
     function currentSilenceMs() {{
       const now = Date.now();
       const lastTextActivity = Math.max(lastTranscriptChangeAt || 0, lastFinalTranscriptAt || 0);
-      const lastActivity = speechStarted ? lastTextActivity : Math.max(lastSpeechResultAt || 0, lastMicActivityAt || 0);
+      // Silence means the transcript AND the microphone have both gone quiet.
+      // Once speechStarted was true this used to consult the transcript alone,
+      // so lastMicActivityAt - the one signal that actually says "this person is
+      // still making sound" - was computed every animation frame and thrown
+      // away. Web Speech interim results arrive in bursts and routinely stall
+      // for a second or more mid-sentence, which is exactly when a candidate got
+      // cut off and the interview moved on without them.
+      const lastActivity = Math.max(
+        lastTextActivity,
+        lastSpeechResultAt || 0,
+        lastMicActivityAt || 0
+      );
       return lastActivity ? now - lastActivity : 0;
     }}
 
@@ -4148,7 +4159,12 @@ Conversation so far:
       const incompleteEndings = [
         'and', 'or', 'but', 'so', 'because', 'like', 'then', 'actually',
         'for example', 'such as', 'i mean', 'let me think', 'one second',
-        'wait', 'just a moment'
+        'wait', 'just a moment',
+        'the', 'a', 'an', 'to', 'of', 'in', 'on', 'for', 'with', 'from',
+        'that', 'which', 'who', 'when', 'where', 'while', 'if', 'as',
+        'is', 'was', 'are', 'were', 'we', 'i', 'they', 'he', 'she', 'it',
+        'also', 'my', 'our', 'their', 'his', 'her', 'its', 'about', 'into',
+        'basically', 'suppose', 'means', 'plus', 'etc'
       ];
       return incompleteEndings.some(ending => text.endsWith(ending));
     }}
@@ -4236,7 +4252,7 @@ Conversation so far:
             sum += value * value;
           }}
           const rms = Math.sqrt(sum / data.length);
-          if (rms >= MIC_ACTIVITY_THRESHOLD && speechStarted) {{
+          if (rms >= MIC_ACTIVITY_THRESHOLD) {{
             lastMicActivityAt = Date.now();
           }}
           audioMonitorId = window.requestAnimationFrame(tick);
