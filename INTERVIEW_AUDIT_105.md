@@ -215,9 +215,39 @@ He may well be a hold. But the interview did not give him a fair chance to demon
 | Judge told the text is machine-transcribed | `web_interview_report` |
 | Low-signal interviews flagged `needs_human_review` | `web_interview_report` |
 
-Still open, and worth doing before the next interview:
+### 8.1 Second round — everything above plus the following
 
-- **log the real failure** behind "Sorry I had trouble processing that"
-- **never complete a session with an unanswered final question**
-- move the interview attempt cap into the database (it is currently in-memory and resets on restart)
-- domain vocabulary hinting for the recogniser
+| Fix | Detail |
+|---|---|
+| **Second cut-off path closed** | `scheduleFinalResultAutoAdvance()` submitted on transcript timing alone, bypassing the microphone check entirely. Chrome finalises a phrase whenever the speaker draws breath, so this path could cut someone off 1.2 s later while they were still talking — probably the dominant one. It now requires `currentSilenceMs()` too. |
+| **Interview API errors return JSON and are logged** | A failure fell through to the HTML error page, which arrived at a `fetch().json()` call as markup. That is exactly the "Sorry I had trouble processing that" at 15:52, and nothing anywhere recorded the cause. Failures now log a traceback plus an `interview_api_failed` event and return a JSON 500. |
+| **Sessions survive a dashboard restart** | `WEB_INTERVIEW_SESSIONS` was in-memory only. A restart mid-interview silently threw the candidate back to question one against a **freshly generated** question list, losing every answer. State is now snapshotted to `recruiter_applications.interview_session` after each turn and resumed on the next one. |
+| **Attempt cap actually enforced** | It lived in a process dictionary that reset on restart. Moved to `interview_attempts` in the database — and doing so exposed that `bump_interview_attempts` used `one()`, which never commits, so the counter always read back as 1. Same defect class as the message-claim bug. |
+| **Early completion flagged** | A session completing before every planned question is answered now records `completion_context` and forces `needs_human_review` with the reason, instead of writing a confident score over a partial interview. An empty answer can no longer complete a session at all. |
+| **Question count capped** | `MAX_INTERVIEW_QUESTIONS` (default 6), recommended questions take priority, and fragments under four words are dropped so "How do you react?" is never read as a main question. |
+| **Report generation moved off the response path** | Scoring is an LLM call and was running before the closing line was sent — part of the 55 s tail. It now runs in a background thread; the stored session is cleared only once the report is written. |
+
+### 8.2 Testing
+
+81 tests, including a new integration suite (`tests/test_interview_api.py`) that
+drives the real HTTP handler over a real socket against the real database with
+only the LLM stubbed. It covers: a repeat request not being scored, thinking
+aloud holding the question open, question echo not counting as an answer,
+duplicate turn ids, session survival across a simulated restart, the attempt cap
+holding across restarts, API failures returning JSON, empty answers never
+completing a session, and early completion being flagged.
+
+`tests/test_interview_client_timing.py` asserts the shipped page keeps the
+timing invariants — silence consulting the microphone on both submit paths, the
+thresholds staying above the trigger-happy range, barge-in wired up, and the
+filler not blocking the real reply.
+
+### 8.3 Still open
+
+- **Domain vocabulary hinting for the recogniser.** Chrome's `SpeechGrammarList`
+  is a no-op in practice, so improving "tax" being heard as "attack" means moving
+  speech-to-text server-side (Whisper `small`/`medium` with an `initial_prompt`
+  seeded from the JD). That is a larger change than anything above and is not
+  done.
+- **Re-interview Akhil Reddy V (application 105)** rather than deciding on this
+  recording.

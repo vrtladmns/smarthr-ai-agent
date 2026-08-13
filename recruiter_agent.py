@@ -700,6 +700,12 @@ CREATE INDEX IF NOT EXISTS recruiter_sent_replies_recipient_scenario_idx
 ON recruiter_sent_replies (recipient, scenario, sent_at DESC);
 
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS human_handled_at TIMESTAMPTZ;
+-- Interview session state, so a dashboard restart mid-interview does not throw
+-- the candidate back to question one with a fresh set of questions.
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_session JSONB NOT NULL DEFAULT '{}'::jsonb;
+-- Attempt counter lives here rather than in process memory, which reset on every
+-- restart and made the cap unenforceable.
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_attempts INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS budget_disclosed_at TIMESTAMPTZ;
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS budget_response TEXT;
 """
@@ -2629,6 +2635,65 @@ class RecruiterDatabase:
             """,
             (reason, application_id),
         )
+
+    def save_interview_session(self, application_id: int, session: dict[str, Any]):
+        """Persist enough of the live session to resume after a restart."""
+        snapshot = {
+            key: session.get(key)
+            for key in (
+                "questions",
+                "current_index",
+                "current_question",
+                "transcript",
+                "followup_for_current",
+                "last_client_turn_id",
+                "role_context",
+                "started_at",
+            )
+        }
+        self.execute(
+            "UPDATE recruiter_applications SET interview_session = %s::jsonb WHERE id = %s",
+            (json.dumps(snapshot, default=str), application_id),
+        )
+
+    def load_interview_session(self, application_id: int) -> dict[str, Any]:
+        row = self.one(
+            "SELECT interview_session FROM recruiter_applications WHERE id = %s",
+            (application_id,),
+        )
+        return json_dict(row.get("interview_session")) if row else {}
+
+    def clear_interview_session(self, application_id: int):
+        self.execute(
+            "UPDATE recruiter_applications SET interview_session = '{}'::jsonb WHERE id = %s",
+            (application_id,),
+        )
+
+    def bump_interview_attempts(self, application_id: int) -> int:
+        """Increment and return the attempt count, committed immediately.
+
+        rows()/one() deliberately do not commit, so an UPDATE ... RETURNING run
+        through them is rolled back when the connection closes. Every request
+        opens its own connection, so the counter always read back as 1 and the
+        cap could never fire.
+        """
+        try:
+            with self.conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE recruiter_applications
+                    SET interview_attempts = COALESCE(interview_attempts, 0) + 1
+                    WHERE id = %s
+                    RETURNING interview_attempts
+                    """,
+                    (application_id,),
+                )
+                row = cursor.fetchone()
+            self.conn.commit()
+            return int(row[0]) if row else 1
+        except Exception:
+            self.rollback()
+            raise
 
     def mark_interview_link_sent(self, application_id: int):
         """Explicit, idempotent transition for 'the candidate has the link'.

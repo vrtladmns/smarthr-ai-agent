@@ -75,7 +75,10 @@ WEB_INTERVIEW_SESSIONS: dict[str, dict] = {}
 MIN_INTERVIEW_RECORDING_BYTES = int(os.getenv("RECRUITER_MIN_INTERVIEW_RECORDING_BYTES", "400000"))
 # How many times a candidate may start the same interview link.
 MAX_INTERVIEW_ATTEMPTS = int(os.getenv("RECRUITER_MAX_INTERVIEW_ATTEMPTS", "2"))
-INTERVIEW_ATTEMPTS: dict[str, int] = {}
+# Hard ceiling on main questions. Application 105 was asked 17 in 17 minutes -
+# generated questions plus recommended questions plus a follow-up on each - and
+# several were fragments like "How do you react?".
+MAX_INTERVIEW_QUESTIONS = int(os.getenv("RECRUITER_MAX_INTERVIEW_QUESTIONS", "6"))
 FINAL_HR_CHECK_SECONDS = 300
 DASHBOARD_SESSION_COOKIE = "recruiter_dashboard_session"
 DASHBOARD_SESSION_SECONDS = 12 * 60 * 60
@@ -744,23 +747,44 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
             interview_api = interview_api_path(parsed.path)
             if interview_api:
                 token, action = interview_api
-                if action == "recording":
-                    self.api_interview_recording(token)
-                    return
-                if action == "recording-chunk":
-                    self.api_interview_recording_chunk(token, parsed)
-                    return
-                payload = self.read_json_body()
-                if action == "start":
-                    self.api_interview_start(token)
-                elif action == "turn":
-                    self.api_interview_turn(token, payload)
-                elif action == "recording-complete":
-                    self.api_interview_recording_complete(token, payload)
-                elif action == "speech":
-                    self.api_interview_speech(token, payload)
-                else:
-                    self.api_interview_complete(token, payload)
+                try:
+                    if action == "recording":
+                        self.api_interview_recording(token)
+                        return
+                    if action == "recording-chunk":
+                        self.api_interview_recording_chunk(token, parsed)
+                        return
+                    payload = self.read_json_body()
+                    if action == "start":
+                        self.api_interview_start(token)
+                    elif action == "turn":
+                        self.api_interview_turn(token, payload)
+                    elif action == "recording-complete":
+                        self.api_interview_recording_complete(token, payload)
+                    elif action == "speech":
+                        self.api_interview_speech(token, payload)
+                    else:
+                        self.api_interview_complete(token, payload)
+                except Exception as exc:
+                    # The candidate is mid-interview. Falling through to the HTML
+                    # error page returned markup to a fetch().json() call, which
+                    # surfaced as "Sorry, I had trouble processing that" with no
+                    # record anywhere of what actually failed.
+                    LOGGER.exception("interview_api_failed action=%s: %s", action, exc)
+                    log_json(
+                        logging.ERROR,
+                        "interview_api_failed",
+                        action=action,
+                        error=str(exc)[:500],
+                        error_type=type(exc).__name__,
+                    )
+                    try:
+                        self.send_json(
+                            {"ok": False, "error": "Interview step failed.", "action": "retry"},
+                            status=500,
+                        )
+                    except Exception:
+                        pass
                 return
 
             if parsed.path == "/login":
@@ -1106,15 +1130,30 @@ Context:
         questions = [" ".join(str(question).split()) for question in questions if str(question).strip()]
         combined = []
         seen = set()
-        for question in [*(questions or fallback), *recommended_questions]:
-            key = question.lower().rstrip("?")
-            if key in seen:
+        for question in [*recommended_questions, *(questions or fallback)]:
+            # Recommended questions come first: they are what HR actually asked
+            # for, and the generated ones fill whatever room is left.
+            text = " ".join(str(question).split())
+            key = text.lower().rstrip("?")
+            if key in seen or len(text.split()) < 4:
+                # Fragments like "How do you react?" are follow-ups, not main
+                # questions, and reading them cold makes no sense.
                 continue
             seen.add(key)
-            combined.append(question)
-        return combined[: RECRUITER_INTERVIEW_QUESTION_COUNT + len(recommended_questions)]
+            combined.append(text)
+        limit = min(
+            RECRUITER_INTERVIEW_QUESTION_COUNT + len(recommended_questions),
+            MAX_INTERVIEW_QUESTIONS,
+        )
+        return combined[:limit]
 
-    def web_interview_report(self, application: dict, transcript: list[dict], camera_monitoring: dict | None = None) -> dict:
+    def web_interview_report(
+        self,
+        application: dict,
+        transcript: list[dict],
+        camera_monitoring: dict | None = None,
+        completion_context: dict | None = None,
+    ) -> dict:
         normalized_camera_monitoring = normalize_camera_monitoring(camera_monitoring)
         llm = make_chat_model(json_mode=True, max_tokens=max(OLLAMA_NUM_PREDICT, 1800))
         response = llm.invoke(
@@ -1207,15 +1246,25 @@ Camera monitoring:
         report["question_count"] = len(transcript)
         report["transcript"] = transcript
         report["interview_mode"] = "browser_voice_link"
+        if completion_context:
+            report["completion_context"] = completion_context
 
         # A score is only trustworthy if there was enough usable material to
         # produce one. Flagging beats quietly emitting a confident low number.
         answered = [entry for entry in transcript if entry.get("status") == "answered"]
+        context = completion_context or {}
         review_reasons = []
         if report.get("needs_human_review") is True:
             review_reasons.append("the evaluator flagged the transcript as hard to judge")
         if len(answered) < 2:
             review_reasons.append(f"only {len(answered)} question(s) were actually answered")
+        if transcript and context.get("final_question_answered") is False:
+            review_reasons.append("the interview ended before the last question was answered")
+        if context.get("ended_early"):
+            review_reasons.append(
+                f"only {context.get('questions_answered')} of {context.get('questions_planned')} "
+                "planned questions were answered"
+            )
         if str(report.get("transcript_quality") or "").lower() == "poor":
             review_reasons.append("speech-to-text quality was poor")
         total_answer_words = sum(len(str(entry.get("answer") or "").split()) for entry in answered)
@@ -1384,9 +1433,14 @@ Conversation so far:
             self.send_json({"error": "This interview has already been completed."}, status=409)
             return
 
-        # Application 21 has three separate recordings for one interview because
-        # nothing stopped the link being restarted.
-        attempts = int(INTERVIEW_ATTEMPTS.get(token, 0)) + 1
+        # Counted in the database: the in-memory counter reset on every restart,
+        # so the cap could not actually be enforced. Application 21 has three
+        # recordings for one interview.
+        database = self.db()
+        try:
+            attempts = database.db.bump_interview_attempts(application["id"])
+        finally:
+            database.close()
         if attempts > MAX_INTERVIEW_ATTEMPTS:
             log_json(
                 logging.WARNING,
@@ -1405,8 +1459,6 @@ Conversation so far:
                 status=429,
             )
             return
-        INTERVIEW_ATTEMPTS[token] = attempts
-
         database = self.db()
         try:
             database.db.mark_interview_started(application["id"])
@@ -1428,6 +1480,7 @@ Conversation so far:
             "role_context": interview_role_context(application),
             "started_at": time.time(),
         }
+        self.persist_interview_session(application["id"], WEB_INTERVIEW_SESSIONS[token])
         # The upcoming questions are known now, so their audio can be generated
         # while the candidate is still on the greeting instead of on the wire
         # during the pause after each answer.
@@ -1732,19 +1785,49 @@ Conversation so far:
             return
         session = WEB_INTERVIEW_SESSIONS.get(token)
         if not session:
-            questions = self.web_interview_questions(application)
-            session = {
-                "application_id": application["id"],
-                "questions": questions,
-                "current_index": 0,
-                "current_question": questions[0] if questions else "",
-                "transcript": [],
-                "camera_monitoring": {},
-                "followup_for_current": False,
-                "last_client_turn_id": 0,
-                "role_context": interview_role_context(application),
-                "started_at": time.time(),
-            }
+            # A dashboard restart used to lose the session entirely: the
+            # candidate was silently thrown back to question one against a
+            # freshly generated question list, and everything already answered
+            # was gone. Resume from the stored snapshot when there is one.
+            database = self.db()
+            try:
+                stored = database.db.load_interview_session(application["id"])
+            finally:
+                database.close()
+            if stored and stored.get("questions"):
+                session = {
+                    "application_id": application["id"],
+                    "questions": stored.get("questions") or [],
+                    "current_index": int(stored.get("current_index") or 0),
+                    "current_question": stored.get("current_question") or "",
+                    "transcript": stored.get("transcript") or [],
+                    "camera_monitoring": {},
+                    "followup_for_current": bool(stored.get("followup_for_current")),
+                    "last_client_turn_id": int(stored.get("last_client_turn_id") or 0),
+                    "role_context": stored.get("role_context") or interview_role_context(application),
+                    "started_at": stored.get("started_at") or time.time(),
+                }
+                log_json(
+                    logging.INFO,
+                    "interview_session_resumed",
+                    application_id=application["id"],
+                    question_index=session["current_index"],
+                    answered=len(session["transcript"]),
+                )
+            else:
+                questions = self.web_interview_questions(application)
+                session = {
+                    "application_id": application["id"],
+                    "questions": questions,
+                    "current_index": 0,
+                    "current_question": questions[0] if questions else "",
+                    "transcript": [],
+                    "camera_monitoring": {},
+                    "followup_for_current": False,
+                    "last_client_turn_id": 0,
+                    "role_context": interview_role_context(application),
+                    "started_at": time.time(),
+                }
             WEB_INTERVIEW_SESSIONS[token] = session
         answer = str(payload.get("answer") or "").strip()
         camera_monitoring = payload.get("camera_monitoring")
@@ -1784,23 +1867,77 @@ Conversation so far:
             )
         if action == "next_question":
             session["current_index"] += 1
-            session["current_question"] = decision.get("question") or session["questions"][session["current_index"]]
+            if session["current_index"] >= len(session["questions"]):
+                session["current_index"] = max(len(session["questions"]) - 1, 0)
+            session["current_question"] = (
+                decision.get("question")
+                or (session["questions"][session["current_index"]] if session["questions"] else "")
+            )
             session["followup_for_current"] = False
         elif action == "follow_up":
             session["current_question"] = decision.get("question") or session["current_question"]
         elif action == "complete":
             if isinstance(session.get("camera_monitoring"), dict) and not session["camera_monitoring"].get("ended_at"):
                 session["camera_monitoring"]["ended_at"] = datetime.utcnow().isoformat() + "Z"
-            report = self.web_interview_report(application, session["transcript"], session.get("camera_monitoring"))
-            database = self.db()
-            try:
-                database.db.update_interview_report(application["id"], report)
-            finally:
-                database.close()
-            notify_post_interview_outcome_async(application["id"], report)
+            transcript = session["transcript"]
+            answered = [entry for entry in transcript if entry.get("status") == "answered"]
+            # Application 105 ended with its last question unanswered after a
+            # failed turn, and the report was written as if the interview had
+            # run to completion. Record why the evidence is thin so the report
+            # can flag it rather than quietly scoring a partial interview.
+            completion_context = {
+                "questions_planned": len(session.get("questions") or []),
+                "questions_recorded": len(transcript),
+                "questions_answered": len(answered),
+                "final_question_answered": bool(transcript and transcript[-1].get("status") == "answered"),
+                "ended_early": len(answered) < len(session.get("questions") or []),
+            }
+            camera = session.get("camera_monitoring")
+            application_id = application["id"]
+
+            def build_and_save_report():
+                try:
+                    report = self.web_interview_report(
+                        application, transcript, camera, completion_context=completion_context
+                    )
+                    database = self.db()
+                    try:
+                        database.db.update_interview_report(application_id, report)
+                        database.db.clear_interview_session(application_id)
+                    finally:
+                        database.close()
+                    notify_post_interview_outcome_async(application_id, report)
+                except Exception as exc:
+                    LOGGER.exception("interview_report_failed for %s: %s", application_id, exc)
+                    log_json(
+                        logging.ERROR,
+                        "interview_report_failed",
+                        application_id=application_id,
+                        error=str(exc)[:400],
+                    )
+
+            # Scoring is an LLM call and the candidate is waiting on the closing
+            # line; it runs after the response rather than in front of it. The
+            # stored session is cleared only once the report is safely written.
+            Thread(target=build_and_save_report, daemon=True).start()
             WEB_INTERVIEW_SESSIONS.pop(token, None)
             decision["report_saved"] = True
+        else:
+            self.persist_interview_session(application["id"], session)
+        if action in {"next_question", "follow_up"}:
+            self.persist_interview_session(application["id"], session)
         self.send_json(decision)
+
+    def persist_interview_session(self, application_id: int, session: dict):
+        """Best-effort snapshot; a persistence failure must not end the interview."""
+        try:
+            database = self.db()
+            try:
+                database.db.save_interview_session(application_id, session)
+            finally:
+                database.close()
+        except Exception as exc:
+            LOGGER.warning("Could not persist interview session for %s: %s", application_id, exc)
 
     def api_interview_complete(self, token: str, payload: dict):
         application = self.application_for_interview_token(token)
@@ -4205,7 +4342,11 @@ Conversation so far:
           !isSubmitting &&
           !interviewClosed &&
           answerCanAutoSubmit() &&
-          Date.now() - lastFinalTranscriptAt >= FINAL_TRANSCRIPT_GRACE_MS
+          Date.now() - lastFinalTranscriptAt >= FINAL_TRANSCRIPT_GRACE_MS &&
+          // Chrome finalises a phrase whenever the speaker draws breath, so this
+          // path fired mid-answer. It must respect the microphone like the other
+          // one does, or it simply reintroduces the cut-offs.
+          currentSilenceMs() >= FINAL_TRANSCRIPT_GRACE_MS
         ) {{
           stopListeningAndAdvance();
         }}
@@ -5238,6 +5379,7 @@ Conversation so far:
         self.send_html(body)
 
     def render_error(self, exc: Exception):
+        LOGGER.exception("dashboard_request_failed: %s", exc)
         help_text = "Make sure PostgreSQL is running and `DATABASE_URL` is set."
         command = "docker compose up -d recruiter-postgres"
         content = f"""
