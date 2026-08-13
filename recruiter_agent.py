@@ -321,11 +321,65 @@ THREAD_FETCH_LIMIT = int(os.getenv("RECRUITER_THREAD_FETCH_LIMIT", "25"))
 # so an exact title match still wins when both requirements look plausible.
 EVIDENCE_MATCH_WEIGHT = float(os.getenv("RECRUITER_EVIDENCE_MATCH_WEIGHT", "0.9"))
 
+# Title words too common in ordinary CV prose to prove anything on their own.
+# "Business Development Executive" reduces to {business, development}, both of
+# which appear in most technology CVs, so matching a QA engineer to a sales role
+# on those two words alone is a false positive waiting to happen. Titles made up
+# entirely of these are matched on the title only, never on CV evidence.
+EVIDENCE_WEAK_TOKENS = {
+    "business",
+    "development",
+    "operations",
+    "management",
+    "service",
+    "services",
+    "process",
+    "support",
+    "technology",
+    "technical",
+    "digital",
+    "global",
+    "client",
+    "customer",
+    "project",
+    "product",
+    "quality",
+    "general",
+    "senior",
+    "junior",
+}
+
 # Never send the same scenario to the same application twice inside this window.
 # This is the backstop that caps the blast radius of any single logic bug.
 REPLY_SCENARIO_COOLDOWN_HOURS = int(os.getenv("RECRUITER_REPLY_SCENARIO_COOLDOWN_HOURS", "24"))
 # Scenarios that must never be repeated for an application, at any interval.
 ONCE_PER_APPLICATION_SCENARIOS = {"budget_disclosure", "holding_reply"}
+
+# The AI interview has already happened by these points. "Approve For Interview"
+# is a pre-interview control and must never appear here - clicking it re-sends
+# the interview link to someone who has already sat the interview.
+POST_INTERVIEW_STATUSES = {
+    "interview_completed",
+    "interview_on_hold_hr_review",
+    "hr_round_time_requested",
+    "interview_availability_received",
+    "interview_scheduled",
+    "final_hr_round_pending",
+    "final_hr_round_completed_pending_decision",
+    "selected_documents_requested",
+    "rejected_after_hr_round",
+    "hold_after_hr_round",
+    "interview_rejected",
+}
+
+# Where HR still owes a decision on a completed interview. The availability
+# request can be re-sent from any of these, which matters when a status was
+# changed by hand and no email ever went out.
+POST_INTERVIEW_DECISION_STATUSES = {
+    "interview_completed",
+    "interview_on_hold_hr_review",
+    "hr_round_time_requested",
+}
 
 # Statuses where a human owns the conversation. The agent stores replies and stops.
 HUMAN_HOLD_STATUSES = {
@@ -646,6 +700,12 @@ CREATE INDEX IF NOT EXISTS recruiter_sent_replies_recipient_scenario_idx
 ON recruiter_sent_replies (recipient, scenario, sent_at DESC);
 
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS human_handled_at TIMESTAMPTZ;
+-- Interview session state, so a dashboard restart mid-interview does not throw
+-- the candidate back to question one with a fresh set of questions.
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_session JSONB NOT NULL DEFAULT '{}'::jsonb;
+-- Attempt counter lives here rather than in process memory, which reset on every
+-- restart and made the cap unenforceable.
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_attempts INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS budget_disclosed_at TIMESTAMPTZ;
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS budget_response TEXT;
 """
@@ -1900,9 +1960,14 @@ def deterministic_requirement_match(
         # whatever they call themselves? Stemmed so "bookkeeper" finds
         # "bookkeeping". Weighted just under a real title match so an exact
         # title still wins when both are present.
-        title_stems = {stem_role_token(word) for word in title_words}
+        distinctive_words = title_words - EVIDENCE_WEAK_TOKENS
+        title_stems = {stem_role_token(word) for word in distinctive_words}
         evidence_hits = title_stems & evidence_stems
-        evidence_score = (len(evidence_hits) / max(len(title_stems), 1)) * EVIDENCE_MATCH_WEIGHT
+        evidence_score = (
+            (len(evidence_hits) / max(len(title_stems), 1)) * EVIDENCE_MATCH_WEIGHT
+            if title_stems
+            else 0.0
+        )
         if evidence_score > score:
             score = evidence_score
             reason = (
@@ -2259,6 +2324,42 @@ def sanitize_db_text(value: Any) -> str:
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
 
 
+def line_is_letter_spaced(line: str) -> bool:
+    """Heuristic: has this line been split into individual glyphs?"""
+    tokens = line.split()
+    if len(tokens) < 4:
+        return False
+    single = sum(1 for token in tokens if len(token) == 1)
+    return single / len(tokens) >= 0.6
+
+
+def repair_letter_spaced_text(text: str) -> str:
+    """Rejoin text that a PDF exported one character at a time.
+
+    Some CVs are produced by tools that position every glyph individually, and
+    pypdf then yields "S U M M A R Y" and "D e v c o n s  S o f t w a r e".
+    Every word in such a CV is invisible to matching, scoring and the LLM: the
+    candidate's own job title cannot be found because it is not there as a word.
+    Word boundaries survive as runs of two or more spaces, which is what makes
+    the repair possible.
+    """
+    if not text:
+        return text
+    repaired_lines = []
+    for line in text.splitlines():
+        if line_is_letter_spaced(line):
+            words = ["".join(part.split()) for part in re.split(r"\s{2,}", line.strip())]
+            repaired_lines.append(" ".join(word for word in words if word))
+        else:
+            repaired_lines.append(line)
+    return "\n".join(repaired_lines)
+
+
+def clean_cv_text(text: str) -> str:
+    """Everything a freshly extracted CV must go through before it is used."""
+    return sanitize_db_text(repair_letter_spaced_text(text))
+
+
 def extract_cv_text(filename: str, payload: bytes) -> str:
     suffix = Path(filename.lower()).suffix
     with TemporaryDirectory() as directory:
@@ -2266,11 +2367,11 @@ def extract_cv_text(filename: str, payload: bytes) -> str:
         path.write_bytes(payload)
 
         if suffix == ".txt":
-            return sanitize_db_text(payload.decode("utf-8", errors="ignore"))
+            return clean_cv_text(payload.decode("utf-8", errors="ignore"))
         if suffix == ".docx":
-            return sanitize_db_text(extract_docx_text(path))
+            return clean_cv_text(extract_docx_text(path))
         if suffix == ".pdf":
-            return sanitize_db_text(extract_pdf_text(path))
+            return clean_cv_text(extract_pdf_text(path))
 
     return ""
 
@@ -2534,6 +2635,65 @@ class RecruiterDatabase:
             """,
             (reason, application_id),
         )
+
+    def save_interview_session(self, application_id: int, session: dict[str, Any]):
+        """Persist enough of the live session to resume after a restart."""
+        snapshot = {
+            key: session.get(key)
+            for key in (
+                "questions",
+                "current_index",
+                "current_question",
+                "transcript",
+                "followup_for_current",
+                "last_client_turn_id",
+                "role_context",
+                "started_at",
+            )
+        }
+        self.execute(
+            "UPDATE recruiter_applications SET interview_session = %s::jsonb WHERE id = %s",
+            (json.dumps(snapshot, default=str), application_id),
+        )
+
+    def load_interview_session(self, application_id: int) -> dict[str, Any]:
+        row = self.one(
+            "SELECT interview_session FROM recruiter_applications WHERE id = %s",
+            (application_id,),
+        )
+        return json_dict(row.get("interview_session")) if row else {}
+
+    def clear_interview_session(self, application_id: int):
+        self.execute(
+            "UPDATE recruiter_applications SET interview_session = '{}'::jsonb WHERE id = %s",
+            (application_id,),
+        )
+
+    def bump_interview_attempts(self, application_id: int) -> int:
+        """Increment and return the attempt count, committed immediately.
+
+        rows()/one() deliberately do not commit, so an UPDATE ... RETURNING run
+        through them is rolled back when the connection closes. Every request
+        opens its own connection, so the counter always read back as 1 and the
+        cap could never fire.
+        """
+        try:
+            with self.conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE recruiter_applications
+                    SET interview_attempts = COALESCE(interview_attempts, 0) + 1
+                    WHERE id = %s
+                    RETURNING interview_attempts
+                    """,
+                    (application_id,),
+                )
+                row = cursor.fetchone()
+            self.conn.commit()
+            return int(row[0]) if row else 1
+        except Exception:
+            self.rollback()
+            raise
 
     def mark_interview_link_sent(self, application_id: int):
         """Explicit, idempotent transition for 'the candidate has the link'.
