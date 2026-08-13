@@ -346,6 +346,46 @@ def test_partial_title_evidence_is_not_enough():
     assert match["requirement_id"] is None, match
 
 
+
+
+# --- interview link must never precede screening (vrtldmns@gmail.com, 2026-08-12)
+
+def test_unscreened_application_reports_every_missing_field():
+    missing = ra.missing_screening_fields({"screening_details": {}})
+    assert missing == [
+        "confirmation of the shift/office work terms",
+        "current salary",
+        "expected salary",
+        "current location",
+        "joining time / notice period",
+    ]
+
+
+def test_partially_screened_application_is_still_blocked():
+    missing = ra.missing_screening_fields(
+        {"screening_details": {"current_salary": 600000, "expected_salary": 900000}}
+    )
+    assert "current location" in missing
+    assert "joining time / notice period" in missing
+
+
+def test_fully_screened_application_is_clear():
+    assert ra.missing_screening_fields({
+        "screening_details": {
+            "comfortable_with_terms": True,
+            "current_salary": 600000,
+            "expected_salary": 900000,
+            "current_location": "Mohali",
+            "joining_days": 30,
+        }
+    }) == []
+
+
+def test_missing_screening_handles_json_string_and_none():
+    assert ra.missing_screening_fields(None)
+    assert ra.missing_screening_fields({"screening_details": "{}"})
+
+
 if __name__ == "__main__":
     import pytest
 

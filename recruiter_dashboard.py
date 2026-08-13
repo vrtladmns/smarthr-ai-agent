@@ -57,6 +57,7 @@ from recruiter_agent import (
     send_final_hr_round_request,
     send_interview_link_for_application,
     send_interview_rejection,
+    reevaluate_application_against_requirement,
     send_interview_request_after_hr_approval,
     send_teams_link_for_application,
     log_json,
@@ -1853,46 +1854,6 @@ Conversation so far:
                 parse_int(form.get("needed_within_days")),
                 form.get("status", "open").strip() or "open",
             )
-            if database.db.is_mssql():
-                existing = database.one(
-                    "SELECT id FROM recruitment_requirements WHERE LOWER(position_title) = LOWER(%s) LIMIT 1",
-                    (values[0],),
-                )
-                if existing:
-                    database.execute(
-                        """
-                        UPDATE recruitment_requirements
-                        SET
-                            experience_min_years = %s,
-                            experience_max_years = %s,
-                            budget_min = %s,
-                            budget_max = %s,
-                            currency = %s,
-                            job_description = %s,
-                            recommended_questions = %s,
-                            urgently_required = %s,
-                            needed_within_days = %s,
-                            status = %s,
-                            updated_at = SYSDATETIMEOFFSET()
-                        WHERE id = %s
-                        """,
-                        values[1:] + (existing["id"],),
-                    )
-                    return
-                database.execute(
-                    """
-                    INSERT INTO recruitment_requirements
-                    (
-                        position_title, experience_min_years, experience_max_years,
-                        budget_min, budget_max, currency, job_description,
-                        recommended_questions, urgently_required, needed_within_days, status
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    values,
-                )
-                return
-
             database.execute(
                 """
                 INSERT INTO recruitment_requirements
@@ -2048,6 +2009,18 @@ Conversation so far:
             database.close()
 
     def update_application(self, form: dict[str, str]):
+        application_id = parse_int(form.get("id"))
+        new_requirement_id = parse_int(form.get("requirement_id"))
+        previous_requirement_id = None
+        database = self.db()
+        try:
+            existing = database.one(
+                "SELECT requirement_id FROM recruiter_applications WHERE id = %s",
+                (application_id,),
+            )
+            previous_requirement_id = existing.get("requirement_id") if existing else None
+        finally:
+            database.close()
         database = self.db()
         try:
             database.execute(
@@ -2094,11 +2067,20 @@ Conversation so far:
                     form.get("interview_availability", "").strip() or None,
                     form.get("hr_interviewer_email", "").strip() or None,
                     form.get("hr_interviewer_name", "").strip() or None,
-                    parse_int(form.get("id")),
+                    application_id,
                 ),
             )
         finally:
             database.close()
+
+        # Assigning a requirement by hand must re-score the CV against that JD,
+        # otherwise the candidate carries a null jd_match_score into the
+        # interview and HR decides on data from a different role.
+        if application_id and new_requirement_id and new_requirement_id != previous_requirement_id:
+            try:
+                reevaluate_application_against_requirement(application_id)
+            except Exception as exc:
+                LOGGER.exception("Could not re-evaluate application %s: %s", application_id, exc)
 
     def delete_application(self, form: dict[str, str]):
         database = self.db()
