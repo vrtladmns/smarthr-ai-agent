@@ -386,6 +386,59 @@ def test_missing_screening_handles_json_string_and_none():
     assert ra.missing_screening_fields({"screening_details": "{}"})
 
 
+
+
+# --- letter-spaced PDF extraction (9591maheshmane@gmail.com, 2026-08-13) ------
+
+LETTER_SPACED = (
+    "S U M M A R Y\n"
+    "C o m p a n y  N a m e  -  D e v c o n s  S o f t w a r e  S o l u t i o n  P v t .  L t d .\n"
+    "P r o j e c t  n a m e  -  W e a l t h  M a n a g e m e n t  &  C l i e n t  O n b o a r d i n g  Q A"
+)
+
+
+def test_letter_spaced_pdf_text_is_repaired():
+    repaired = ra.repair_letter_spaced_text(LETTER_SPACED)
+    assert "SUMMARY" in repaired
+    assert "Devcons Software Solution" in repaired
+    assert "Wealth Management" in repaired
+    assert "QA" in repaired
+
+
+def test_normal_text_is_left_alone():
+    normal = "SUMMARY\nQA Engineer with 4 years in manual and automation testing.\nSelenium, Java, TestNG."
+    assert ra.repair_letter_spaced_text(normal) == normal
+
+
+def test_short_lines_are_not_mistaken_for_letter_spacing():
+    assert ra.repair_letter_spaced_text("A B C") == "A B C"
+
+
+def test_generic_title_words_cannot_match_on_cv_evidence_alone():
+    """A QA CV must not match Business Development Executive."""
+    qa_cv = (
+        "QA Engineer. Manual and automation testing, Selenium, TestNG, Jira. "
+        "Tested a wealth management platform and its business rules."
+    )
+    match = ra.deterministic_requirement_match(
+        {"target_position": "QA Engineer", "current_title": "QA Engineer", "skills": ["Selenium"]},
+        {"detected_position": "QA Engineer"},
+        MATCH_REQUIREMENTS + [{"id": 9, "position_title": "Business Development Executive",
+                               "job_description": "sales pipeline, lead generation"}],
+        source_text=qa_cv,
+    )
+    assert match["requirement_id"] is None, match
+
+
+def test_distinctive_titles_still_match_on_evidence():
+    """The weak-token filter must not undo the bookkeeping fix."""
+    match = ra.deterministic_requirement_match(
+        TUSHAR_EXTRACTED, {"detected_position": "US Accounting Manager"},
+        MATCH_REQUIREMENTS, source_text=TUSHAR_CV,
+    )
+    assert match["requirement_id"] == 2
+
+
 if __name__ == "__main__":
     import pytest
 
