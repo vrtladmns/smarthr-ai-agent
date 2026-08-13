@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.policy import default
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import make_msgid, parseaddr, parsedate_to_datetime
 from html import escape as html_escape
 from html import unescape
 from logging.handlers import RotatingFileHandler
@@ -3938,23 +3938,45 @@ class MicrosoftGraphProvider:
         )
         return None
 
-    def send_direct_email(self, to_email: str, subject: str, body: str):
+    def send_direct_email(self, to_email: str, subject: str, body: str) -> str | None:
+        """Send a standalone email. Returns its internetMessageId when known.
+
+        Created as a draft first so the id is available: sendMail returns
+        nothing, which meant every direct email the agent sent was invisible to
+        the reply ledger, and the next candidate reply in that thread looked
+        like a human had taken the conversation over.
+        """
         if not RECRUITER_REPLY_ENABLED:
             print(f"[direct reply disabled] To: {to_email} | Subject: {subject}\n{body}")
-            return
+            return None
         reply_html = append_signature_if_needed(email_body_to_html(body))
+        message = {
+            "subject": subject,
+            "body": {"contentType": "HTML", "content": reply_html},
+            "toRecipients": [{"emailAddress": {"address": to_email}}],
+        }
+        try:
+            draft = self.request("POST", f"/users/{self.mailbox}/messages", json=message)
+            draft_id = draft.get("id")
+            if draft_id:
+                self.request(
+                    "POST",
+                    f"/users/{self.mailbox}/messages/{quote(draft_id, safe='')}/send",
+                    json={},
+                )
+                return draft.get("internetMessageId")
+        except Exception as exc:
+            log_json(
+                logging.WARNING,
+                "graph_draft_send_failed_falling_back",
+                error=str(exc)[:300],
+            )
         self.request(
             "POST",
             f"/users/{self.mailbox}/sendMail",
-            json={
-                "message": {
-                    "subject": subject,
-                    "body": {"contentType": "HTML", "content": reply_html},
-                    "toRecipients": [{"emailAddress": {"address": to_email}}],
-                },
-                "saveToSentItems": True,
-            },
+            json={"message": message, "saveToSentItems": True},
         )
+        return None
 
     def create_online_meeting(self, subject: str, start_at: datetime, end_at: datetime) -> str:
         data = self.request(
@@ -4136,12 +4158,14 @@ class RecruiterMailer:
         message["From"] = RECRUITER_FROM_EMAIL
         message["To"] = to_email
         message["Subject"] = subject
+        message["Message-ID"] = make_msgid()
         message.set_content(plain_body)
         message.add_alternative(html_body, subtype="html")
         with smtplib.SMTP(RECRUITER_SMTP_HOST, RECRUITER_SMTP_PORT) as smtp:
             smtp.starttls()
             smtp.login(RECRUITER_EMAIL, RECRUITER_EMAIL_PASSWORD)
             smtp.send_message(message)
+        return message["Message-ID"]
 
     def send_reply(self, inbox_email: InboxEmail, subject: str, body: str, to_email: str | None = None):
         recipient = to_email or inbox_email.sender
@@ -4755,6 +4779,14 @@ class AIRecruiterAgent:
 
         A colleague replying from the shared mailbox leaves no status behind, so
         without this the agent talks straight over them.
+
+        This fails SAFE. Deciding "a human wrote that" silences the agent on the
+        thread permanently, so it only concludes so when it can positively
+        recognise its own messages: if nothing the agent sent to this recipient
+        was ever recorded, it cannot tell the difference and must not guess.
+        That is exactly what went wrong when direct emails were not being
+        recorded - the agent read its own "Final HR round availability" message
+        as a stranger's and abandoned the candidate.
         """
         messages = inbox_email.thread_messages or []
         if not messages:
@@ -4770,7 +4802,24 @@ class AIRecruiterAgent:
         latest_outbound = outbound[-1]
         if not latest_outbound.message_id:
             return False
-        return latest_outbound.message_id not in self.db.agent_sent_message_ids()
+
+        known_ids = self.db.agent_sent_message_ids()
+        if latest_outbound.message_id in known_ids:
+            return False
+
+        # Do we have any record of our own outbound mail in this thread at all?
+        # If not, the ledger simply has no coverage here and an unknown id proves
+        # nothing.
+        thread_ids = {message.message_id for message in outbound if message.message_id}
+        if not (thread_ids & known_ids):
+            log_json(
+                logging.INFO,
+                "human_takeover_check_skipped_no_ledger_coverage",
+                **inbox_email_summary(inbox_email),
+                outbound_in_thread=len(outbound),
+            )
+            return False
+        return True
 
     def notify_manual_hr_review(
         self,
@@ -7328,6 +7377,38 @@ def reevaluate_application_against_requirement(application_id: int) -> dict[str,
         db.close()
 
 
+def send_tracked_direct_email(
+    db: "RecruiterDatabase",
+    mailer,
+    application_id: int | None,
+    recipient: str,
+    subject: str,
+    body: str,
+    scenario: str,
+) -> str | None:
+    """Send a direct candidate email and record it in the reply ledger.
+
+    Recording matters for two reasons: the duplicate-reply guard needs to know
+    what has already gone out, and human-takeover detection needs to be able to
+    recognise the agent's own messages. Anything sent outside this helper looks
+    like a stranger wrote it.
+    """
+    sender = mailer if hasattr(mailer, "send_direct_email") else RecruiterMailer()
+    provider_message_id = sender.send_direct_email(recipient, subject, body)
+    try:
+        db.record_sent_reply(application_id, recipient, scenario, body, provider_message_id)
+    except Exception as exc:
+        LOGGER.warning("Could not record sent reply (%s) for %s: %s", scenario, application_id, exc)
+    log_json(
+        logging.INFO,
+        "candidate_direct_email_sent",
+        application_id=application_id,
+        scenario=scenario,
+        recipient=recipient,
+    )
+    return provider_message_id
+
+
 def send_interview_request_after_hr_approval(application_id: int):
     db = RecruiterDatabase()
     mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
@@ -7363,12 +7444,11 @@ def send_interview_request_after_hr_approval(application_id: int):
                 "Please also share your current salary, expected salary, current location, "
                 "and how soon you could join.",
             )
-            if hasattr(mailer, "send_direct_email"):
-                mailer.send_direct_email(recipient, "Next steps on your application", body)
-            else:
-                RecruiterMailer().send_direct_email(recipient, "Next steps on your application", body)
+            send_tracked_direct_email(
+                db, mailer, application_id, recipient,
+                "Next steps on your application", body, "screening_questions",
+            )
             db.update_application_screening(application_id, "screening_questions_sent", answers)
-            db.record_sent_reply(application_id, recipient, "screening_questions", body)
             log_json(
                 logging.INFO,
                 "hr_approved_screening_questions_sent",
@@ -7397,10 +7477,9 @@ def send_interview_request_after_hr_approval(application_id: int):
             f"You can start it here whenever you are ready: {link}",
             "Please use a laptop or desktop with a working microphone, and choose a quiet place before starting.",
         )
-        if hasattr(mailer, "send_direct_email"):
-            mailer.send_direct_email(recipient, "Interview link", body)
-        else:
-            RecruiterMailer().send_direct_email(recipient, "Interview link", body)
+        send_tracked_direct_email(
+            db, mailer, application_id, recipient, "Interview link", body, "interview_link",
+        )
     finally:
         db.close()
 
@@ -7439,7 +7518,9 @@ def send_interview_link_for_application(application_id: int):
             f"You can start it here whenever you are ready: {link}",
             "Please use a laptop or desktop with a working microphone, and choose a quiet place before starting.",
         )
-        mailer.send_direct_email(recipient, "Interview link", body)
+        send_tracked_direct_email(
+            db, mailer, application_id, recipient, "Interview link", body, "interview_link",
+        )
         print(f"Interview link sent for application {application_id}: {link}")
     finally:
         db.close()
@@ -7484,7 +7565,10 @@ def send_pending_interview_reminders(
                 "Once you complete it, I will review your interview and get back to you with the next update.",
             )
             try:
-                mailer.send_direct_email(recipient, "Reminder: please complete your interview", body)
+                send_tracked_direct_email(
+                    db, mailer, application["id"], recipient,
+                    "Reminder: please complete your interview", body, "interview_reminder",
+                )
                 db.mark_interview_reminder_sent(application["id"])
                 sent_count += 1
                 log_json(
@@ -7573,7 +7657,10 @@ def send_final_hr_round_request(application_id: int, approved_by_hr: bool = Fals
             "Could you please share two or three date and time slots that work for you between Monday and Friday, 6 PM to 1 AM IST?",
             "Once you share your availability, I will schedule the meeting and send you the Teams link.",
         )
-        mailer.send_direct_email(recipient, f"Final HR round availability{f' - {role}' if role else ''}", body)
+        send_tracked_direct_email(
+            db, mailer, application_id, recipient,
+            f"Final HR round availability{f' - {role}' if role else ''}", body, "final_hr_round_request",
+        )
         print(f"Final HR round request sent for application {application_id}.")
     finally:
         db.close()
@@ -7598,7 +7685,10 @@ def send_interview_rejection(application_id: int, reason: str | None = None):
             "You did well in the discussion, but at the moment we have decided to move forward with another candidate whose profile is a closer match for this opening.",
             "Thank you again for your interest, and I wish you the very best in your job search.",
         )
-        mailer.send_direct_email(recipient, f"Interview feedback{f' - {role}' if role else ''}", body)
+        send_tracked_direct_email(
+            db, mailer, application_id, recipient,
+            f"Interview feedback{f' - {role}' if role else ''}", body, "interview_feedback",
+        )
         print(f"Interview rejection sent for application {application_id}.")
     finally:
         db.close()
@@ -8650,6 +8740,21 @@ def main():
         help="Release a claimed message id so it can be processed again",
     )
     parser.add_argument(
+        "--list-human-handled",
+        action="store_true",
+        help="List applications the agent has stopped replying to because it saw a human takeover",
+    )
+    parser.add_argument(
+        "--resume-application",
+        type=int,
+        help="Hand an application back to the agent, restoring the status it had before the takeover latch",
+    )
+    parser.add_argument(
+        "--resume-status",
+        default="hr_round_time_requested",
+        help="Status to restore with --resume-application (default: hr_round_time_requested)",
+    )
+    parser.add_argument(
         "--forget-candidate",
         help=(
             "Delete every application, candidate row, reply-ledger entry and message claim "
@@ -8711,6 +8816,47 @@ def main():
         try:
             db.release_provider_message(args.release_message)
             print(f"Released {args.release_message}. It will be processed on the next pass.")
+        finally:
+            db.close()
+        return
+
+    if args.list_human_handled:
+        db = RecruiterDatabase()
+        try:
+            rows = db.rows(
+                """
+                SELECT id, candidate_email, source_email, application_status,
+                       human_handled_at, hr_escalation_reason
+                FROM recruiter_applications
+                WHERE LOWER(COALESCE(application_status, '')) = 'human_handled'
+                ORDER BY human_handled_at DESC NULLS LAST
+                """
+            )
+            if not rows:
+                print("No applications are latched to human_handled.")
+            for row in rows:
+                who = row.get("candidate_email") or row.get("source_email") or "-"
+                print(f"  {row['id']:>6}  {who:<40} {row.get('human_handled_at')}  {row.get('hr_escalation_reason') or ''}")
+        finally:
+            db.close()
+        return
+
+    if args.resume_application:
+        db = RecruiterDatabase()
+        try:
+            db.execute(
+                """
+                UPDATE recruiter_applications
+                SET application_status = %s,
+                    human_handled_at = NULL
+                WHERE id = %s
+                """,
+                (args.resume_status, args.resume_application),
+            )
+            print(
+                f"Application {args.resume_application} handed back to the agent "
+                f"with status '{args.resume_status}'."
+            )
         finally:
             db.close()
         return

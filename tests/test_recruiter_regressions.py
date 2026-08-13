@@ -494,6 +494,60 @@ def test_hr_round_time_requested_can_resend_availability():
     assert "interview_on_hold_hr_review" in ra.POST_INTERVIEW_DECISION_STATUSES
 
 
+
+
+# --- human takeover must fail safe (application 105, 2026-08-13) --------------
+
+class FakeAgentDB:
+    def __init__(self, known_ids):
+        self._known = set(known_ids)
+
+    def agent_sent_message_ids(self, limit=500):
+        return self._known
+
+
+def _takeover(thread, known_ids):
+    agent = ra.AIRecruiterAgent.__new__(ra.AIRecruiterAgent)
+    agent.db = FakeAgentDB(known_ids)
+    messages = [
+        FakeThreadMessage(sender, "body", None, message_id=mid) for sender, mid in thread
+    ]
+    return ra.AIRecruiterAgent.thread_taken_over_by_human(agent, FakeInboxEmail(messages))
+
+
+MAILBOX = ra.MICROSOFT_MAILBOX or ra.RECRUITER_FROM_EMAIL
+
+
+def test_unrecorded_agent_email_is_not_mistaken_for_a_human():
+    """The 'Final HR round availability' email was sent outside the ledger and
+    the agent then read its own message as a stranger's, abandoning candidate 105."""
+    thread = [
+        ("candidate@example.com", "<c1>"),
+        (MAILBOX, "<agent-not-recorded>"),
+        ("candidate@example.com", "<c2>"),
+    ]
+    assert _takeover(thread, known_ids=set()) is False
+
+
+def test_real_human_reply_is_detected_when_the_ledger_has_coverage():
+    thread = [
+        ("candidate@example.com", "<c1>"),
+        (MAILBOX, "<agent-1>"),
+        ("candidate@example.com", "<c2>"),
+        (MAILBOX, "<typed-by-a-person>"),
+    ]
+    assert _takeover(thread, known_ids={"<agent-1>"}) is True
+
+
+def test_agents_own_latest_message_is_not_a_takeover():
+    thread = [("candidate@example.com", "<c1>"), (MAILBOX, "<agent-1>")]
+    assert _takeover(thread, known_ids={"<agent-1>"}) is False
+
+
+def test_thread_with_no_outbound_mail_is_not_a_takeover():
+    assert _takeover([("candidate@example.com", "<c1>")], known_ids={"<agent-1>"}) is False
+
+
 if __name__ == "__main__":
     import pytest
 
