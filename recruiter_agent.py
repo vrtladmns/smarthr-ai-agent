@@ -355,6 +355,32 @@ REPLY_SCENARIO_COOLDOWN_HOURS = int(os.getenv("RECRUITER_REPLY_SCENARIO_COOLDOWN
 # Scenarios that must never be repeated for an application, at any interval.
 ONCE_PER_APPLICATION_SCENARIOS = {"budget_disclosure", "holding_reply"}
 
+# The AI interview has already happened by these points. "Approve For Interview"
+# is a pre-interview control and must never appear here - clicking it re-sends
+# the interview link to someone who has already sat the interview.
+POST_INTERVIEW_STATUSES = {
+    "interview_completed",
+    "interview_on_hold_hr_review",
+    "hr_round_time_requested",
+    "interview_availability_received",
+    "interview_scheduled",
+    "final_hr_round_pending",
+    "final_hr_round_completed_pending_decision",
+    "selected_documents_requested",
+    "rejected_after_hr_round",
+    "hold_after_hr_round",
+    "interview_rejected",
+}
+
+# Where HR still owes a decision on a completed interview. The availability
+# request can be re-sent from any of these, which matters when a status was
+# changed by hand and no email ever went out.
+POST_INTERVIEW_DECISION_STATUSES = {
+    "interview_completed",
+    "interview_on_hold_hr_review",
+    "hr_round_time_requested",
+}
+
 # Statuses where a human owns the conversation. The agent stores replies and stops.
 HUMAN_HOLD_STATUSES = {
     "hr_escalated",

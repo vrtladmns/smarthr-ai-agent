@@ -439,6 +439,61 @@ def test_distinctive_titles_still_match_on_evidence():
     assert match["requirement_id"] == 2
 
 
+
+
+# --- HR controls must match the stage (application 105, 2026-08-13) ----------
+
+def _pre_interview_approve_visible(row: dict) -> bool:
+    """Mirrors the gate in recruiter_dashboard.application_detail."""
+    status = (row.get("application_status") or "").lower()
+    already_interviewed = (
+        bool(row.get("interview_completed_at"))
+        or bool(row.get("interview_started_at"))
+        or status in ra.POST_INTERVIEW_STATUSES
+    )
+    awaiting = bool(row.get("hr_escalated_at")) and not row.get("hr_approved_at")
+    decidable = {"hr_escalated", "budget_disclosed", "manual_hr_review", "human_handled"}
+    return not already_interviewed and (awaiting or status in decidable)
+
+
+def test_post_interview_hold_does_not_offer_approve_for_interview():
+    """AI said hold; approving must not re-send the interview link."""
+    row = {
+        "application_status": "interview_on_hold_hr_review",
+        "hr_escalated_at": "2026-08-13T09:00:00Z",   # set by mark_post_interview_outcome
+        "hr_approved_at": None,
+        "interview_completed_at": "2026-08-13T08:00:00Z",
+    }
+    assert _pre_interview_approve_visible(row) is False
+
+
+def test_pre_interview_escalation_still_offers_approve_for_interview():
+    row = {
+        "application_status": "hr_escalated",
+        "hr_escalated_at": "2026-08-13T09:00:00Z",
+        "hr_approved_at": None,
+        "interview_completed_at": None,
+        "interview_started_at": None,
+    }
+    assert _pre_interview_approve_visible(row) is True
+
+
+def test_started_interview_blocks_the_pre_interview_control():
+    row = {
+        "application_status": "hr_escalated",
+        "hr_escalated_at": "2026-08-13T09:00:00Z",
+        "hr_approved_at": None,
+        "interview_started_at": "2026-08-13T08:00:00Z",
+    }
+    assert _pre_interview_approve_visible(row) is False
+
+
+def test_hr_round_time_requested_can_resend_availability():
+    """Editing the status by hand sends no email; the button must stay available."""
+    assert "hr_round_time_requested" in ra.POST_INTERVIEW_DECISION_STATUSES
+    assert "interview_on_hold_hr_review" in ra.POST_INTERVIEW_DECISION_STATUSES
+
+
 if __name__ == "__main__":
     import pytest
 

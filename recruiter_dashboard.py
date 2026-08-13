@@ -42,6 +42,8 @@ from config import (
 from llm_factory import make_chat_model
 from recruiter_agent import (
     LOGGER,
+    POST_INTERVIEW_DECISION_STATUSES,
+    POST_INTERVIEW_STATUSES,
     MicrosoftGraphProvider,
     RecruiterDatabase,
     candidate_interview_url,
@@ -3436,9 +3438,19 @@ Conversation so far:
         # ones whose status still happens to read "hr_escalated". Previously the
         # button vanished the moment anything moved the status on, leaving HR
         # holding an email that asked them to act on a page with no action.
+        status_lower = (row["application_status"] or "").lower()
+        # A post-interview hold also stamps hr_escalated_at, so the "awaiting a
+        # decision" test alone put a pre-interview approval button on candidates
+        # who had already been interviewed. Clicking it re-sent the interview
+        # link instead of asking for HR-round availability.
+        already_interviewed = (
+            bool(row.get("interview_completed_at"))
+            or bool(row.get("interview_started_at"))
+            or status_lower in POST_INTERVIEW_STATUSES
+        )
         awaiting_hr_decision = bool(row.get("hr_escalated_at")) and not row.get("hr_approved_at")
         decidable_statuses = {"hr_escalated", "budget_disclosed", "manual_hr_review", "human_handled"}
-        if awaiting_hr_decision or (row["application_status"] or "").lower() in decidable_statuses:
+        if not already_interviewed and (awaiting_hr_decision or status_lower in decidable_statuses):
             budget_note = ""
             if row.get("budget_response"):
                 budget_note = (
@@ -3453,8 +3465,18 @@ Conversation so far:
             </form>
             """
         post_interview_review_forms = ""
-        if (row["application_status"] or "").lower() == "interview_on_hold_hr_review":
+        # Also shown for hr_round_time_requested so the availability request can
+        # be re-sent: editing the status by hand never sends any email, and the
+        # button used to disappear the moment the status moved.
+        if status_lower in POST_INTERVIEW_DECISION_STATUSES:
+            resend_note = ""
+            if status_lower == "hr_round_time_requested":
+                resend_note = (
+                    '<p class="hint">Availability was already requested. Use this to send '
+                    "the request again if the candidate never received it.</p>"
+                )
             post_interview_review_forms = f"""
+            {resend_note}
             <form method="post" action="/applications/post-interview-approve" class="inline-form" onsubmit="return confirm('Approve this candidate for the final HR round and email the candidate?');">
                 <input type="hidden" name="id" value="{html_escape(application_id)}">
                 <button type="submit">Approve For HR Round</button>
