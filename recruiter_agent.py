@@ -2296,6 +2296,14 @@ def roles_are_compatible(requested_role: str | None, cv_role: str | None, cv_tex
 
 
 def extract_docx_text(path: Path) -> str:
+    try:
+        return _extract_docx_text(path)
+    except Exception as exc:
+        log_json(logging.WARNING, "docx_extract_failed", error=str(exc)[:300])
+        return ""
+
+
+def _extract_docx_text(path: Path) -> str:
     paragraphs = []
     with zipfile.ZipFile(path) as docx:
         xml = docx.read("word/document.xml")
@@ -2313,8 +2321,20 @@ def extract_pdf_text(path: Path) -> str:
     except RuntimeError:
         pypdf = require_package("PyPDF2", "./venv/bin/python -m pip install pypdf")
 
-    reader = pypdf.PdfReader(str(path))
-    pages = [page.extract_text() or "" for page in reader.pages]
+    try:
+        reader = pypdf.PdfReader(str(path))
+    except Exception as exc:
+        # Corrupt or truncated files used to raise straight out of process_email,
+        # which aborted the whole message and left it unread and unanswered.
+        # An unreadable CV is a normal outcome, not a crash.
+        log_json(logging.WARNING, "pdf_open_failed", error=str(exc)[:300])
+        return ""
+    pages = []
+    for index, page in enumerate(reader.pages):
+        try:
+            pages.append(page.extract_text() or "")
+        except Exception as exc:
+            log_json(logging.WARNING, "pdf_page_extract_failed", page=index, error=str(exc)[:200])
     return "\n".join(pages).strip()
 
 
@@ -5702,6 +5722,39 @@ class AIRecruiterAgent:
             application=application,
         )
 
+    def reply_unreadable_cv(self, inbox_email: InboxEmail, filename: str):
+        """The file was a CV by every outward sign, but held no readable text.
+
+        Almost always a scan or a photo of a printout. Without this the
+        candidate simply never heard back.
+        """
+        display = attachment_display_name(filename) or "the file"
+        fallback_body = recruiter_email_body(
+            "Thanks for sending your CV.",
+            f"I could not read any text from {display} - it looks like a scanned image "
+            "rather than a text document, so nothing came through on my side.",
+            "Could you send it again as a PDF exported from Word or Google Docs, or as a "
+            "DOCX? As soon as I can read it I will review your profile.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "the candidate attached what looks like a CV but it contains no readable text, "
+            "most likely a scan or photo; ask warmly for a text-based PDF or DOCX and do "
+            "not suggest anything is wrong with their application",
+            {
+                "attachment_name": display,
+                "unreadable_attachment": True,
+                "supported_cv_formats": ["PDF exported from a document editor", "DOCX", "TXT"],
+            },
+            fallback_body,
+        )
+        self.send_candidate_reply(
+            inbox_email,
+            f"Could not read your CV: {inbox_email.subject}" if inbox_email.subject else "Could not read your CV",
+            body,
+            scenario="unreadable_cv",
+        )
+
     def reply_supported_cv_required(self, inbox_email: InboxEmail):
         fallback_body = recruiter_email_body(
             "Thanks for your message.",
@@ -6586,8 +6639,22 @@ class AIRecruiterAgent:
                 self.db.log_email_event(
                     inbox_email,
                     "cv_text_extract_failed",
-                    {"filename": filename},
+                    {"filename": filename, "payload_bytes": len(payload or b"")},
                 )
+                # Silently dropping the candidate here meant a scanned CV got no
+                # reply at all - not a rejection, not a request for a better
+                # file, nothing. Tell them, and let HR know if it keeps happening.
+                self.reply_unreadable_cv(inbox_email, filename)
+                if self.db.recent_event_count(inbox_email.sender, ["cv_text_extract_failed"], hours=72) > 1:
+                    self.notify_manual_hr_review(
+                        inbox_email,
+                        active_application,
+                        f"The CV attachment '{attachment_display_name(filename)}' could not be read as text "
+                        "(it is most likely a scan or image). The candidate has now sent an unreadable file "
+                        "more than once.",
+                        event_type="repeated_unreadable_cv_handoff_to_hr",
+                        mark_application=bool(active_application),
+                    )
                 continue
 
             extracted = self.ai.extract_cv_details(cv_text, thread_context)
