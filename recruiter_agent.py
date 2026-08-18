@@ -349,6 +349,13 @@ EVIDENCE_WEAK_TOKENS = {
     "junior",
 }
 
+# A claim older than this is treated as abandoned and may be re-acquired. If the
+# process is killed between claiming a message and releasing it, the claim would
+# otherwise be permanent: every later notification skips the message, it stays
+# unread, and the candidate is never answered. Re-processing is safe because the
+# reply ledger still blocks duplicate emails.
+MESSAGE_CLAIM_STALE_MINUTES = int(os.getenv("RECRUITER_MESSAGE_CLAIM_STALE_MINUTES", "30"))
+
 # Never send the same scenario to the same application twice inside this window.
 # This is the backstop that caps the blast radius of any single logic bug.
 REPLY_SCENARIO_COOLDOWN_HOURS = int(os.getenv("RECRUITER_REPLY_SCENARIO_COOLDOWN_HOURS", "24"))
@@ -2522,10 +2529,13 @@ class RecruiterDatabase:
                     """
                     INSERT INTO recruiter_processed_messages (provider_message_id)
                     VALUES (%s)
-                    ON CONFLICT (provider_message_id) DO NOTHING
+                    ON CONFLICT (provider_message_id) DO UPDATE
+                        SET processed_at = NOW()
+                        WHERE recruiter_processed_messages.processed_at
+                              < NOW() - make_interval(mins => %s)
                     RETURNING provider_message_id
                     """,
-                    (message_id,),
+                    (message_id, MESSAGE_CLAIM_STALE_MINUTES),
                 )
                 claimed = cursor.fetchone() is not None
             # Committed immediately so the claim is durable and independent of
@@ -4085,6 +4095,59 @@ class MicrosoftGraphProvider:
                 "clientState": client_state,
             },
         )
+
+    def renew_inbox_subscription(self, subscription_id: str, hours: int) -> dict[str, Any]:
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=max(1, min(hours, 48)))
+        return self.request(
+            "PATCH",
+            f"/subscriptions/{quote(subscription_id, safe='')}",
+            json={"expirationDateTime": expires_at.isoformat().replace("+00:00", "Z")},
+        )
+
+    def renew_or_create_inbox_subscription(
+        self,
+        notification_url: str,
+        client_state: str,
+        hours: int,
+    ) -> dict[str, Any]:
+        """Keep exactly one live Inbox subscription for this mailbox.
+
+        Graph subscriptions expire after at most 48 hours. Nothing renewed them,
+        so mail processing stopped silently whenever one lapsed - no error, no
+        log line, just candidates never receiving a reply.
+        """
+        target = f"users/{MICROSOFT_MAILBOX}/mailfolders('inbox')/messages"
+        for subscription in self.list_subscriptions():
+            resource = (subscription.get("resource") or "").lower().replace("%40", "@")
+            if resource != target.lower():
+                continue
+            if (subscription.get("notificationUrl") or "") != notification_url:
+                continue
+            try:
+                renewed = self.renew_inbox_subscription(subscription["id"], hours)
+                log_json(
+                    logging.INFO,
+                    "graph_subscription_renewed",
+                    subscription_id=subscription["id"],
+                    expires=renewed.get("expirationDateTime"),
+                )
+                return renewed
+            except Exception as exc:
+                log_json(
+                    logging.WARNING,
+                    "graph_subscription_renew_failed_recreating",
+                    subscription_id=subscription.get("id"),
+                    error=str(exc)[:300],
+                )
+                break
+        created = self.create_inbox_subscription(notification_url, client_state, hours)
+        log_json(
+            logging.INFO,
+            "graph_subscription_created",
+            subscription_id=created.get("id"),
+            expires=created.get("expirationDateTime"),
+        )
+        return created
 
     def list_subscriptions(self) -> list[dict[str, Any]]:
         data = self.request("GET", "/subscriptions")
@@ -8564,6 +8627,27 @@ class GraphWebhookServer:
 
         return GraphWebhookHandler
 
+    def keep_subscription_alive(self):
+        """Renew the Inbox subscription well before Graph expires it.
+
+        Subscriptions last at most 48 hours and nothing renewed them, so mail
+        processing simply stopped whenever one lapsed - silently, with no error
+        and no log line. Runs for the life of the webhook process.
+        """
+        interval = max(600, int(GRAPH_SUBSCRIPTION_HOURS * 3600 / 3))
+        while True:
+            try:
+                provider = MicrosoftGraphProvider()
+                provider.renew_or_create_inbox_subscription(
+                    GRAPH_NOTIFICATION_URL,
+                    GRAPH_CLIENT_STATE,
+                    GRAPH_SUBSCRIPTION_HOURS,
+                )
+            except Exception as exc:
+                LOGGER.exception("Graph subscription renewal failed: %s", exc)
+                log_json(logging.ERROR, "graph_subscription_renew_error", error=str(exc)[:300])
+            time.sleep(interval)
+
     def serve_forever(self):
         httpd = ReusableThreadingHTTPServer(
             (GRAPH_WEBHOOK_HOST, GRAPH_WEBHOOK_PORT),
@@ -8573,7 +8657,11 @@ class GraphWebhookServer:
             f"Microsoft Graph webhook listening on "
             f"http://{GRAPH_WEBHOOK_HOST}:{GRAPH_WEBHOOK_PORT}{GRAPH_WEBHOOK_PATH}"
         )
-        print("Register the subscription with --register-graph-subscription after exposing this URL over HTTPS.")
+        if GRAPH_NOTIFICATION_URL and GRAPH_CLIENT_STATE:
+            Thread(target=self.keep_subscription_alive, daemon=True).start()
+            print("Subscription auto-renewal is running.")
+        else:
+            print("GRAPH_NOTIFICATION_URL/GRAPH_CLIENT_STATE not set; auto-renewal is OFF.")
         httpd.serve_forever()
 
 
@@ -8740,6 +8828,18 @@ def main():
         help="Release a claimed message id so it can be processed again",
     )
     parser.add_argument(
+        "--renew-graph-subscription",
+        action="store_true",
+        help="Renew (or recreate) the Outlook Inbox subscription now",
+    )
+    parser.add_argument(
+        "--list-unread",
+        nargs="?",
+        const=20,
+        type=int,
+        help="List unread inbox messages the agent has not answered, with their claim state",
+    )
+    parser.add_argument(
         "--list-human-handled",
         action="store_true",
         help="List applications the agent has stopped replying to because it saw a human takeover",
@@ -8816,6 +8916,46 @@ def main():
         try:
             db.release_provider_message(args.release_message)
             print(f"Released {args.release_message}. It will be processed on the next pass.")
+        finally:
+            db.close()
+        return
+
+    if args.renew_graph_subscription:
+        provider = MicrosoftGraphProvider()
+        result = provider.renew_or_create_inbox_subscription(
+            GRAPH_NOTIFICATION_URL, GRAPH_CLIENT_STATE, GRAPH_SUBSCRIPTION_HOURS
+        )
+        print(f"Subscription {result.get('id')} valid until {result.get('expirationDateTime')}.")
+        return
+
+    if args.list_unread:
+        provider = build_inbox_provider()
+        if not isinstance(provider, MicrosoftGraphProvider):
+            print("--list-unread requires MAIL_PROVIDER=microsoft_graph.")
+            return
+        db = RecruiterDatabase()
+        try:
+            data = provider.request(
+                "GET",
+                f"/users/{provider.mailbox}/mailFolders/inbox/messages",
+                params={
+                    "$filter": "isRead eq false",
+                    "$top": str(args.list_unread),
+                    "$orderby": "receivedDateTime desc",
+                    "$select": "id,subject,from,receivedDateTime",
+                },
+            )
+            rows = data.get("value", [])
+            if not rows:
+                print("No unread inbox messages.")
+            for message in rows:
+                sender = ((message.get("from") or {}).get("emailAddress") or {}).get("address", "?")
+                claimed = db.one(
+                    "SELECT processed_at FROM recruiter_processed_messages WHERE provider_message_id = %s",
+                    (message["id"],),
+                )
+                state = f"claimed at {claimed['processed_at']}" if claimed else "not claimed"
+                print(f"  {message['receivedDateTime']}  {sender:<34} {message['subject'][:44]:<46} [{state}]")
         finally:
             db.close()
         return
