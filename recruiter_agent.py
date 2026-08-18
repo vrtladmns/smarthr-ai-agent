@@ -317,6 +317,13 @@ THREAD_CONTEXT_PER_MESSAGE_CHARS = int(os.getenv("RECRUITER_THREAD_CONTEXT_PER_M
 # run past 20 messages, and the newest ones are the ones that matter.
 THREAD_FETCH_LIMIT = int(os.getenv("RECRUITER_THREAD_FETCH_LIMIT", "25"))
 
+# How sure the LLM must be to attach a requirement. This is deliberately not a
+# suitability bar: it only decides which opening to evaluate the CV against.
+# Suitability is then judged by the JD score, which yields either screening
+# questions or an explained rejection HR can revoke - both better outcomes than
+# asking a human to assign the requirement by hand.
+LLM_MATCH_MIN_CONFIDENCE = float(os.getenv("RECRUITER_LLM_MATCH_MIN_CONFIDENCE", "0.5"))
+
 # Evidence of doing the work counts slightly less than carrying the job title,
 # so an exact title match still wins when both requirements look plausible.
 EVIDENCE_MATCH_WEIGHT = float(os.getenv("RECRUITER_EVIDENCE_MATCH_WEIGHT", "0.9"))
@@ -2165,6 +2172,20 @@ ROLE_FAMILY_KEYWORDS = {
         "k1",
         "preparer",
     },
+    "sales": {
+        "sales",
+        "selling",
+        "business",
+        "bd",
+        "revenue",
+        "prospecting",
+        "pipeline",
+        "crm",
+        "quota",
+        "outreach",
+        "telesales",
+        "telecalling",
+    },
     "it_support": {
         "desktop",
         "helpdesk",
@@ -2204,6 +2225,69 @@ def role_families_from_text(value: str | None) -> set[str]:
     return {family for family, keywords in STEMMED_ROLE_FAMILIES.items() if tokens & keywords}
 
 
+def candidate_role_families(
+    cv_role_summary: dict[str, Any] | None,
+    extracted: dict[str, Any] | None = None,
+    cv_text: str = "",
+) -> set[str]:
+    """Everything we can infer about which field this candidate works in."""
+    summary = cv_role_summary or {}
+    families = set()
+    declared = str(summary.get("role_family") or "").strip().lower()
+    if declared:
+        families.add(declared)
+    families |= role_families_from_text(
+        " ".join(
+            str(value)
+            for value in [
+                summary.get("primary_role"),
+                (extracted or {}).get("target_position"),
+                (extracted or {}).get("current_title"),
+                " ".join(str(skill) for skill in ensure_list((extracted or {}).get("skills"))),
+                cv_text[:2000],
+            ]
+            if value
+        )
+    )
+    return families
+
+
+def single_family_requirement(
+    requirements: list[dict[str, Any]],
+    cv_role_summary: dict[str, Any] | None,
+    extracted: dict[str, Any] | None = None,
+    cv_text: str = "",
+) -> dict[str, Any] | None:
+    """The one open role in this candidate's field, when there is exactly one.
+
+    Job titles in accounting barely overlap as strings - "Senior Accountant",
+    "Accounts Executive" and "Sr. Accounts Associate" share no token with
+    "US Bookkeeper" - so title matching alone sent every one of them to a human.
+    When the field is unambiguous, evaluate the CV against that JD and let the
+    JD score decide. That produces either screening questions or an explained
+    rejection, instead of asking HR to assign the requirement by hand.
+    """
+    families = candidate_role_families(cv_role_summary, extracted, cv_text)
+    if not families:
+        return None
+
+    # The field the CV summary actually declared outranks anything inferred from
+    # loose keywords: "Sr. US Accountant & Payroll Executive" reads as both
+    # accounting and HR, and only the first of those is what they do.
+    declared = str((cv_role_summary or {}).get("role_family") or "").strip().lower()
+    for candidate_families in ({declared} if declared else set(), families):
+        if not candidate_families:
+            continue
+        matches = [
+            requirement
+            for requirement in requirements or []
+            if requirement_role_families(requirement) & candidate_families
+        ]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
 def near_miss_requirements(
     requirements: list[dict[str, Any]],
     cv_role_summary: dict[str, Any] | None,
@@ -2220,24 +2304,7 @@ def near_miss_requirements(
     if not requirements:
         return []
 
-    summary = cv_role_summary or {}
-    candidate_families = set()
-    declared_family = str(summary.get("role_family") or "").strip().lower()
-    if declared_family:
-        candidate_families.add(declared_family)
-    candidate_families |= role_families_from_text(
-        " ".join(
-            str(value)
-            for value in [
-                summary.get("primary_role"),
-                (extracted or {}).get("target_position"),
-                (extracted or {}).get("current_title"),
-                " ".join(str(skill) for skill in ensure_list((extracted or {}).get("skills"))),
-                cv_text[:2000],
-            ]
-            if value
-        )
-    )
+    candidate_families = candidate_role_families(cv_role_summary, extracted, cv_text)
     if not candidate_families:
         return []
 
@@ -2257,13 +2324,11 @@ def requirement_role_families(requirement: dict[str, Any] | None) -> set[str]:
     """
     if not requirement:
         return set()
-    return role_families_from_text(
-        " ".join(
-            str(value)
-            for value in [requirement.get("position_title"), requirement.get("job_description")]
-            if value
-        )
-    )
+    # Title only. A job description is prose that mentions payroll, clients and
+    # talent in passing, and deriving the field from it made unrelated roles
+    # look adjacent. No family simply means "unknown", which is handled safely
+    # by every caller.
+    return role_families_from_text(requirement.get("position_title"))
 
 
 def roles_are_compatible(requested_role: str | None, cv_role: str | None, cv_text: str = "") -> bool:
@@ -6496,6 +6561,25 @@ class AIRecruiterAgent:
                 if requirements
                 else {"requirement_id": None, "confidence": 0, "reason": "No open requirements in database"}
             )
+            if requirements and not match.get("requirement_id"):
+                sole = single_family_requirement(requirements, cv_role_summary, extracted, cv_text)
+                if sole:
+                    match = {
+                        "requirement_id": sole["id"],
+                        "confidence": 0.5,
+                        "reason": (
+                            f"Only open role in the candidate's field "
+                            f"({', '.join(sorted(requirement_role_families(sole))) or 'unknown'}); "
+                            "JD score decides suitability"
+                        ),
+                    }
+                    log_json(
+                        logging.INFO,
+                        "requirement_matched_by_field",
+                        **inbox_email_summary(inbox_email),
+                        requirement=sole.get("position_title"),
+                    )
+
             matched_requirement_id = safe_int(match.get("requirement_id"))
             requirement = next((row for row in requirements if row["id"] == matched_requirement_id), None)
             if requirement and not requirement_is_compatible_with_candidate_role(
@@ -6823,7 +6907,7 @@ class AIRecruiterAgent:
                     requirements,
                     cv_text=cv_text,
                 )
-                if score_number(match.get("confidence")) is not None and score_number(match.get("confidence")) < 0.75:
+                if score_number(match.get("confidence")) is not None and score_number(match.get("confidence")) < LLM_MATCH_MIN_CONFIDENCE:
                     match = {
                         "requirement_id": None,
                         "confidence": score_number(match.get("confidence")) or 0,
