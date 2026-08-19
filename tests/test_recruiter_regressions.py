@@ -548,6 +548,80 @@ def test_thread_with_no_outbound_mail_is_not_a_takeover():
     assert _takeover([("candidate@example.com", "<c1>")], known_ids={"<agent-1>"}) is False
 
 
+
+
+# --- matching must reach a JD, not a human (mailbox audit 2026-08-19) ---------
+
+FIELD_REQUIREMENTS = [
+    {"id": 1, "position_title": "Business Development Executive",
+     "job_description": "B2B sales pipeline, lead generation, talent for closing deals."},
+    {"id": 2, "position_title": "US Bookkeeper",
+     "job_description": "5 years US bookkeeping, QuickBooks Online, payroll processing, financial statements."},
+    {"id": 3, "position_title": "US Tax Preparer",
+     "job_description": "2-7 years US CPA firm, 1040, 1120S, tax software."},
+]
+
+
+def test_requirement_field_comes_from_the_title_not_the_prose():
+    """'payroll' and 'talent' in a JD made unrelated roles look adjacent."""
+    assert ra.requirement_role_families(FIELD_REQUIREMENTS[1]) == {"accounting"}
+    assert ra.requirement_role_families(FIELD_REQUIREMENTS[0]) == {"sales"}
+    assert ra.requirement_role_families(FIELD_REQUIREMENTS[2]) == {"tax"}
+
+
+def test_accounting_titles_reach_the_bookkeeper_jd():
+    """None of these shares a token with 'US Bookkeeper', so all went to HR."""
+    for title in [
+        "Senior Accountant",
+        "Accounts Executive",
+        "Sr. Accounts Associate",
+        "Sr. US Accountant & Payroll Executive",
+        "Junior Accountant",
+    ]:
+        sole = ra.single_family_requirement(
+            FIELD_REQUIREMENTS,
+            {"primary_role": title, "role_family": "accounting"},
+            {"current_title": title, "skills": []},
+            "general ledger, AP/AR, reconciliation, month end close",
+        )
+        assert sole and sole["position_title"] == "US Bookkeeper", title
+
+
+def test_unrelated_fields_are_still_not_routed():
+    for title, family in [
+        ("Talent Acquisition Lead", "hr"),
+        ("QA Engineer", "software"),
+        ("UI/UX Designer", "design"),
+    ]:
+        assert ra.single_family_requirement(
+            FIELD_REQUIREMENTS,
+            {"primary_role": title, "role_family": family},
+            {"current_title": title, "skills": []},
+            "",
+        ) is None, title
+
+
+def test_a_recruiter_is_not_told_bookkeeping_is_the_same_area():
+    hits = ra.near_miss_requirements(
+        FIELD_REQUIREMENTS,
+        {"primary_role": "Talent Acquisition Lead", "role_family": "hr"},
+        {"current_title": "Talent Acquisition Lead", "skills": ["sourcing"]},
+        "talent acquisition, sourcing, interviews, onboarding",
+    )
+    assert hits == []
+
+
+def test_declared_field_wins_when_a_title_reads_as_two():
+    """'Payroll Executive' also reads as HR; accounting is what they do."""
+    sole = ra.single_family_requirement(
+        FIELD_REQUIREMENTS + [{"id": 9, "position_title": "HR Manager", "job_description": "employee relations"}],
+        {"primary_role": "Sr. US Accountant & Payroll Executive", "role_family": "accounting"},
+        {"current_title": "Sr. US Accountant & Payroll Executive", "skills": []},
+        "US accounting and payroll, QuickBooks",
+    )
+    assert sole and sole["position_title"] == "US Bookkeeper"
+
+
 if __name__ == "__main__":
     import pytest
 

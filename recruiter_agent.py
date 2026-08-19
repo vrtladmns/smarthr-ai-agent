@@ -317,6 +317,13 @@ THREAD_CONTEXT_PER_MESSAGE_CHARS = int(os.getenv("RECRUITER_THREAD_CONTEXT_PER_M
 # run past 20 messages, and the newest ones are the ones that matter.
 THREAD_FETCH_LIMIT = int(os.getenv("RECRUITER_THREAD_FETCH_LIMIT", "25"))
 
+# How sure the LLM must be to attach a requirement. This is deliberately not a
+# suitability bar: it only decides which opening to evaluate the CV against.
+# Suitability is then judged by the JD score, which yields either screening
+# questions or an explained rejection HR can revoke - both better outcomes than
+# asking a human to assign the requirement by hand.
+LLM_MATCH_MIN_CONFIDENCE = float(os.getenv("RECRUITER_LLM_MATCH_MIN_CONFIDENCE", "0.5"))
+
 # Evidence of doing the work counts slightly less than carrying the job title,
 # so an exact title match still wins when both requirements look plausible.
 EVIDENCE_MATCH_WEIGHT = float(os.getenv("RECRUITER_EVIDENCE_MATCH_WEIGHT", "0.9"))
@@ -348,6 +355,13 @@ EVIDENCE_WEAK_TOKENS = {
     "senior",
     "junior",
 }
+
+# A claim older than this is treated as abandoned and may be re-acquired. If the
+# process is killed between claiming a message and releasing it, the claim would
+# otherwise be permanent: every later notification skips the message, it stays
+# unread, and the candidate is never answered. Re-processing is safe because the
+# reply ledger still blocks duplicate emails.
+MESSAGE_CLAIM_STALE_MINUTES = int(os.getenv("RECRUITER_MESSAGE_CLAIM_STALE_MINUTES", "30"))
 
 # Never send the same scenario to the same application twice inside this window.
 # This is the backstop that caps the blast radius of any single logic bug.
@@ -2158,6 +2172,20 @@ ROLE_FAMILY_KEYWORDS = {
         "k1",
         "preparer",
     },
+    "sales": {
+        "sales",
+        "selling",
+        "business",
+        "bd",
+        "revenue",
+        "prospecting",
+        "pipeline",
+        "crm",
+        "quota",
+        "outreach",
+        "telesales",
+        "telecalling",
+    },
     "it_support": {
         "desktop",
         "helpdesk",
@@ -2197,6 +2225,69 @@ def role_families_from_text(value: str | None) -> set[str]:
     return {family for family, keywords in STEMMED_ROLE_FAMILIES.items() if tokens & keywords}
 
 
+def candidate_role_families(
+    cv_role_summary: dict[str, Any] | None,
+    extracted: dict[str, Any] | None = None,
+    cv_text: str = "",
+) -> set[str]:
+    """Everything we can infer about which field this candidate works in."""
+    summary = cv_role_summary or {}
+    families = set()
+    declared = str(summary.get("role_family") or "").strip().lower()
+    if declared:
+        families.add(declared)
+    families |= role_families_from_text(
+        " ".join(
+            str(value)
+            for value in [
+                summary.get("primary_role"),
+                (extracted or {}).get("target_position"),
+                (extracted or {}).get("current_title"),
+                " ".join(str(skill) for skill in ensure_list((extracted or {}).get("skills"))),
+                cv_text[:2000],
+            ]
+            if value
+        )
+    )
+    return families
+
+
+def single_family_requirement(
+    requirements: list[dict[str, Any]],
+    cv_role_summary: dict[str, Any] | None,
+    extracted: dict[str, Any] | None = None,
+    cv_text: str = "",
+) -> dict[str, Any] | None:
+    """The one open role in this candidate's field, when there is exactly one.
+
+    Job titles in accounting barely overlap as strings - "Senior Accountant",
+    "Accounts Executive" and "Sr. Accounts Associate" share no token with
+    "US Bookkeeper" - so title matching alone sent every one of them to a human.
+    When the field is unambiguous, evaluate the CV against that JD and let the
+    JD score decide. That produces either screening questions or an explained
+    rejection, instead of asking HR to assign the requirement by hand.
+    """
+    families = candidate_role_families(cv_role_summary, extracted, cv_text)
+    if not families:
+        return None
+
+    # The field the CV summary actually declared outranks anything inferred from
+    # loose keywords: "Sr. US Accountant & Payroll Executive" reads as both
+    # accounting and HR, and only the first of those is what they do.
+    declared = str((cv_role_summary or {}).get("role_family") or "").strip().lower()
+    for candidate_families in ({declared} if declared else set(), families):
+        if not candidate_families:
+            continue
+        matches = [
+            requirement
+            for requirement in requirements or []
+            if requirement_role_families(requirement) & candidate_families
+        ]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
 def near_miss_requirements(
     requirements: list[dict[str, Any]],
     cv_role_summary: dict[str, Any] | None,
@@ -2213,24 +2304,7 @@ def near_miss_requirements(
     if not requirements:
         return []
 
-    summary = cv_role_summary or {}
-    candidate_families = set()
-    declared_family = str(summary.get("role_family") or "").strip().lower()
-    if declared_family:
-        candidate_families.add(declared_family)
-    candidate_families |= role_families_from_text(
-        " ".join(
-            str(value)
-            for value in [
-                summary.get("primary_role"),
-                (extracted or {}).get("target_position"),
-                (extracted or {}).get("current_title"),
-                " ".join(str(skill) for skill in ensure_list((extracted or {}).get("skills"))),
-                cv_text[:2000],
-            ]
-            if value
-        )
-    )
+    candidate_families = candidate_role_families(cv_role_summary, extracted, cv_text)
     if not candidate_families:
         return []
 
@@ -2250,13 +2324,11 @@ def requirement_role_families(requirement: dict[str, Any] | None) -> set[str]:
     """
     if not requirement:
         return set()
-    return role_families_from_text(
-        " ".join(
-            str(value)
-            for value in [requirement.get("position_title"), requirement.get("job_description")]
-            if value
-        )
-    )
+    # Title only. A job description is prose that mentions payroll, clients and
+    # talent in passing, and deriving the field from it made unrelated roles
+    # look adjacent. No family simply means "unknown", which is handled safely
+    # by every caller.
+    return role_families_from_text(requirement.get("position_title"))
 
 
 def roles_are_compatible(requested_role: str | None, cv_role: str | None, cv_text: str = "") -> bool:
@@ -2289,6 +2361,14 @@ def roles_are_compatible(requested_role: str | None, cv_role: str | None, cv_tex
 
 
 def extract_docx_text(path: Path) -> str:
+    try:
+        return _extract_docx_text(path)
+    except Exception as exc:
+        log_json(logging.WARNING, "docx_extract_failed", error=str(exc)[:300])
+        return ""
+
+
+def _extract_docx_text(path: Path) -> str:
     paragraphs = []
     with zipfile.ZipFile(path) as docx:
         xml = docx.read("word/document.xml")
@@ -2306,8 +2386,20 @@ def extract_pdf_text(path: Path) -> str:
     except RuntimeError:
         pypdf = require_package("PyPDF2", "./venv/bin/python -m pip install pypdf")
 
-    reader = pypdf.PdfReader(str(path))
-    pages = [page.extract_text() or "" for page in reader.pages]
+    try:
+        reader = pypdf.PdfReader(str(path))
+    except Exception as exc:
+        # Corrupt or truncated files used to raise straight out of process_email,
+        # which aborted the whole message and left it unread and unanswered.
+        # An unreadable CV is a normal outcome, not a crash.
+        log_json(logging.WARNING, "pdf_open_failed", error=str(exc)[:300])
+        return ""
+    pages = []
+    for index, page in enumerate(reader.pages):
+        try:
+            pages.append(page.extract_text() or "")
+        except Exception as exc:
+            log_json(logging.WARNING, "pdf_page_extract_failed", page=index, error=str(exc)[:200])
     return "\n".join(pages).strip()
 
 
@@ -2522,10 +2614,13 @@ class RecruiterDatabase:
                     """
                     INSERT INTO recruiter_processed_messages (provider_message_id)
                     VALUES (%s)
-                    ON CONFLICT (provider_message_id) DO NOTHING
+                    ON CONFLICT (provider_message_id) DO UPDATE
+                        SET processed_at = NOW()
+                        WHERE recruiter_processed_messages.processed_at
+                              < NOW() - make_interval(mins => %s)
                     RETURNING provider_message_id
                     """,
-                    (message_id,),
+                    (message_id, MESSAGE_CLAIM_STALE_MINUTES),
                 )
                 claimed = cursor.fetchone() is not None
             # Committed immediately so the claim is durable and independent of
@@ -4086,6 +4181,59 @@ class MicrosoftGraphProvider:
             },
         )
 
+    def renew_inbox_subscription(self, subscription_id: str, hours: int) -> dict[str, Any]:
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=max(1, min(hours, 48)))
+        return self.request(
+            "PATCH",
+            f"/subscriptions/{quote(subscription_id, safe='')}",
+            json={"expirationDateTime": expires_at.isoformat().replace("+00:00", "Z")},
+        )
+
+    def renew_or_create_inbox_subscription(
+        self,
+        notification_url: str,
+        client_state: str,
+        hours: int,
+    ) -> dict[str, Any]:
+        """Keep exactly one live Inbox subscription for this mailbox.
+
+        Graph subscriptions expire after at most 48 hours. Nothing renewed them,
+        so mail processing stopped silently whenever one lapsed - no error, no
+        log line, just candidates never receiving a reply.
+        """
+        target = f"users/{MICROSOFT_MAILBOX}/mailfolders('inbox')/messages"
+        for subscription in self.list_subscriptions():
+            resource = (subscription.get("resource") or "").lower().replace("%40", "@")
+            if resource != target.lower():
+                continue
+            if (subscription.get("notificationUrl") or "") != notification_url:
+                continue
+            try:
+                renewed = self.renew_inbox_subscription(subscription["id"], hours)
+                log_json(
+                    logging.INFO,
+                    "graph_subscription_renewed",
+                    subscription_id=subscription["id"],
+                    expires=renewed.get("expirationDateTime"),
+                )
+                return renewed
+            except Exception as exc:
+                log_json(
+                    logging.WARNING,
+                    "graph_subscription_renew_failed_recreating",
+                    subscription_id=subscription.get("id"),
+                    error=str(exc)[:300],
+                )
+                break
+        created = self.create_inbox_subscription(notification_url, client_state, hours)
+        log_json(
+            logging.INFO,
+            "graph_subscription_created",
+            subscription_id=created.get("id"),
+            expires=created.get("expirationDateTime"),
+        )
+        return created
+
     def list_subscriptions(self) -> list[dict[str, Any]]:
         data = self.request("GET", "/subscriptions")
         return data.get("value", [])
@@ -5639,6 +5787,39 @@ class AIRecruiterAgent:
             application=application,
         )
 
+    def reply_unreadable_cv(self, inbox_email: InboxEmail, filename: str):
+        """The file was a CV by every outward sign, but held no readable text.
+
+        Almost always a scan or a photo of a printout. Without this the
+        candidate simply never heard back.
+        """
+        display = attachment_display_name(filename) or "the file"
+        fallback_body = recruiter_email_body(
+            "Thanks for sending your CV.",
+            f"I could not read any text from {display} - it looks like a scanned image "
+            "rather than a text document, so nothing came through on my side.",
+            "Could you send it again as a PDF exported from Word or Google Docs, or as a "
+            "DOCX? As soon as I can read it I will review your profile.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "the candidate attached what looks like a CV but it contains no readable text, "
+            "most likely a scan or photo; ask warmly for a text-based PDF or DOCX and do "
+            "not suggest anything is wrong with their application",
+            {
+                "attachment_name": display,
+                "unreadable_attachment": True,
+                "supported_cv_formats": ["PDF exported from a document editor", "DOCX", "TXT"],
+            },
+            fallback_body,
+        )
+        self.send_candidate_reply(
+            inbox_email,
+            f"Could not read your CV: {inbox_email.subject}" if inbox_email.subject else "Could not read your CV",
+            body,
+            scenario="unreadable_cv",
+        )
+
     def reply_supported_cv_required(self, inbox_email: InboxEmail):
         fallback_body = recruiter_email_body(
             "Thanks for your message.",
@@ -6380,6 +6561,25 @@ class AIRecruiterAgent:
                 if requirements
                 else {"requirement_id": None, "confidence": 0, "reason": "No open requirements in database"}
             )
+            if requirements and not match.get("requirement_id"):
+                sole = single_family_requirement(requirements, cv_role_summary, extracted, cv_text)
+                if sole:
+                    match = {
+                        "requirement_id": sole["id"],
+                        "confidence": 0.5,
+                        "reason": (
+                            f"Only open role in the candidate's field "
+                            f"({', '.join(sorted(requirement_role_families(sole))) or 'unknown'}); "
+                            "JD score decides suitability"
+                        ),
+                    }
+                    log_json(
+                        logging.INFO,
+                        "requirement_matched_by_field",
+                        **inbox_email_summary(inbox_email),
+                        requirement=sole.get("position_title"),
+                    )
+
             matched_requirement_id = safe_int(match.get("requirement_id"))
             requirement = next((row for row in requirements if row["id"] == matched_requirement_id), None)
             if requirement and not requirement_is_compatible_with_candidate_role(
@@ -6523,8 +6723,22 @@ class AIRecruiterAgent:
                 self.db.log_email_event(
                     inbox_email,
                     "cv_text_extract_failed",
-                    {"filename": filename},
+                    {"filename": filename, "payload_bytes": len(payload or b"")},
                 )
+                # Silently dropping the candidate here meant a scanned CV got no
+                # reply at all - not a rejection, not a request for a better
+                # file, nothing. Tell them, and let HR know if it keeps happening.
+                self.reply_unreadable_cv(inbox_email, filename)
+                if self.db.recent_event_count(inbox_email.sender, ["cv_text_extract_failed"], hours=72) > 1:
+                    self.notify_manual_hr_review(
+                        inbox_email,
+                        active_application,
+                        f"The CV attachment '{attachment_display_name(filename)}' could not be read as text "
+                        "(it is most likely a scan or image). The candidate has now sent an unreadable file "
+                        "more than once.",
+                        event_type="repeated_unreadable_cv_handoff_to_hr",
+                        mark_application=bool(active_application),
+                    )
                 continue
 
             extracted = self.ai.extract_cv_details(cv_text, thread_context)
@@ -6693,7 +6907,7 @@ class AIRecruiterAgent:
                     requirements,
                     cv_text=cv_text,
                 )
-                if score_number(match.get("confidence")) is not None and score_number(match.get("confidence")) < 0.75:
+                if score_number(match.get("confidence")) is not None and score_number(match.get("confidence")) < LLM_MATCH_MIN_CONFIDENCE:
                     match = {
                         "requirement_id": None,
                         "confidence": score_number(match.get("confidence")) or 0,
@@ -7409,6 +7623,223 @@ def send_tracked_direct_email(
     return provider_message_id
 
 
+REMATCH_DEFAULT_STATUSES = ("manual_hr_review", "no_open_requirement")
+
+
+def rematch_stored_applications(
+    statuses: tuple[str, ...] = REMATCH_DEFAULT_STATUSES,
+    apply_changes: bool = False,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Re-run matching over applications that were parked for a human.
+
+    Most of them were parked because title matching could not bridge, say,
+    "Senior Accountant" to "US Bookkeeper" - not because anyone judged them
+    unsuitable. Re-running now sends each to the JD it should have been measured
+    against, and the JD score decides: screening questions, or a rejection with
+    a reason HR can revoke.
+
+    Defaults to a dry run. Nothing is written or emailed unless apply_changes is
+    explicitly set, because this sends real mail to real candidates.
+    """
+    db = RecruiterDatabase()
+    mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
+    results: list[dict[str, Any]] = []
+    try:
+        db.init_schema()
+        ai = RecruiterAI()
+        requirements = db.open_requirements()
+        if not requirements:
+            print("No open requirements; nothing to match against.")
+            return results
+
+        placeholders = ", ".join(["%s"] * len(statuses))
+        rows = db.rows(
+            f"""
+            SELECT ra.id, ra.application_status, ra.candidate_email, ra.source_email,
+                   ra.detected_position, ra.matched_position, ra.requirement_id,
+                   rc.full_name, rc.current_title, rc.skills, rc.raw_cv_text, rc.cv_summary
+            FROM recruiter_applications ra
+            JOIN recruiter_candidates rc ON rc.id = ra.candidate_id
+            WHERE LOWER(COALESCE(ra.application_status, '')) IN ({placeholders})
+            ORDER BY ra.id DESC
+            LIMIT %s
+            """,
+            (*[status.lower() for status in statuses], limit),
+        )
+        print(f"{len(rows)} application(s) in {', '.join(statuses)}"
+              f"{'' if apply_changes else '   [DRY RUN - nothing will be sent]'}\n")
+
+        for row in rows:
+            application_id = row["id"]
+            who = row.get("candidate_email") or row.get("source_email") or "-"
+            cv_text = row.get("raw_cv_text") or ""
+            outcome = {"application_id": application_id, "candidate": who, "action": None, "detail": ""}
+
+            if not cv_text.strip():
+                outcome.update(action="skipped", detail="no CV text stored")
+                results.append(outcome)
+                print(f"  {application_id:>5}  {who:<38} SKIP    no CV text stored")
+                continue
+
+            extracted = normalize_cv_details(
+                {
+                    "full_name": row.get("full_name"),
+                    "current_title": row.get("current_title"),
+                    "target_position": row.get("matched_position") or row.get("detected_position"),
+                    "skills": json_list_or_empty(row.get("skills")),
+                }
+            )
+            classification = {"detected_position": row.get("detected_position")}
+            try:
+                cv_role_summary = ai.summarize_cv_role(cv_text, extracted)
+            except Exception as exc:
+                LOGGER.warning("Could not summarise role for %s: %s", application_id, exc)
+                cv_role_summary = {}
+
+            match = deterministic_requirement_match(
+                extracted, classification, requirements, source_text=cv_text[:4000]
+            )
+            if not match.get("requirement_id"):
+                try:
+                    llm_match = ai.match_requirement(
+                        {**extracted, "cv_role_summary": cv_role_summary}, requirements, cv_text=cv_text
+                    )
+                    confidence = score_number(llm_match.get("confidence"))
+                    if llm_match.get("requirement_id") and (
+                        confidence is None or confidence >= LLM_MATCH_MIN_CONFIDENCE
+                    ):
+                        match = llm_match
+                except Exception as exc:
+                    LOGGER.warning("LLM match failed for %s: %s", application_id, exc)
+            requirement = next(
+                (r for r in requirements if r["id"] == safe_int(match.get("requirement_id"))), None
+            )
+            if not requirement:
+                requirement = single_family_requirement(requirements, cv_role_summary, extracted, cv_text)
+
+            if not requirement:
+                outcome.update(action="no_match", detail="no open role in this candidate's field")
+                results.append(outcome)
+                print(f"  {application_id:>5}  {who:<38} KEEP    no open role in their field - left for HR")
+                continue
+
+            evaluation = ai.evaluate_cv(cv_text, extracted, requirement)
+            ats = numeric_value(evaluation.get("ats_score"))
+            jd = numeric_value(evaluation.get("jd_match_score"))
+            role = requirement.get("position_title")
+            passes = passes_screening_threshold(evaluation, requirement)
+            outcome.update(
+                role=role, ats_score=ats, jd_match_score=jd,
+                action="screening_questions" if passes else "reject_jd_score",
+                detail=(evaluation.get("short_description") or evaluation.get("reasoning") or "")[:160],
+            )
+            verdict = "SCREEN " if passes else "REJECT "
+            print(f"  {application_id:>5}  {who:<38} {verdict} {role:<18} ATS={ats} JD={jd}")
+
+            if apply_changes:
+                db.execute(
+                    """
+                    UPDATE recruiter_applications
+                    SET requirement_id = %s,
+                        matched_position = %s,
+                        ats_score = %s,
+                        jd_match_score = %s,
+                        strengths = %s::jsonb,
+                        risks = %s::jsonb,
+                        missing_requirements = %s::jsonb,
+                        ai_short_description = %s,
+                        ai_evaluation = %s::jsonb
+                    WHERE id = %s
+                    """,
+                    (
+                        requirement["id"], role, ats, jd,
+                        json.dumps(ensure_list(evaluation.get("strengths"))),
+                        json.dumps(ensure_list(evaluation.get("risks"))),
+                        json.dumps(ensure_list(evaluation.get("missing_requirements"))),
+                        evaluation.get("short_description"),
+                        json.dumps(evaluation),
+                        application_id,
+                    ),
+                )
+                if passes:
+                    recipient = clean_email(row.get("candidate_email") or row.get("source_email"))
+                    if recipient:
+                        send_screening_questions_direct(db, mailer, application_id, recipient, role)
+                        db.update_application_screening(
+                            application_id, "screening_questions_sent",
+                            {"ats_score": ats, "jd_match_score": jd, "work_terms": screening_work_terms()},
+                        )
+                    else:
+                        outcome["action"] = "skipped"
+                        outcome["detail"] = "no candidate email address"
+                else:
+                    db.execute(
+                        "UPDATE recruiter_applications SET application_status = 'rejected_jd_score' WHERE id = %s",
+                        (application_id,),
+                    )
+                    try:
+                        notify_jd_score_rejection_to_hr(application_id, evaluation, requirement)
+                    except Exception as exc:
+                        LOGGER.warning("Could not notify HR of rejection for %s: %s", application_id, exc)
+            results.append(outcome)
+
+        screened = sum(1 for r in results if r["action"] == "screening_questions")
+        rejected = sum(1 for r in results if r["action"] == "reject_jd_score")
+        kept = sum(1 for r in results if r["action"] == "no_match")
+        skipped = sum(1 for r in results if r["action"] == "skipped")
+        print(f"\n  screening questions: {screened}   rejected on JD score: {rejected}"
+              f"   left for HR: {kept}   skipped: {skipped}")
+        if not apply_changes:
+            print("\n  Dry run. Re-run with --apply to write these changes and email candidates.")
+        return results
+    finally:
+        db.close()
+
+
+def json_list_or_empty(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
+def screening_questions_body(role_title: str | None) -> str:
+    terms = screening_work_terms()
+    return recruiter_email_body(
+        "Thanks for your patience while I reviewed your profile.",
+        f"I would like to take your application{f' for {role_title}' if role_title else ''} forward.",
+        f"Before we set up the interview, could you confirm you are comfortable with "
+        f"{terms['shift']}, {terms['work_mode']} in {terms['office_location']}, "
+        f"{terms['working_days']}, with cab facility {terms['cab_facility']}?",
+        "Please also share your current salary, expected salary, current location, "
+        "and how soon you could join.",
+    )
+
+
+def send_screening_questions_direct(
+    db: "RecruiterDatabase",
+    mailer,
+    application_id: int,
+    recipient: str,
+    role_title: str | None,
+) -> str | None:
+    return send_tracked_direct_email(
+        db,
+        mailer,
+        application_id,
+        recipient,
+        "Next steps on your application",
+        screening_questions_body(role_title),
+        "screening_questions",
+    )
+
+
 def send_interview_request_after_hr_approval(application_id: int):
     db = RecruiterDatabase()
     mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
@@ -7434,20 +7865,7 @@ def send_interview_request_after_hr_approval(application_id: int):
                 or application.get("matched_position")
                 or application.get("detected_position")
             )
-            terms = screening_work_terms()
-            body = recruiter_email_body(
-                "Thanks for your patience while I reviewed your profile.",
-                f"I would like to take your application{f' for {role_title}' if role_title else ''} forward.",
-                f"Before we set up the interview, could you confirm you are comfortable with "
-                f"{terms['shift']}, {terms['work_mode']} in {terms['office_location']}, "
-                f"{terms['working_days']}, with cab facility {terms['cab_facility']}?",
-                "Please also share your current salary, expected salary, current location, "
-                "and how soon you could join.",
-            )
-            send_tracked_direct_email(
-                db, mailer, application_id, recipient,
-                "Next steps on your application", body, "screening_questions",
-            )
+            send_screening_questions_direct(db, mailer, application_id, recipient, role_title)
             db.update_application_screening(application_id, "screening_questions_sent", answers)
             log_json(
                 logging.INFO,
@@ -8564,6 +8982,27 @@ class GraphWebhookServer:
 
         return GraphWebhookHandler
 
+    def keep_subscription_alive(self):
+        """Renew the Inbox subscription well before Graph expires it.
+
+        Subscriptions last at most 48 hours and nothing renewed them, so mail
+        processing simply stopped whenever one lapsed - silently, with no error
+        and no log line. Runs for the life of the webhook process.
+        """
+        interval = max(600, int(GRAPH_SUBSCRIPTION_HOURS * 3600 / 3))
+        while True:
+            try:
+                provider = MicrosoftGraphProvider()
+                provider.renew_or_create_inbox_subscription(
+                    GRAPH_NOTIFICATION_URL,
+                    GRAPH_CLIENT_STATE,
+                    GRAPH_SUBSCRIPTION_HOURS,
+                )
+            except Exception as exc:
+                LOGGER.exception("Graph subscription renewal failed: %s", exc)
+                log_json(logging.ERROR, "graph_subscription_renew_error", error=str(exc)[:300])
+            time.sleep(interval)
+
     def serve_forever(self):
         httpd = ReusableThreadingHTTPServer(
             (GRAPH_WEBHOOK_HOST, GRAPH_WEBHOOK_PORT),
@@ -8573,7 +9012,11 @@ class GraphWebhookServer:
             f"Microsoft Graph webhook listening on "
             f"http://{GRAPH_WEBHOOK_HOST}:{GRAPH_WEBHOOK_PORT}{GRAPH_WEBHOOK_PATH}"
         )
-        print("Register the subscription with --register-graph-subscription after exposing this URL over HTTPS.")
+        if GRAPH_NOTIFICATION_URL and GRAPH_CLIENT_STATE:
+            Thread(target=self.keep_subscription_alive, daemon=True).start()
+            print("Subscription auto-renewal is running.")
+        else:
+            print("GRAPH_NOTIFICATION_URL/GRAPH_CLIENT_STATE not set; auto-renewal is OFF.")
         httpd.serve_forever()
 
 
@@ -8740,6 +9183,42 @@ def main():
         help="Release a claimed message id so it can be processed again",
     )
     parser.add_argument(
+        "--rematch-parked",
+        action="store_true",
+        help=(
+            "Re-run matching over applications parked in manual_hr_review / no_open_requirement. "
+            "Dry run unless --apply is also given."
+        ),
+    )
+    parser.add_argument(
+        "--rematch-status",
+        action="append",
+        help="Status to include in --rematch-parked (repeatable; default manual_hr_review and no_open_requirement)",
+    )
+    parser.add_argument(
+        "--rematch-limit",
+        type=int,
+        default=100,
+        help="Maximum applications to consider in --rematch-parked",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="With --rematch-parked, actually write the changes and email candidates",
+    )
+    parser.add_argument(
+        "--renew-graph-subscription",
+        action="store_true",
+        help="Renew (or recreate) the Outlook Inbox subscription now",
+    )
+    parser.add_argument(
+        "--list-unread",
+        nargs="?",
+        const=20,
+        type=int,
+        help="List unread inbox messages the agent has not answered, with their claim state",
+    )
+    parser.add_argument(
         "--list-human-handled",
         action="store_true",
         help="List applications the agent has stopped replying to because it saw a human takeover",
@@ -8816,6 +9295,55 @@ def main():
         try:
             db.release_provider_message(args.release_message)
             print(f"Released {args.release_message}. It will be processed on the next pass.")
+        finally:
+            db.close()
+        return
+
+    if args.rematch_parked:
+        statuses = tuple(args.rematch_status) if args.rematch_status else REMATCH_DEFAULT_STATUSES
+        rematch_stored_applications(
+            statuses=statuses,
+            apply_changes=bool(args.apply),
+            limit=args.rematch_limit,
+        )
+        return
+
+    if args.renew_graph_subscription:
+        provider = MicrosoftGraphProvider()
+        result = provider.renew_or_create_inbox_subscription(
+            GRAPH_NOTIFICATION_URL, GRAPH_CLIENT_STATE, GRAPH_SUBSCRIPTION_HOURS
+        )
+        print(f"Subscription {result.get('id')} valid until {result.get('expirationDateTime')}.")
+        return
+
+    if args.list_unread:
+        provider = build_inbox_provider()
+        if not isinstance(provider, MicrosoftGraphProvider):
+            print("--list-unread requires MAIL_PROVIDER=microsoft_graph.")
+            return
+        db = RecruiterDatabase()
+        try:
+            data = provider.request(
+                "GET",
+                f"/users/{provider.mailbox}/mailFolders/inbox/messages",
+                params={
+                    "$filter": "isRead eq false",
+                    "$top": str(args.list_unread),
+                    "$orderby": "receivedDateTime desc",
+                    "$select": "id,subject,from,receivedDateTime",
+                },
+            )
+            rows = data.get("value", [])
+            if not rows:
+                print("No unread inbox messages.")
+            for message in rows:
+                sender = ((message.get("from") or {}).get("emailAddress") or {}).get("address", "?")
+                claimed = db.one(
+                    "SELECT processed_at FROM recruiter_processed_messages WHERE provider_message_id = %s",
+                    (message["id"],),
+                )
+                state = f"claimed at {claimed['processed_at']}" if claimed else "not claimed"
+                print(f"  {message['receivedDateTime']}  {sender:<34} {message['subject'][:44]:<46} [{state}]")
         finally:
             db.close()
         return
