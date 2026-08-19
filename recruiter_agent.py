@@ -7623,6 +7623,223 @@ def send_tracked_direct_email(
     return provider_message_id
 
 
+REMATCH_DEFAULT_STATUSES = ("manual_hr_review", "no_open_requirement")
+
+
+def rematch_stored_applications(
+    statuses: tuple[str, ...] = REMATCH_DEFAULT_STATUSES,
+    apply_changes: bool = False,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Re-run matching over applications that were parked for a human.
+
+    Most of them were parked because title matching could not bridge, say,
+    "Senior Accountant" to "US Bookkeeper" - not because anyone judged them
+    unsuitable. Re-running now sends each to the JD it should have been measured
+    against, and the JD score decides: screening questions, or a rejection with
+    a reason HR can revoke.
+
+    Defaults to a dry run. Nothing is written or emailed unless apply_changes is
+    explicitly set, because this sends real mail to real candidates.
+    """
+    db = RecruiterDatabase()
+    mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
+    results: list[dict[str, Any]] = []
+    try:
+        db.init_schema()
+        ai = RecruiterAI()
+        requirements = db.open_requirements()
+        if not requirements:
+            print("No open requirements; nothing to match against.")
+            return results
+
+        placeholders = ", ".join(["%s"] * len(statuses))
+        rows = db.rows(
+            f"""
+            SELECT ra.id, ra.application_status, ra.candidate_email, ra.source_email,
+                   ra.detected_position, ra.matched_position, ra.requirement_id,
+                   rc.full_name, rc.current_title, rc.skills, rc.raw_cv_text, rc.cv_summary
+            FROM recruiter_applications ra
+            JOIN recruiter_candidates rc ON rc.id = ra.candidate_id
+            WHERE LOWER(COALESCE(ra.application_status, '')) IN ({placeholders})
+            ORDER BY ra.id DESC
+            LIMIT %s
+            """,
+            (*[status.lower() for status in statuses], limit),
+        )
+        print(f"{len(rows)} application(s) in {', '.join(statuses)}"
+              f"{'' if apply_changes else '   [DRY RUN - nothing will be sent]'}\n")
+
+        for row in rows:
+            application_id = row["id"]
+            who = row.get("candidate_email") or row.get("source_email") or "-"
+            cv_text = row.get("raw_cv_text") or ""
+            outcome = {"application_id": application_id, "candidate": who, "action": None, "detail": ""}
+
+            if not cv_text.strip():
+                outcome.update(action="skipped", detail="no CV text stored")
+                results.append(outcome)
+                print(f"  {application_id:>5}  {who:<38} SKIP    no CV text stored")
+                continue
+
+            extracted = normalize_cv_details(
+                {
+                    "full_name": row.get("full_name"),
+                    "current_title": row.get("current_title"),
+                    "target_position": row.get("matched_position") or row.get("detected_position"),
+                    "skills": json_list_or_empty(row.get("skills")),
+                }
+            )
+            classification = {"detected_position": row.get("detected_position")}
+            try:
+                cv_role_summary = ai.summarize_cv_role(cv_text, extracted)
+            except Exception as exc:
+                LOGGER.warning("Could not summarise role for %s: %s", application_id, exc)
+                cv_role_summary = {}
+
+            match = deterministic_requirement_match(
+                extracted, classification, requirements, source_text=cv_text[:4000]
+            )
+            if not match.get("requirement_id"):
+                try:
+                    llm_match = ai.match_requirement(
+                        {**extracted, "cv_role_summary": cv_role_summary}, requirements, cv_text=cv_text
+                    )
+                    confidence = score_number(llm_match.get("confidence"))
+                    if llm_match.get("requirement_id") and (
+                        confidence is None or confidence >= LLM_MATCH_MIN_CONFIDENCE
+                    ):
+                        match = llm_match
+                except Exception as exc:
+                    LOGGER.warning("LLM match failed for %s: %s", application_id, exc)
+            requirement = next(
+                (r for r in requirements if r["id"] == safe_int(match.get("requirement_id"))), None
+            )
+            if not requirement:
+                requirement = single_family_requirement(requirements, cv_role_summary, extracted, cv_text)
+
+            if not requirement:
+                outcome.update(action="no_match", detail="no open role in this candidate's field")
+                results.append(outcome)
+                print(f"  {application_id:>5}  {who:<38} KEEP    no open role in their field - left for HR")
+                continue
+
+            evaluation = ai.evaluate_cv(cv_text, extracted, requirement)
+            ats = numeric_value(evaluation.get("ats_score"))
+            jd = numeric_value(evaluation.get("jd_match_score"))
+            role = requirement.get("position_title")
+            passes = passes_screening_threshold(evaluation, requirement)
+            outcome.update(
+                role=role, ats_score=ats, jd_match_score=jd,
+                action="screening_questions" if passes else "reject_jd_score",
+                detail=(evaluation.get("short_description") or evaluation.get("reasoning") or "")[:160],
+            )
+            verdict = "SCREEN " if passes else "REJECT "
+            print(f"  {application_id:>5}  {who:<38} {verdict} {role:<18} ATS={ats} JD={jd}")
+
+            if apply_changes:
+                db.execute(
+                    """
+                    UPDATE recruiter_applications
+                    SET requirement_id = %s,
+                        matched_position = %s,
+                        ats_score = %s,
+                        jd_match_score = %s,
+                        strengths = %s::jsonb,
+                        risks = %s::jsonb,
+                        missing_requirements = %s::jsonb,
+                        ai_short_description = %s,
+                        ai_evaluation = %s::jsonb
+                    WHERE id = %s
+                    """,
+                    (
+                        requirement["id"], role, ats, jd,
+                        json.dumps(ensure_list(evaluation.get("strengths"))),
+                        json.dumps(ensure_list(evaluation.get("risks"))),
+                        json.dumps(ensure_list(evaluation.get("missing_requirements"))),
+                        evaluation.get("short_description"),
+                        json.dumps(evaluation),
+                        application_id,
+                    ),
+                )
+                if passes:
+                    recipient = clean_email(row.get("candidate_email") or row.get("source_email"))
+                    if recipient:
+                        send_screening_questions_direct(db, mailer, application_id, recipient, role)
+                        db.update_application_screening(
+                            application_id, "screening_questions_sent",
+                            {"ats_score": ats, "jd_match_score": jd, "work_terms": screening_work_terms()},
+                        )
+                    else:
+                        outcome["action"] = "skipped"
+                        outcome["detail"] = "no candidate email address"
+                else:
+                    db.execute(
+                        "UPDATE recruiter_applications SET application_status = 'rejected_jd_score' WHERE id = %s",
+                        (application_id,),
+                    )
+                    try:
+                        notify_jd_score_rejection_to_hr(application_id, evaluation, requirement)
+                    except Exception as exc:
+                        LOGGER.warning("Could not notify HR of rejection for %s: %s", application_id, exc)
+            results.append(outcome)
+
+        screened = sum(1 for r in results if r["action"] == "screening_questions")
+        rejected = sum(1 for r in results if r["action"] == "reject_jd_score")
+        kept = sum(1 for r in results if r["action"] == "no_match")
+        skipped = sum(1 for r in results if r["action"] == "skipped")
+        print(f"\n  screening questions: {screened}   rejected on JD score: {rejected}"
+              f"   left for HR: {kept}   skipped: {skipped}")
+        if not apply_changes:
+            print("\n  Dry run. Re-run with --apply to write these changes and email candidates.")
+        return results
+    finally:
+        db.close()
+
+
+def json_list_or_empty(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
+def screening_questions_body(role_title: str | None) -> str:
+    terms = screening_work_terms()
+    return recruiter_email_body(
+        "Thanks for your patience while I reviewed your profile.",
+        f"I would like to take your application{f' for {role_title}' if role_title else ''} forward.",
+        f"Before we set up the interview, could you confirm you are comfortable with "
+        f"{terms['shift']}, {terms['work_mode']} in {terms['office_location']}, "
+        f"{terms['working_days']}, with cab facility {terms['cab_facility']}?",
+        "Please also share your current salary, expected salary, current location, "
+        "and how soon you could join.",
+    )
+
+
+def send_screening_questions_direct(
+    db: "RecruiterDatabase",
+    mailer,
+    application_id: int,
+    recipient: str,
+    role_title: str | None,
+) -> str | None:
+    return send_tracked_direct_email(
+        db,
+        mailer,
+        application_id,
+        recipient,
+        "Next steps on your application",
+        screening_questions_body(role_title),
+        "screening_questions",
+    )
+
+
 def send_interview_request_after_hr_approval(application_id: int):
     db = RecruiterDatabase()
     mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
@@ -7648,20 +7865,7 @@ def send_interview_request_after_hr_approval(application_id: int):
                 or application.get("matched_position")
                 or application.get("detected_position")
             )
-            terms = screening_work_terms()
-            body = recruiter_email_body(
-                "Thanks for your patience while I reviewed your profile.",
-                f"I would like to take your application{f' for {role_title}' if role_title else ''} forward.",
-                f"Before we set up the interview, could you confirm you are comfortable with "
-                f"{terms['shift']}, {terms['work_mode']} in {terms['office_location']}, "
-                f"{terms['working_days']}, with cab facility {terms['cab_facility']}?",
-                "Please also share your current salary, expected salary, current location, "
-                "and how soon you could join.",
-            )
-            send_tracked_direct_email(
-                db, mailer, application_id, recipient,
-                "Next steps on your application", body, "screening_questions",
-            )
+            send_screening_questions_direct(db, mailer, application_id, recipient, role_title)
             db.update_application_screening(application_id, "screening_questions_sent", answers)
             log_json(
                 logging.INFO,
@@ -8979,6 +9183,30 @@ def main():
         help="Release a claimed message id so it can be processed again",
     )
     parser.add_argument(
+        "--rematch-parked",
+        action="store_true",
+        help=(
+            "Re-run matching over applications parked in manual_hr_review / no_open_requirement. "
+            "Dry run unless --apply is also given."
+        ),
+    )
+    parser.add_argument(
+        "--rematch-status",
+        action="append",
+        help="Status to include in --rematch-parked (repeatable; default manual_hr_review and no_open_requirement)",
+    )
+    parser.add_argument(
+        "--rematch-limit",
+        type=int,
+        default=100,
+        help="Maximum applications to consider in --rematch-parked",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="With --rematch-parked, actually write the changes and email candidates",
+    )
+    parser.add_argument(
         "--renew-graph-subscription",
         action="store_true",
         help="Renew (or recreate) the Outlook Inbox subscription now",
@@ -9069,6 +9297,15 @@ def main():
             print(f"Released {args.release_message}. It will be processed on the next pass.")
         finally:
             db.close()
+        return
+
+    if args.rematch_parked:
+        statuses = tuple(args.rematch_status) if args.rematch_status else REMATCH_DEFAULT_STATUSES
+        rematch_stored_applications(
+            statuses=statuses,
+            apply_changes=bool(args.apply),
+            limit=args.rematch_limit,
+        )
         return
 
     if args.renew_graph_subscription:
