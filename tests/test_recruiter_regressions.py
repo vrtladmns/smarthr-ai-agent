@@ -622,6 +622,66 @@ def test_declared_field_wins_when_a_title_reads_as_two():
     assert sole and sole["position_title"] == "US Bookkeeper"
 
 
+
+
+# --- stated experience minimums must be enforced (2026-08-20) ----------------
+
+BDE_2Y = {
+    "id": 1, "position_title": "Business Development Executive", "experience_min_years": 2,
+    "job_description": "B2B sales. Minimum 2 years field sales experience.",
+}
+GOOD_SCORES = {"ats_score": 75, "jd_match_score": 55, "recommendation": "shortlist"}
+
+
+def test_fresher_is_rejected_against_a_stated_minimum():
+    """Scores alone would have let an MBA fresher through to screening."""
+    extracted = ra.normalize_cv_details({"total_experience_years": 0})
+    assert ra.experience_shortfall(BDE_2Y, extracted)
+    assert ra.passes_screening_threshold(ra.normalize_evaluation(GOOD_SCORES), BDE_2Y, extracted) is False
+
+
+def test_the_rejection_reason_names_the_gap():
+    extracted = ra.normalize_cv_details({"total_experience_years": 0})
+    reason = ra.jd_rejection_reason(ra.normalize_evaluation(GOOD_SCORES), BDE_2Y, extracted)
+    assert "minimum of 2" in reason and "experience" in reason.lower()
+
+
+def test_meeting_the_minimum_still_passes():
+    extracted = ra.normalize_cv_details({"total_experience_years": 3})
+    assert ra.experience_shortfall(BDE_2Y, extracted) is None
+    assert ra.passes_screening_threshold(ra.normalize_evaluation(GOOD_SCORES), BDE_2Y, extracted) is True
+
+
+def test_a_near_miss_on_years_is_within_tolerance():
+    """CVs round their dates; 1.6 against 2 is noise, not a gap."""
+    extracted = ra.normalize_cv_details({"total_experience_years": 1.6})
+    assert ra.experience_shortfall(BDE_2Y, extracted) is None
+
+
+def test_unknown_experience_is_not_treated_as_zero():
+    """Rejecting on a missing field would discard perfectly good candidates."""
+    extracted = ra.normalize_cv_details({})
+    assert ra.experience_shortfall(BDE_2Y, extracted) is None
+    assert ra.passes_screening_threshold(ra.normalize_evaluation(GOOD_SCORES), BDE_2Y, extracted) is True
+
+
+def test_requirement_without_a_minimum_is_unaffected():
+    extracted = ra.normalize_cv_details({"total_experience_years": 0})
+    assert ra.experience_shortfall({"position_title": "Open Role"}, extracted) is None
+
+
+def test_hr_candidate_matches_nothing_when_no_hr_role_is_open():
+    """An HR fresher should get 'no opening', not a manual review queue."""
+    reqs = [BDE_2Y,
+            {"id": 2, "position_title": "US Bookkeeper", "job_description": "US bookkeeping, QuickBooks."},
+            {"id": 3, "position_title": "US Tax Preparer", "job_description": "1040, 1120S."}]
+    summary = {"primary_role": "HR / Recruitment", "role_family": "hr"}
+    extracted = {"current_title": "HR Trainee", "skills": ["recruitment", "onboarding"]}
+    cv = "Objective to start my career in Human Resource Management, recruitment, onboarding, employee engagement."
+    assert ra.single_family_requirement(reqs, summary, extracted, cv) is None
+    assert ra.near_miss_requirements(reqs, summary, extracted, cv) == []
+
+
 if __name__ == "__main__":
     import pytest
 

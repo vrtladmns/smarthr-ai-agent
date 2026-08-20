@@ -1179,8 +1179,50 @@ def numeric_value(value: Any) -> float | None:
     return float(match.group(0)) if match else None
 
 
-def passes_screening_threshold(evaluation: dict[str, Any], requirement: dict[str, Any] | None) -> bool:
+# A shortfall smaller than this is not worth rejecting over; CVs round their
+# dates and "1.8 years" against a 2 year minimum is noise, not a gap.
+EXPERIENCE_TOLERANCE_YEARS = float(os.getenv("RECRUITER_EXPERIENCE_TOLERANCE_YEARS", "0.5"))
+
+
+def experience_shortfall(
+    requirement: dict[str, Any] | None,
+    extracted: dict[str, Any] | None,
+) -> str | None:
+    """Reason the candidate is short of the role's stated minimum, if they are.
+
+    experience_min_years was stored on every requirement and never once
+    consulted, so a fresher applying to a role that asks for two years relied
+    entirely on the LLM choosing to score them low. That is a stated, checkable
+    requirement and it should be checked.
+
+    Returns None when the candidate meets it, or when the CV does not state a
+    figure - an unknown is not a shortfall, and rejecting on a missing field
+    would throw away candidates whose CV simply lists dates instead of a total.
+    """
     if not requirement:
+        return None
+    required = numeric_value(requirement.get("experience_min_years"))
+    if not required:
+        return None
+    candidate_years = numeric_value((extracted or {}).get("total_experience_years"))
+    if candidate_years is None:
+        return None
+    if candidate_years + EXPERIENCE_TOLERANCE_YEARS >= required:
+        return None
+    return (
+        f"{candidate_years:g} year(s) of experience against a stated minimum of "
+        f"{required:g} for {requirement.get('position_title') or 'this role'}"
+    )
+
+
+def passes_screening_threshold(
+    evaluation: dict[str, Any],
+    requirement: dict[str, Any] | None,
+    extracted: dict[str, Any] | None = None,
+) -> bool:
+    if not requirement:
+        return False
+    if experience_shortfall(requirement, extracted):
         return False
     ats_score = score_number(evaluation.get("ats_score"))
     jd_match_score = score_number(evaluation.get("jd_match_score"))
@@ -7129,7 +7171,7 @@ class AIRecruiterAgent:
                     )
 
             if requirement:
-                if application_id and passes_screening_threshold(evaluation, requirement):
+                if application_id and passes_screening_threshold(evaluation, requirement, extracted):
                     log_json(
                         logging.INFO,
                         "screening_threshold_passed",
@@ -7166,7 +7208,7 @@ class AIRecruiterAgent:
                     )
                     continue
                 if application_id:
-                    reason = jd_rejection_reason(evaluation, requirement)
+                    reason = jd_rejection_reason(evaluation, requirement, extracted)
                     log_json(
                         logging.INFO,
                         "screening_threshold_failed",
@@ -7728,7 +7770,7 @@ def rematch_stored_applications(
             ats = numeric_value(evaluation.get("ats_score"))
             jd = numeric_value(evaluation.get("jd_match_score"))
             role = requirement.get("position_title")
-            passes = passes_screening_threshold(evaluation, requirement)
+            passes = passes_screening_threshold(evaluation, requirement, extracted)
             outcome.update(
                 role=role, ats_score=ats, jd_match_score=jd,
                 action="screening_questions" if passes else "reject_jd_score",
@@ -8173,7 +8215,14 @@ def notify_post_interview_outcome(application_id: int, report: dict[str, Any]):
         db.close()
 
 
-def jd_rejection_reason(evaluation: dict[str, Any], requirement: dict[str, Any] | None) -> str:
+def jd_rejection_reason(
+    evaluation: dict[str, Any],
+    requirement: dict[str, Any] | None,
+    extracted: dict[str, Any] | None = None,
+) -> str:
+    shortfall = experience_shortfall(requirement, extracted)
+    if shortfall:
+        return f"Below the experience requirement: {shortfall}."
     role = requirement.get("position_title") if requirement else None
     jd_score = evaluation.get("jd_match_score")
     recommendation = evaluation.get("recommendation")
