@@ -622,6 +622,114 @@ def test_declared_field_wins_when_a_title_reads_as_two():
     assert sole and sole["position_title"] == "US Bookkeeper"
 
 
+
+
+# --- stated experience minimums must be enforced (2026-08-20) ----------------
+
+BDE_2Y = {
+    "id": 1, "position_title": "Business Development Executive", "experience_min_years": 2,
+    "job_description": "B2B sales. Minimum 2 years field sales experience.",
+}
+GOOD_SCORES = {"ats_score": 75, "jd_match_score": 55, "recommendation": "shortlist"}
+
+
+def test_fresher_is_rejected_against_a_stated_minimum():
+    """Scores alone would have let an MBA fresher through to screening."""
+    extracted = ra.normalize_cv_details({"total_experience_years": 0})
+    assert ra.experience_shortfall(BDE_2Y, extracted)
+    assert ra.passes_screening_threshold(ra.normalize_evaluation(GOOD_SCORES), BDE_2Y, extracted) is False
+
+
+def test_the_rejection_reason_names_the_gap():
+    extracted = ra.normalize_cv_details({"total_experience_years": 0})
+    reason = ra.jd_rejection_reason(ra.normalize_evaluation(GOOD_SCORES), BDE_2Y, extracted)
+    assert "minimum of 2" in reason and "experience" in reason.lower()
+
+
+def test_meeting_the_minimum_still_passes():
+    extracted = ra.normalize_cv_details({"total_experience_years": 3})
+    assert ra.experience_shortfall(BDE_2Y, extracted) is None
+    assert ra.passes_screening_threshold(ra.normalize_evaluation(GOOD_SCORES), BDE_2Y, extracted) is True
+
+
+def test_a_near_miss_on_years_is_within_tolerance():
+    """CVs round their dates; 1.6 against 2 is noise, not a gap."""
+    extracted = ra.normalize_cv_details({"total_experience_years": 1.6})
+    assert ra.experience_shortfall(BDE_2Y, extracted) is None
+
+
+def test_unknown_experience_is_not_treated_as_zero():
+    """Rejecting on a missing field would discard perfectly good candidates."""
+    extracted = ra.normalize_cv_details({})
+    assert ra.experience_shortfall(BDE_2Y, extracted) is None
+    assert ra.passes_screening_threshold(ra.normalize_evaluation(GOOD_SCORES), BDE_2Y, extracted) is True
+
+
+def test_requirement_without_a_minimum_is_unaffected():
+    extracted = ra.normalize_cv_details({"total_experience_years": 0})
+    assert ra.experience_shortfall({"position_title": "Open Role"}, extracted) is None
+
+
+def test_hr_candidate_matches_nothing_when_no_hr_role_is_open():
+    """An HR fresher should get 'no opening', not a manual review queue."""
+    reqs = [BDE_2Y,
+            {"id": 2, "position_title": "US Bookkeeper", "job_description": "US bookkeeping, QuickBooks."},
+            {"id": 3, "position_title": "US Tax Preparer", "job_description": "1040, 1120S."}]
+    summary = {"primary_role": "HR / Recruitment", "role_family": "hr"}
+    extracted = {"current_title": "HR Trainee", "skills": ["recruitment", "onboarding"]}
+    cv = "Objective to start my career in Human Resource Management, recruitment, onboarding, employee engagement."
+    assert ra.single_family_requirement(reqs, summary, extracted, cv) is None
+    assert ra.near_miss_requirements(reqs, summary, extracted, cv) == []
+
+
+
+
+# --- scheduling must read the reply, not the quoted headers (2026-08-20) -----
+
+def test_quoted_email_headers_are_not_read_as_availability():
+    """A final round was booked for 19 August 2027 off a quoted header."""
+    assert ra.parse_interview_datetime_fallback(
+        "Thanks.\n\nOn Wed, 19 Aug 2026 at 11:28 PM, Career <career@x.org> wrote:\nHi, ..."
+    ) is None
+
+
+def test_a_past_date_never_rolls_forward_a_year():
+    """'19 August' the day after is a misread, not next August."""
+    now = ra.recruiter_now()
+    yesterday = now - ra.timedelta(days=1)
+    text = f"Let's meet {yesterday.day} {yesterday.strftime('%B')} at 7pm"
+    assert ra.parse_interview_datetime_fallback(text) is None
+
+
+def test_weekday_availability_picks_the_soonest_day():
+    text = "I will be available anytime on friday, monday and tuesday."
+    slot = ra.parse_interview_datetime_fallback(text)
+    assert slot is not None
+    assert slot.weekday() == 4, slot          # Friday
+    assert 0 <= (slot - ra.recruiter_now()).days <= 7
+
+
+def test_a_bare_weekday_still_yields_a_slot():
+    slot = ra.parse_interview_datetime_fallback("I'm available Friday")
+    assert slot is not None and slot.weekday() == 4
+
+
+def test_weekday_with_a_time_keeps_the_time():
+    slot = ra.parse_interview_datetime_fallback("I am free on Tuesday at 7 pm")
+    assert slot is not None and slot.weekday() == 1 and slot.hour == 19
+
+
+def test_no_slot_is_invented_from_a_plain_thank_you():
+    assert ra.parse_interview_datetime_fallback("Thanks, looking forward to it.") is None
+
+
+def test_a_slot_far_in_the_future_is_rejected():
+    now = ra.recruiter_now()
+    far = now + ra.timedelta(days=ra.MAX_SCHEDULE_DAYS_AHEAD + 30)
+    text = f"Let's meet {far.day} {far.strftime('%B')} at 7pm"
+    assert ra.parse_interview_datetime_fallback(text) is None
+
+
 if __name__ == "__main__":
     import pytest
 

@@ -1179,8 +1179,50 @@ def numeric_value(value: Any) -> float | None:
     return float(match.group(0)) if match else None
 
 
-def passes_screening_threshold(evaluation: dict[str, Any], requirement: dict[str, Any] | None) -> bool:
+# A shortfall smaller than this is not worth rejecting over; CVs round their
+# dates and "1.8 years" against a 2 year minimum is noise, not a gap.
+EXPERIENCE_TOLERANCE_YEARS = float(os.getenv("RECRUITER_EXPERIENCE_TOLERANCE_YEARS", "0.5"))
+
+
+def experience_shortfall(
+    requirement: dict[str, Any] | None,
+    extracted: dict[str, Any] | None,
+) -> str | None:
+    """Reason the candidate is short of the role's stated minimum, if they are.
+
+    experience_min_years was stored on every requirement and never once
+    consulted, so a fresher applying to a role that asks for two years relied
+    entirely on the LLM choosing to score them low. That is a stated, checkable
+    requirement and it should be checked.
+
+    Returns None when the candidate meets it, or when the CV does not state a
+    figure - an unknown is not a shortfall, and rejecting on a missing field
+    would throw away candidates whose CV simply lists dates instead of a total.
+    """
     if not requirement:
+        return None
+    required = numeric_value(requirement.get("experience_min_years"))
+    if not required:
+        return None
+    candidate_years = numeric_value((extracted or {}).get("total_experience_years"))
+    if candidate_years is None:
+        return None
+    if candidate_years + EXPERIENCE_TOLERANCE_YEARS >= required:
+        return None
+    return (
+        f"{candidate_years:g} year(s) of experience against a stated minimum of "
+        f"{required:g} for {requirement.get('position_title') or 'this role'}"
+    )
+
+
+def passes_screening_threshold(
+    evaluation: dict[str, Any],
+    requirement: dict[str, Any] | None,
+    extracted: dict[str, Any] | None = None,
+) -> bool:
+    if not requirement:
+        return False
+    if experience_shortfall(requirement, extracted):
         return False
     ats_score = score_number(evaluation.get("ats_score"))
     jd_match_score = score_number(evaluation.get("jd_match_score"))
@@ -1362,10 +1404,41 @@ def parse_time_from_text(text: str) -> tuple[int, int] | None:
     return hour, minute
 
 
+WEEKDAY_NAMES = {
+    "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1, "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "thurs": 3, "friday": 4, "fri": 4, "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+
+# A bare "19 Aug" that has already passed almost never means next year. Rolling
+# the year forward is only sensible across a December/January boundary, so it is
+# accepted only when it lands inside this window.
+YEAR_ROLLOVER_MAX_DAYS = int(os.getenv("RECRUITER_YEAR_ROLLOVER_MAX_DAYS", "60"))
+# Nothing in a recruiting pipeline is scheduled further out than this. Anything
+# beyond it is a parsing error, not an intention.
+MAX_SCHEDULE_DAYS_AHEAD = int(os.getenv("RECRUITER_MAX_SCHEDULE_DAYS_AHEAD", "90"))
+
+
+def next_weekday_date(weekday: int, now: datetime):
+    """The next occurrence of this weekday, never today."""
+    ahead = (weekday - now.weekday()) % 7
+    return (now + timedelta(days=ahead or 7)).date()
+
+
 def parse_interview_datetime_fallback(text: str) -> datetime | None:
-    normalized = normalize_position_text(text)
+    """Read a slot out of what the candidate just wrote.
+
+    Only the newest part of the message is considered. Reading the whole body
+    meant quoted headers like "On Wed, 19 Aug 2026 at 11:28 PM, Career wrote:"
+    were parsed as the candidate's availability - which is how a final round was
+    booked for 19 August 2027.
+    """
+    latest = latest_reply_text(text or "")
+    normalized = normalize_position_text(latest)
     now = recruiter_now()
     target_date = None
+    weekday_only = False
+
     if "tomorrow" in normalized or "tommorow" in normalized or "next day" in normalized:
         target_date = (now + timedelta(days=1)).date()
     elif "today" in normalized:
@@ -1382,16 +1455,41 @@ def parse_interview_datetime_fallback(text: str) -> datetime | None:
             r"\b(\d{1,2})(?:st|nd|rd|th)?\s+"
             r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
             r"aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b",
-            text,
+            latest,
             flags=re.I,
         )
         if date_match:
             day = int(date_match.group(1))
             month = month_names[date_match.group(2).lower()]
-            year = now.year
-            target_date = datetime(year, month, day, tzinfo=now.tzinfo).date()
-            if target_date < now.date():
-                target_date = datetime(year + 1, month, day, tzinfo=now.tzinfo).date()
+            try:
+                candidate = datetime(now.year, month, day, tzinfo=now.tzinfo).date()
+            except ValueError:
+                candidate = None
+            if candidate and candidate < now.date():
+                try:
+                    rolled = datetime(now.year + 1, month, day, tzinfo=now.tzinfo).date()
+                except ValueError:
+                    rolled = None
+                # Only a genuine year boundary, never "yesterday" meaning next August.
+                candidate = (
+                    rolled
+                    if rolled and (rolled - now.date()).days <= YEAR_ROLLOVER_MAX_DAYS
+                    else None
+                )
+            target_date = candidate
+
+    if not target_date:
+        # "I am available on friday, monday and tuesday" - take the soonest.
+        weekday_hits = {
+            WEEKDAY_NAMES[word]
+            for word in re.findall(r"[a-z]+", normalized)
+            if word in WEEKDAY_NAMES
+        }
+        if weekday_hits:
+            target_date = min(next_weekday_date(day, now) for day in weekday_hits)
+            # Naming a day without a time is an offer of that whole day; the
+            # HR window coercion picks a real slot inside it.
+            weekday_only = True
 
     flexible = any(
         phrase in normalized
@@ -1404,14 +1502,14 @@ def parse_interview_datetime_fallback(text: str) -> datetime | None:
             "schedule it",
         ]
     )
-    time_parts = parse_time_from_text(text)
+    time_parts = parse_time_from_text(latest)
     if not target_date and flexible:
         target_date = (now + timedelta(days=1)).date()
     if not target_date:
         return None
     if time_parts:
         hour, minute = time_parts
-    elif flexible:
+    elif flexible or weekday_only:
         hour, minute = 11, 0
     else:
         return None
@@ -1419,6 +1517,15 @@ def parse_interview_datetime_fallback(text: str) -> datetime | None:
     scheduled_at = datetime.combine(target_date, datetime.min.time(), tzinfo=recruiter_tz()).replace(hour=hour, minute=minute)
     if scheduled_at <= now:
         scheduled_at += timedelta(days=1)
+    if (scheduled_at - now).days > MAX_SCHEDULE_DAYS_AHEAD:
+        # Whatever produced this was not a date the candidate offered.
+        log_json(
+            logging.WARNING,
+            "interview_slot_rejected_too_far_ahead",
+            scheduled_at=scheduled_at.isoformat(),
+            days_ahead=(scheduled_at - now).days,
+        )
+        return None
     return scheduled_at
 
 
@@ -7129,7 +7236,7 @@ class AIRecruiterAgent:
                     )
 
             if requirement:
-                if application_id and passes_screening_threshold(evaluation, requirement):
+                if application_id and passes_screening_threshold(evaluation, requirement, extracted):
                     log_json(
                         logging.INFO,
                         "screening_threshold_passed",
@@ -7166,7 +7273,7 @@ class AIRecruiterAgent:
                     )
                     continue
                 if application_id:
-                    reason = jd_rejection_reason(evaluation, requirement)
+                    reason = jd_rejection_reason(evaluation, requirement, extracted)
                     log_json(
                         logging.INFO,
                         "screening_threshold_failed",
@@ -7728,7 +7835,7 @@ def rematch_stored_applications(
             ats = numeric_value(evaluation.get("ats_score"))
             jd = numeric_value(evaluation.get("jd_match_score"))
             role = requirement.get("position_title")
-            passes = passes_screening_threshold(evaluation, requirement)
+            passes = passes_screening_threshold(evaluation, requirement, extracted)
             outcome.update(
                 role=role, ats_score=ats, jd_match_score=jd,
                 action="screening_questions" if passes else "reject_jd_score",
@@ -8173,7 +8280,14 @@ def notify_post_interview_outcome(application_id: int, report: dict[str, Any]):
         db.close()
 
 
-def jd_rejection_reason(evaluation: dict[str, Any], requirement: dict[str, Any] | None) -> str:
+def jd_rejection_reason(
+    evaluation: dict[str, Any],
+    requirement: dict[str, Any] | None,
+    extracted: dict[str, Any] | None = None,
+) -> str:
+    shortfall = experience_shortfall(requirement, extracted)
+    if shortfall:
+        return f"Below the experience requirement: {shortfall}."
     role = requirement.get("position_title") if requirement else None
     jd_score = evaluation.get("jd_match_score")
     recommendation = evaluation.get("recommendation")
