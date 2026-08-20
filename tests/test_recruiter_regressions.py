@@ -730,6 +730,24 @@ def test_a_slot_far_in_the_future_is_rejected():
     assert ra.parse_interview_datetime_fallback(text) is None
 
 
+
+
+# --- the duplicate guard must not rewrite pipeline state (2026-08-20) --------
+
+def test_duplicate_guard_does_not_mark_the_application():
+    """A run that had just booked a Teams meeting was dragged back to
+    manual_hr_review by the suppression branch, so the meeting existed and the
+    candidate was never told."""
+    import inspect
+
+    source = inspect.getsource(ra.AIRecruiterAgent.send_candidate_reply)
+    assert "notify_manual_hr_review" not in source, (
+        "suppression must notify HR without rewriting application status"
+    )
+    assert "notify_hr_rate_limited" in source
+    assert "mark_application" not in source
+
+
 if __name__ == "__main__":
     import pytest
 
