@@ -9335,7 +9335,11 @@ def main():
     parser.add_argument(
         "--list-human-handled",
         action="store_true",
-        help="List applications the agent has stopped replying to because it saw a human takeover",
+        help="List every application the agent has stopped replying to (manual_hr_review, hr_escalated, human_handled, ...)",
+    )
+    parser.add_argument(
+        "--show-candidate",
+        help="Show everything stored for one candidate email address: status, scores, interview state, emails sent",
     )
     parser.add_argument(
         "--resume-application",
@@ -9465,20 +9469,86 @@ def main():
     if args.list_human_handled:
         db = RecruiterDatabase()
         try:
+            # Every status where the agent has stopped replying, not just
+            # human_handled - manual_hr_review holds a thread just as firmly.
+            holds = tuple(sorted(HUMAN_HOLD_STATUSES))
+            placeholders = ", ".join(["%s"] * len(holds))
             rows = db.rows(
-                """
+                f"""
                 SELECT id, candidate_email, source_email, application_status,
-                       human_handled_at, hr_escalation_reason
+                       human_handled_at, hr_escalated_at, hr_escalation_reason
                 FROM recruiter_applications
-                WHERE LOWER(COALESCE(application_status, '')) = 'human_handled'
-                ORDER BY human_handled_at DESC NULLS LAST
-                """
+                WHERE LOWER(COALESCE(application_status, '')) IN ({placeholders})
+                ORDER BY COALESCE(human_handled_at, hr_escalated_at) DESC NULLS LAST
+                """,
+                holds,
             )
             if not rows:
-                print("No applications are latched to human_handled.")
+                print(f"No applications are held for a human ({', '.join(holds)}).")
             for row in rows:
                 who = row.get("candidate_email") or row.get("source_email") or "-"
-                print(f"  {row['id']:>6}  {who:<40} {row.get('human_handled_at')}  {row.get('hr_escalation_reason') or ''}")
+                when = row.get("human_handled_at") or row.get("hr_escalated_at") or ""
+                print(f"  {row['id']:>6}  {who:<38} {row['application_status']:<20} {str(when)[:19]}")
+                if row.get("hr_escalation_reason"):
+                    print(f"          {str(row['hr_escalation_reason'])[:110]}")
+        finally:
+            db.close()
+        return
+
+    if args.show_candidate:
+        email_address = clean_email(args.show_candidate) or args.show_candidate
+        db = RecruiterDatabase()
+        try:
+            rows = db.rows(
+                """
+                SELECT ra.*, rc.full_name, rc.current_title, rc.total_experience_years,
+                       rr.position_title AS requirement_position
+                FROM recruiter_applications ra
+                JOIN recruiter_candidates rc ON rc.id = ra.candidate_id
+                LEFT JOIN recruitment_requirements rr ON rr.id = ra.requirement_id
+                WHERE LOWER(COALESCE(ra.candidate_email, '')) = %s
+                   OR LOWER(COALESCE(ra.source_email, '')) = %s
+                ORDER BY ra.id DESC
+                """,
+                (email_address, email_address),
+            )
+            if not rows:
+                print(f"No application found for {email_address}.")
+                return
+            for row in rows:
+                print(f"\napplication {row['id']}   {row.get('full_name') or '-'}")
+                print(f"  status            : {row.get('application_status')}")
+                print(f"  requirement       : {row.get('requirement_position') or '(none)'}")
+                print(f"  ats / jd score    : {row.get('ats_score')} / {row.get('jd_match_score')}")
+                print(f"  their title       : {row.get('current_title') or '-'}"
+                      f"   experience: {row.get('total_experience_years')}")
+                print(f"  screening         : {json.dumps(json_dict(row.get('screening_details')), default=str)[:200]}")
+                for label, key in [
+                    ("hr escalated", "hr_escalated_at"), ("hr approved", "hr_approved_at"),
+                    ("human handled", "human_handled_at"), ("interview started", "interview_started_at"),
+                    ("interview done", "interview_completed_at"), ("interview scheduled", "interview_scheduled_at"),
+                ]:
+                    if row.get(key):
+                        print(f"  {label:<18}: {row[key]}")
+                if row.get("hr_escalation_reason"):
+                    print(f"  reason            : {str(row['hr_escalation_reason'])[:160]}")
+                if row.get("interview_availability"):
+                    print(f"  availability text : {str(row['interview_availability'])[:160]}")
+                report = json_dict(row.get("interview_report"))
+                if report:
+                    print(f"  interview report  : score={report.get('overall_score')} "
+                          f"rec={report.get('recommendation')} review={report.get('needs_human_review')}")
+                    if report.get("human_review_reasons"):
+                        print(f"    review reasons  : {report['human_review_reasons']}")
+                sent = db.rows(
+                    "SELECT scenario, sent_at FROM recruiter_sent_replies WHERE application_id = %s "
+                    "ORDER BY sent_at DESC LIMIT 12",
+                    (row["id"],),
+                )
+                if sent:
+                    print("  emails sent       :")
+                    for entry in sent:
+                        print(f"    {str(entry['sent_at'])[:19]}  {entry['scenario']}")
         finally:
             db.close()
         return
