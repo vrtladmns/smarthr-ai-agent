@@ -4989,15 +4989,30 @@ class AIRecruiterAgent:
                     "no_candidate_reply_sent": True,
                 },
             )
-            # The agent wanted to repeat itself. That is the signal that this
-            # thread has stopped making progress, so hand it to a human.
-            self.notify_manual_hr_review(
+            # Tell a human, but do NOT touch the application status. The guard's
+            # job is to stop the email, not to rewrite pipeline state: a run that
+            # had just booked a Teams meeting and set interview_scheduled found
+            # itself dragged back to manual_hr_review by this branch, so the
+            # meeting existed and nobody was told about it.
+            self.notify_hr_rate_limited(
                 inbox_email,
                 application,
-                f"The agent tried to send the '{scenario}' message again. "
-                "The conversation is not progressing and needs a person.",
-                event_type="repeat_reply_handoff_to_hr",
-                mark_application=bool(application_id),
+                f"Repeat message suppressed: {inbox_email.sender}",
+                recruiter_email_body(
+                    f"The agent tried to send the '{scenario}' message again and it was suppressed.",
+                    f"Candidate: {inbox_email.sender}",
+                    f"Application: {dashboard_application_url(application_id)}"
+                    if application_id
+                    else RECRUITER_DASHBOARD_BASE_URL,
+                    "If the candidate still needs this message, send it from the dashboard. "
+                    "If the thread is going in circles, take it over.",
+                ),
+                "repeat_reply_notice",
+            )
+            self.db.log_email_event(
+                inbox_email,
+                "repeat_reply_handoff_to_hr",
+                {"scenario": scenario, "application_id": application_id, "no_candidate_reply_sent": True},
             )
             return False
 
@@ -8438,7 +8453,10 @@ def send_teams_link_for_application(application_id: int):
             interviewer_email=interviewer["email"],
             interviewer_name=interviewer["name"],
         )
-        mailer.send_direct_email(
+        send_tracked_direct_email(
+            db,
+            mailer,
+            application_id,
             recipient,
             "Microsoft Teams interview link",
             recruiter_email_body(
@@ -8447,6 +8465,7 @@ def send_teams_link_for_application(application_id: int):
                 f"You will be speaking with {interviewer['name']}.",
                 f"Teams link: {join_url}",
             ),
+            "interview_scheduled",
         )
         print(f"Teams link sent for application {application_id}: {join_url}")
     finally:
@@ -9565,10 +9584,21 @@ def main():
                 """,
                 (args.resume_status, args.resume_application),
             )
+            # Clearing the reply ledger is the point of handing it back: without
+            # it the 24h duplicate guard suppresses exactly the message the
+            # reset was meant to produce, and the candidate hears nothing.
+            cleared = db.rows(
+                "DELETE FROM recruiter_sent_replies WHERE application_id = %s RETURNING scenario",
+                (args.resume_application,),
+            )
+            db.conn.commit()
             print(
                 f"Application {args.resume_application} handed back to the agent "
                 f"with status '{args.resume_status}'."
             )
+            if cleared:
+                print(f"  cleared {len(cleared)} sent-reply record(s) so the agent may resend: "
+                      f"{', '.join(sorted({row['scenario'] for row in cleared}))}")
         finally:
             db.close()
         return
