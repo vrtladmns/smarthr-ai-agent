@@ -682,6 +682,54 @@ def test_hr_candidate_matches_nothing_when_no_hr_role_is_open():
     assert ra.near_miss_requirements(reqs, summary, extracted, cv) == []
 
 
+
+
+# --- scheduling must read the reply, not the quoted headers (2026-08-20) -----
+
+def test_quoted_email_headers_are_not_read_as_availability():
+    """A final round was booked for 19 August 2027 off a quoted header."""
+    assert ra.parse_interview_datetime_fallback(
+        "Thanks.\n\nOn Wed, 19 Aug 2026 at 11:28 PM, Career <career@x.org> wrote:\nHi, ..."
+    ) is None
+
+
+def test_a_past_date_never_rolls_forward_a_year():
+    """'19 August' the day after is a misread, not next August."""
+    now = ra.recruiter_now()
+    yesterday = now - ra.timedelta(days=1)
+    text = f"Let's meet {yesterday.day} {yesterday.strftime('%B')} at 7pm"
+    assert ra.parse_interview_datetime_fallback(text) is None
+
+
+def test_weekday_availability_picks_the_soonest_day():
+    text = "I will be available anytime on friday, monday and tuesday."
+    slot = ra.parse_interview_datetime_fallback(text)
+    assert slot is not None
+    assert slot.weekday() == 4, slot          # Friday
+    assert 0 <= (slot - ra.recruiter_now()).days <= 7
+
+
+def test_a_bare_weekday_still_yields_a_slot():
+    slot = ra.parse_interview_datetime_fallback("I'm available Friday")
+    assert slot is not None and slot.weekday() == 4
+
+
+def test_weekday_with_a_time_keeps_the_time():
+    slot = ra.parse_interview_datetime_fallback("I am free on Tuesday at 7 pm")
+    assert slot is not None and slot.weekday() == 1 and slot.hour == 19
+
+
+def test_no_slot_is_invented_from_a_plain_thank_you():
+    assert ra.parse_interview_datetime_fallback("Thanks, looking forward to it.") is None
+
+
+def test_a_slot_far_in_the_future_is_rejected():
+    now = ra.recruiter_now()
+    far = now + ra.timedelta(days=ra.MAX_SCHEDULE_DAYS_AHEAD + 30)
+    text = f"Let's meet {far.day} {far.strftime('%B')} at 7pm"
+    assert ra.parse_interview_datetime_fallback(text) is None
+
+
 if __name__ == "__main__":
     import pytest
 

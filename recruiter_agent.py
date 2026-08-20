@@ -1404,10 +1404,41 @@ def parse_time_from_text(text: str) -> tuple[int, int] | None:
     return hour, minute
 
 
+WEEKDAY_NAMES = {
+    "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1, "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "thurs": 3, "friday": 4, "fri": 4, "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+
+# A bare "19 Aug" that has already passed almost never means next year. Rolling
+# the year forward is only sensible across a December/January boundary, so it is
+# accepted only when it lands inside this window.
+YEAR_ROLLOVER_MAX_DAYS = int(os.getenv("RECRUITER_YEAR_ROLLOVER_MAX_DAYS", "60"))
+# Nothing in a recruiting pipeline is scheduled further out than this. Anything
+# beyond it is a parsing error, not an intention.
+MAX_SCHEDULE_DAYS_AHEAD = int(os.getenv("RECRUITER_MAX_SCHEDULE_DAYS_AHEAD", "90"))
+
+
+def next_weekday_date(weekday: int, now: datetime):
+    """The next occurrence of this weekday, never today."""
+    ahead = (weekday - now.weekday()) % 7
+    return (now + timedelta(days=ahead or 7)).date()
+
+
 def parse_interview_datetime_fallback(text: str) -> datetime | None:
-    normalized = normalize_position_text(text)
+    """Read a slot out of what the candidate just wrote.
+
+    Only the newest part of the message is considered. Reading the whole body
+    meant quoted headers like "On Wed, 19 Aug 2026 at 11:28 PM, Career wrote:"
+    were parsed as the candidate's availability - which is how a final round was
+    booked for 19 August 2027.
+    """
+    latest = latest_reply_text(text or "")
+    normalized = normalize_position_text(latest)
     now = recruiter_now()
     target_date = None
+    weekday_only = False
+
     if "tomorrow" in normalized or "tommorow" in normalized or "next day" in normalized:
         target_date = (now + timedelta(days=1)).date()
     elif "today" in normalized:
@@ -1424,16 +1455,41 @@ def parse_interview_datetime_fallback(text: str) -> datetime | None:
             r"\b(\d{1,2})(?:st|nd|rd|th)?\s+"
             r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
             r"aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b",
-            text,
+            latest,
             flags=re.I,
         )
         if date_match:
             day = int(date_match.group(1))
             month = month_names[date_match.group(2).lower()]
-            year = now.year
-            target_date = datetime(year, month, day, tzinfo=now.tzinfo).date()
-            if target_date < now.date():
-                target_date = datetime(year + 1, month, day, tzinfo=now.tzinfo).date()
+            try:
+                candidate = datetime(now.year, month, day, tzinfo=now.tzinfo).date()
+            except ValueError:
+                candidate = None
+            if candidate and candidate < now.date():
+                try:
+                    rolled = datetime(now.year + 1, month, day, tzinfo=now.tzinfo).date()
+                except ValueError:
+                    rolled = None
+                # Only a genuine year boundary, never "yesterday" meaning next August.
+                candidate = (
+                    rolled
+                    if rolled and (rolled - now.date()).days <= YEAR_ROLLOVER_MAX_DAYS
+                    else None
+                )
+            target_date = candidate
+
+    if not target_date:
+        # "I am available on friday, monday and tuesday" - take the soonest.
+        weekday_hits = {
+            WEEKDAY_NAMES[word]
+            for word in re.findall(r"[a-z]+", normalized)
+            if word in WEEKDAY_NAMES
+        }
+        if weekday_hits:
+            target_date = min(next_weekday_date(day, now) for day in weekday_hits)
+            # Naming a day without a time is an offer of that whole day; the
+            # HR window coercion picks a real slot inside it.
+            weekday_only = True
 
     flexible = any(
         phrase in normalized
@@ -1446,14 +1502,14 @@ def parse_interview_datetime_fallback(text: str) -> datetime | None:
             "schedule it",
         ]
     )
-    time_parts = parse_time_from_text(text)
+    time_parts = parse_time_from_text(latest)
     if not target_date and flexible:
         target_date = (now + timedelta(days=1)).date()
     if not target_date:
         return None
     if time_parts:
         hour, minute = time_parts
-    elif flexible:
+    elif flexible or weekday_only:
         hour, minute = 11, 0
     else:
         return None
@@ -1461,6 +1517,15 @@ def parse_interview_datetime_fallback(text: str) -> datetime | None:
     scheduled_at = datetime.combine(target_date, datetime.min.time(), tzinfo=recruiter_tz()).replace(hour=hour, minute=minute)
     if scheduled_at <= now:
         scheduled_at += timedelta(days=1)
+    if (scheduled_at - now).days > MAX_SCHEDULE_DAYS_AHEAD:
+        # Whatever produced this was not a date the candidate offered.
+        log_json(
+            logging.WARNING,
+            "interview_slot_rejected_too_far_ahead",
+            scheduled_at=scheduled_at.isoformat(),
+            days_ahead=(scheduled_at - now).days,
+        )
+        return None
     return scheduled_at
 
 
