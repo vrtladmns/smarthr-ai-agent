@@ -74,7 +74,9 @@ WEB_INTERVIEW_SESSIONS: dict[str, dict] = {}
 # scored as if it were one. Roughly 30 seconds of webm/opus video.
 MIN_INTERVIEW_RECORDING_BYTES = int(os.getenv("RECRUITER_MIN_INTERVIEW_RECORDING_BYTES", "400000"))
 # How many times a candidate may start the same interview link.
-MAX_INTERVIEW_ATTEMPTS = int(os.getenv("RECRUITER_MAX_INTERVIEW_ATTEMPTS", "2"))
+# 0 (the default) means unlimited: the cap is off. Attempts are still counted so
+# the history is visible, they just do not lock anyone out.
+MAX_INTERVIEW_ATTEMPTS = int(os.getenv("RECRUITER_MAX_INTERVIEW_ATTEMPTS", "0"))
 # Hard ceiling on main questions. Application 105 was asked 17 in 17 minutes -
 # generated questions plus recommended questions plus a follow-up on each - and
 # several were fragments like "How do you react?".
@@ -1483,7 +1485,7 @@ Conversation so far:
             attempts = database.db.bump_interview_attempts(application["id"])
         finally:
             database.close()
-        if attempts > MAX_INTERVIEW_ATTEMPTS:
+        if MAX_INTERVIEW_ATTEMPTS > 0 and attempts > MAX_INTERVIEW_ATTEMPTS:
             log_json(
                 logging.WARNING,
                 "interview_attempt_limit_reached",

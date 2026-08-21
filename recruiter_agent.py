@@ -9727,6 +9727,8 @@ def main():
                 print(f"  their title       : {row.get('current_title') or '-'}"
                       f"   experience: {row.get('total_experience_years')}")
                 print(f"  screening         : {json.dumps(json_dict(row.get('screening_details')), default=str)[:200]}")
+                if row.get("interview_attempts"):
+                    print(f"  interview attempts: {row['interview_attempts']}")
                 for label, key in [
                     ("hr escalated", "hr_escalated_at"), ("hr approved", "hr_approved_at"),
                     ("human handled", "human_handled_at"), ("interview started", "interview_started_at"),

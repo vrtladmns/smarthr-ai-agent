@@ -229,12 +229,14 @@ def test_session_survives_a_restart_mid_interview(server, application):
 
 # --- attempt cap --------------------------------------------------------------
 
-def test_attempt_cap_survives_a_restart(server, application):
+def test_attempt_cap_survives_a_restart(server, application, monkeypatch):
     """The counter lives in the database, so a process restart cannot reset it.
 
-    Each iteration clears the stored session as well as the in-memory one, which
-    is what makes the next call a genuinely fresh start rather than a resume.
+    The cap ships disabled, so this enables it to exercise the mechanism. Each
+    iteration clears the stored session as well as the in-memory one, which is
+    what makes the next call a genuinely fresh start rather than a resume.
     """
+    monkeypatch.setattr(rd, "MAX_INTERVIEW_ATTEMPTS", 2)
     token = application["token"]
     for _ in range(rd.MAX_INTERVIEW_ATTEMPTS):
         db = ra.RecruiterDatabase()
@@ -351,7 +353,8 @@ def test_reload_resumes_without_consuming_an_attempt(server, application):
     assert used == 1, f"a resume must not consume an attempt (used {used})"
 
 
-def test_a_genuinely_fresh_start_still_counts(server, application):
+def test_a_genuinely_fresh_start_still_counts(server, application, monkeypatch):
+    monkeypatch.setattr(rd, "MAX_INTERVIEW_ATTEMPTS", 2)
     token = application["token"]
     db = ra.RecruiterDatabase()
     db.clear_interview_session(application["id"])
@@ -364,7 +367,8 @@ def test_a_genuinely_fresh_start_still_counts(server, application):
     assert start(server, token).status_code == 429
 
 
-def test_reopening_clears_the_lockout(server, application):
+def test_reopening_clears_the_lockout(server, application, monkeypatch):
+    monkeypatch.setattr(rd, "MAX_INTERVIEW_ATTEMPTS", 2)
     token = application["token"]
     db = ra.RecruiterDatabase()
     db.clear_interview_session(application["id"])
@@ -381,6 +385,20 @@ def test_reopening_clears_the_lockout(server, application):
     db.close()
     rd.WEB_INTERVIEW_SESSIONS.clear()
     assert start(server, token).status_code == 200
+
+
+
+
+def test_the_cap_is_disabled_by_default(server, application):
+    """Shipped off: a candidate can restart as often as they need to."""
+    assert rd.MAX_INTERVIEW_ATTEMPTS == 0
+    token = application["token"]
+    for _ in range(4):
+        db = ra.RecruiterDatabase()
+        db.clear_interview_session(application["id"])
+        db.close()
+        rd.WEB_INTERVIEW_SESSIONS.clear()
+        assert start(server, token).status_code == 200
 
 
 if __name__ == "__main__":
