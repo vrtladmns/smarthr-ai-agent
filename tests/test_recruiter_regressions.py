@@ -806,6 +806,47 @@ def test_a_scenario_may_be_sent_twice_before_suppression():
     assert "budget_disclosure" in ra.ONCE_PER_APPLICATION_SCENARIOS
 
 
+
+
+# --- "send me a new link, I'll do it tomorrow" (application 135, 2026-08-21) --
+
+def test_his_actual_message_is_treated_as_a_delay():
+    """Rohit got a "your interview is still pending" reminder, then silence."""
+    text = "send me new link i will give it tommorow"
+    assert ra.is_interview_delay_reply(text) or ra.wants_a_fresh_interview_link(text)
+
+
+def test_misspelled_tomorrow_and_other_verbs_are_understood():
+    for text in [
+        "I'll give the interview tomorrow",
+        "I am busy today, will attempt tommorow",
+        "I will attend on Monday",
+        "tomorrow i will complete it",
+        "I need some time",
+    ]:
+        assert ra.is_interview_delay_reply(text), text
+
+
+def test_asking_for_the_link_again_is_recognised():
+    for text in [
+        "send me new link",
+        "Please resend the link",
+        "can you share the interview link again?",
+    ]:
+        assert ra.wants_a_fresh_interview_link(text), text
+
+
+def test_unrelated_replies_are_not_treated_as_delays():
+    for text in [
+        "Thanks, I have completed the interview",
+        "What is the status of my application?",
+        "Thank you for inviting me to interview for the position.",
+        "My notice period is 2 months",
+    ]:
+        assert not ra.is_interview_delay_reply(text), text
+        assert not ra.wants_a_fresh_interview_link(text), text
+
+
 if __name__ == "__main__":
     import pytest
 
