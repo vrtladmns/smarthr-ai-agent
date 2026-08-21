@@ -702,11 +702,17 @@ def test_a_past_date_never_rolls_forward_a_year():
 
 
 def test_weekday_availability_picks_the_soonest_day():
+    """Must not depend on which day the suite happens to run."""
     text = "I will be available anytime on friday, monday and tuesday."
     slot = ra.parse_interview_datetime_fallback(text)
     assert slot is not None
-    assert slot.weekday() == 4, slot          # Friday
-    assert 0 <= (slot - ra.recruiter_now()).days <= 7
+    offered = {4, 0, 1}                      # Friday, Monday, Tuesday
+    assert slot.weekday() in offered, slot
+    now = ra.recruiter_now()
+    # It is the soonest of the days offered, and a named day never means today.
+    soonest = min(ra.next_weekday_date(day, now) for day in offered)
+    assert slot.date() == soonest, (slot, soonest)
+    assert 0 < (slot.date() - now.date()).days <= 7
 
 
 def test_a_bare_weekday_still_yields_a_slot():
@@ -746,6 +752,58 @@ def test_duplicate_guard_does_not_mark_the_application():
     )
     assert "notify_hr_rate_limited" in source
     assert "mark_application" not in source
+
+
+
+
+# --- joining answered as a date, not a number of days (2026-08-21) ----------
+
+def test_a_joining_date_answers_the_joining_question():
+    """Divya said "4 Sep"; only joining_days was accepted, so she was asked again."""
+    answers = {
+        "comfortable_with_terms": True, "current_salary": 444000, "expected_salary": 700000,
+        "current_location": "Mohali", "joining_days": None, "joining_date": "4 Sep",
+    }
+    assert ra.screening_answers_complete(answers) is True
+    assert ra.missing_screening_fields({"screening_details": answers}) == []
+
+
+def test_joining_dates_in_various_shapes_are_understood():
+    for text in ["4 sep", "2026-09-04", "3 or 4 Sep", "September 4", "after 31 August"]:
+        assert ra.parse_joining_date(text) is not None, text
+
+
+def test_joining_date_converts_to_days():
+    answers = {"joining_date": ra.recruiter_now().date().isoformat()}
+    assert ra.joining_days_from_answers(answers) == 0
+
+
+def test_a_notice_period_in_days_still_works():
+    answers = {
+        "comfortable_with_terms": True, "current_salary": 444000, "expected_salary": 700000,
+        "current_location": "Mohali", "joining_days": 15,
+    }
+    assert ra.screening_answers_complete(answers) is True
+
+
+def test_screening_is_still_incomplete_when_joining_is_unknown():
+    answers = {
+        "comfortable_with_terms": True, "current_salary": 444000, "expected_salary": 700000,
+        "current_location": "Mohali",
+    }
+    assert ra.screening_answers_complete(answers) is False
+    assert "joining time / notice period" in ra.missing_screening_fields({"screening_details": answers})
+
+
+def test_joining_time_is_not_listed_twice():
+    missing = ra.missing_screening_fields({"screening_details": {}})
+    assert len([m for m in missing if "joining" in m]) == 1
+
+
+def test_a_scenario_may_be_sent_twice_before_suppression():
+    """Suppressing the second message left candidates with total silence."""
+    assert ra.REPLY_SCENARIO_MAX_PER_WINDOW >= 2
+    assert "budget_disclosure" in ra.ONCE_PER_APPLICATION_SCENARIOS
 
 
 if __name__ == "__main__":
