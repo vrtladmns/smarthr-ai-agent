@@ -366,6 +366,12 @@ MESSAGE_CLAIM_STALE_MINUTES = int(os.getenv("RECRUITER_MESSAGE_CLAIM_STALE_MINUT
 # Never send the same scenario to the same application twice inside this window.
 # This is the backstop that caps the blast radius of any single logic bug.
 REPLY_SCENARIO_COOLDOWN_HOURS = int(os.getenv("RECRUITER_REPLY_SCENARIO_COOLDOWN_HOURS", "24"))
+# How many times one scenario may legitimately be sent inside that window.
+# One was too strict: a candidate who replies with something new gets an answer
+# that happens to share a scenario with an earlier message, and suppressing it
+# left them with total silence. Two still caps the runaway loops this guard
+# exists for - the original fault was a dozen near-identical emails.
+REPLY_SCENARIO_MAX_PER_WINDOW = int(os.getenv("RECRUITER_REPLY_SCENARIO_MAX_PER_WINDOW", "2"))
 # Scenarios that must never be repeated for an application, at any interval.
 ONCE_PER_APPLICATION_SCENARIOS = {"budget_disclosure", "holding_reply"}
 
@@ -1263,20 +1269,103 @@ SCREENING_FIELD_LABELS = (
     ("current_salary", "current salary"),
     ("expected_salary", "expected salary"),
     ("current_location", "current location"),
-    ("joining_days", "joining time / notice period"),
 )
 
 
 def missing_screening_fields(application: dict[str, Any] | None) -> list[str]:
     """Which screening answers are still unknown for this application."""
     answers = json_dict((application or {}).get("screening_details"))
-    return [label for key, label in SCREENING_FIELD_LABELS if answers.get(key) in (None, "", [])]
+    missing = [label for key, label in SCREENING_FIELD_LABELS if answers.get(key) in (None, "", [])]
+    # Joining is answered by either a notice period or a date.
+    if joining_days_from_answers(answers) is None:
+        missing.append("joining time / notice period")
+    return missing
+
+
+MONTH_NUMBERS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+
+def parse_joining_date(value: Any):
+    """Read a joining date the candidate stated, in whatever shape they wrote it.
+
+    Candidates answer "how soon can you join?" with a date at least as often as
+    with a number of days - "4 Sep", "after 31 August", "2026-09-04". Only
+    joining_days was ever accepted, so those answers never satisfied the
+    screening check and the agent asked the same question again.
+    """
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    text = str(value).strip()
+    if not text:
+        return None
+    now = recruiter_now()
+
+    iso = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", text)
+    if iso:
+        try:
+            return datetime(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)), tzinfo=now.tzinfo).date()
+        except ValueError:
+            return None
+
+    match = re.search(
+        r"\b(\d{1,2})(?:st|nd|rd|th)?\s+"
+        r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+        r"aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b",
+        text,
+        flags=re.I,
+    ) or re.search(
+        r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+        r"aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?\b",
+        text,
+        flags=re.I,
+    )
+    if not match:
+        return None
+    groups = match.groups()
+    day, month_name = (groups[0], groups[1]) if groups[0].isdigit() else (groups[1], groups[0])
+    month = MONTH_NUMBERS.get(month_name.lower())
+    if not month:
+        return None
+    try:
+        candidate = datetime(now.year, month, int(day), tzinfo=now.tzinfo).date()
+    except ValueError:
+        return None
+    if candidate < now.date():
+        # A joining date that has passed means next year only across a year end.
+        try:
+            rolled = datetime(now.year + 1, month, int(day), tzinfo=now.tzinfo).date()
+        except ValueError:
+            return None
+        if (rolled - now.date()).days > YEAR_ROLLOVER_MAX_DAYS:
+            return None
+        candidate = rolled
+    return candidate
+
+
+def joining_days_from_answers(answers: dict[str, Any]) -> int | None:
+    """Notice period in days, however the candidate expressed it."""
+    days = screening_int(answers.get("joining_days"))
+    if days is not None:
+        return days
+    joining_date = parse_joining_date(answers.get("joining_date"))
+    if joining_date:
+        return max((joining_date - recruiter_now().date()).days, 0)
+    return None
 
 
 def screening_answers_complete(answers: dict[str, Any]) -> bool:
+    if joining_days_from_answers(answers) is None:
+        return False
     return all(
         answers.get(key) not in (None, "", [])
-        for key in ["comfortable_with_terms", "current_salary", "expected_salary", "current_location", "joining_days"]
+        for key in ["comfortable_with_terms", "current_salary", "expected_salary", "current_location"]
     )
 
 
@@ -3247,7 +3336,7 @@ class RecruiterDatabase:
             score_number(details.get("current_salary")),
             score_number(details.get("expected_salary")),
             details.get("current_location"),
-            screening_int(details.get("joining_days")),
+            joining_days_from_answers(details),
         )
         if escalation_reason:
             self.execute(
@@ -4823,6 +4912,9 @@ Extract the candidate's screening answers.
 Prefer the newest message. If the candidate corrected a value, use the corrected one.
 Anything listed under "Already known" is confirmed; repeat it unless the candidate changed it.
 For salary, return the numeric annual amount. If candidate says 6 LPA or 6 lakh, return 600000.
+For joining, fill joining_days when they give a notice period in days or months,
+and joining_date (YYYY-MM-DD) when they name a date such as "4 Sep" or
+"after 31 August". Either one answers the question; fill whichever they gave.
 If a value is genuinely unknown, use null.
 
 JSON schema:
@@ -4832,6 +4924,7 @@ JSON schema:
   "expected_salary": null,
   "current_location": null,
   "joining_days": null,
+  "joining_date": null,
   "interview_availability": null,
   "notes": "short notes"
 }}
@@ -4963,8 +5056,10 @@ class AIRecruiterAgent:
 
         if scenario in ONCE_PER_APPLICATION_SCENARIOS:
             already_sent = self.db.scenario_ever_sent(application_id, recipient, scenario)
+            sent_count = 1 if already_sent else 0
         else:
-            already_sent = self.db.sent_reply_count(application_id, recipient, scenario) > 0
+            sent_count = self.db.sent_reply_count(application_id, recipient, scenario)
+            already_sent = sent_count >= REPLY_SCENARIO_MAX_PER_WINDOW
 
         if already_sent:
             log_json(
@@ -4973,6 +5068,8 @@ class AIRecruiterAgent:
                 **inbox_email_summary(inbox_email),
                 scenario=scenario,
                 application_id=application_id,
+                already_sent_count=sent_count,
+                suppressed_body=body[:600],
             )
             trace_recruiter_event(
                 "duplicate_reply_suppressed",
@@ -4986,6 +5083,8 @@ class AIRecruiterAgent:
                 {
                     "scenario": scenario,
                     "application_id": application_id,
+                    "already_sent_count": sent_count,
+                    "suppressed_body": body[:2000],
                     "no_candidate_reply_sent": True,
                 },
             )
@@ -5344,11 +5443,12 @@ class AIRecruiterAgent:
                 ("current_salary", "current salary"),
                 ("expected_salary", "expected salary"),
                 ("current_location", "current location"),
-                ("joining_days", "joining time"),
                 ("comfortable_with_terms", "confirmation that the work terms suit you"),
             ]
             if answers.get(key) in (None, "", [])
         ]
+        if joining_days_from_answers(answers) is None:
+            missing.append("joining time")
         missing_text = ", ".join(missing) if missing else "a few remaining details"
         fallback_body = recruiter_email_body(
             "Thanks for sharing the details.",
