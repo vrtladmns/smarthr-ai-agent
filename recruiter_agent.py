@@ -9509,6 +9509,11 @@ def main():
         help="List every application the agent has stopped replying to (manual_hr_review, hr_escalated, human_handled, ...)",
     )
     parser.add_argument(
+        "--reopen-interview",
+        type=int,
+        help="Clear the interview attempt counter for an application so the candidate can start again",
+    )
+    parser.add_argument(
         "--show-candidate",
         help="Show everything stored for one candidate email address: status, scores, interview state, emails sent",
     )
@@ -9662,6 +9667,34 @@ def main():
                 print(f"  {row['id']:>6}  {who:<38} {row['application_status']:<20} {str(when)[:19]}")
                 if row.get("hr_escalation_reason"):
                     print(f"          {str(row['hr_escalation_reason'])[:110]}")
+        finally:
+            db.close()
+        return
+
+    if args.reopen_interview:
+        db = RecruiterDatabase()
+        try:
+            row = db.one(
+                "SELECT interview_attempts, interview_completed_at, interview_link_token "
+                "FROM recruiter_applications WHERE id = %s",
+                (args.reopen_interview,),
+            )
+            if not row:
+                print(f"Application {args.reopen_interview} not found.")
+                return
+            db.execute(
+                "UPDATE recruiter_applications SET interview_attempts = 0 WHERE id = %s",
+                (args.reopen_interview,),
+            )
+            print(
+                f"Interview reopened for application {args.reopen_interview} "
+                f"(attempts were {row.get('interview_attempts')})."
+            )
+            if row.get("interview_completed_at"):
+                print("  Note: this interview is already marked completed; "
+                      "use --create-interview-link --reset-interview-link to run a fresh one.")
+            if row.get("interview_link_token"):
+                print(f"  Their existing link still works: {candidate_interview_url(row['interview_link_token'])}")
         finally:
             db.close()
         return

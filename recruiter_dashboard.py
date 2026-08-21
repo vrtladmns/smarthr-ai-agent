@@ -1433,9 +1433,51 @@ Conversation so far:
             self.send_json({"error": "This interview has already been completed."}, status=409)
             return
 
-        # Counted in the database: the in-memory counter reset on every restart,
-        # so the cap could not actually be enforced. Application 21 has three
-        # recordings for one interview.
+        # An interview already underway is RESUMED, not restarted. Counting every
+        # /start call meant a page reload, a dropped connection or clicking the
+        # link twice each burned an attempt, and the candidate was then locked
+        # out of an interview they were part-way through.
+        database = self.db()
+        try:
+            stored = database.db.load_interview_session(application["id"])
+        finally:
+            database.close()
+        resumable = bool(stored.get("questions")) and not application.get("interview_completed_at")
+        if resumable:
+            session = {
+                "application_id": application["id"],
+                "questions": stored.get("questions") or [],
+                "current_index": int(stored.get("current_index") or 0),
+                "current_question": stored.get("current_question") or "",
+                "transcript": stored.get("transcript") or [],
+                "camera_monitoring": {},
+                "followup_for_current": bool(stored.get("followup_for_current")),
+                "last_client_turn_id": int(stored.get("last_client_turn_id") or 0),
+                "role_context": stored.get("role_context") or interview_role_context(application),
+                "started_at": stored.get("started_at") or time.time(),
+            }
+            WEB_INTERVIEW_SESSIONS[token] = session
+            log_json(
+                logging.INFO,
+                "interview_resumed_without_consuming_attempt",
+                application_id=application["id"],
+                question_index=session["current_index"],
+                answered=len(session["transcript"]),
+            )
+            self.pregenerate_interview_speech(session["questions"])
+            self.send_json(
+                {
+                    "application_id": application["id"],
+                    "candidate_name": application.get("full_name") or "there",
+                    "role": application.get("requirement_position") or application.get("matched_position") or application.get("detected_position") or "this role",
+                    "question": session["current_question"] or (session["questions"][0] if session["questions"] else ""),
+                    "question_number": session["current_index"] + 1,
+                    "total_questions": len(session["questions"]),
+                    "resumed": True,
+                }
+            )
+            return
+
         database = self.db()
         try:
             attempts = database.db.bump_interview_attempts(application["id"])
@@ -1453,7 +1495,7 @@ Conversation so far:
                 {
                     "error": (
                         "This interview has already been started the maximum number of times. "
-                        "Please contact us if you had a technical problem."
+                        "Please reply to our email and we will reopen it for you."
                     )
                 },
                 status=429,

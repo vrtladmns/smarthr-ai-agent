@@ -230,12 +230,24 @@ def test_session_survives_a_restart_mid_interview(server, application):
 # --- attempt cap --------------------------------------------------------------
 
 def test_attempt_cap_survives_a_restart(server, application):
+    """The counter lives in the database, so a process restart cannot reset it.
+
+    Each iteration clears the stored session as well as the in-memory one, which
+    is what makes the next call a genuinely fresh start rather than a resume.
+    """
     token = application["token"]
     for _ in range(rd.MAX_INTERVIEW_ATTEMPTS):
+        db = ra.RecruiterDatabase()
+        db.clear_interview_session(application["id"])
+        db.close()
+        rd.WEB_INTERVIEW_SESSIONS.clear()
         assert start(server, token).status_code == 200
-        rd.WEB_INTERVIEW_SESSIONS.clear()      # restart between attempts
-    r = start(server, token)
-    assert r.status_code == 429, "the cap must be enforced across restarts"
+
+    db = ra.RecruiterDatabase()
+    db.clear_interview_session(application["id"])
+    db.close()
+    rd.WEB_INTERVIEW_SESSIONS.clear()
+    assert start(server, token).status_code == 429, "the cap must be enforced across restarts"
 
 
 # --- errors are JSON, not an HTML page ---------------------------------------
@@ -310,6 +322,65 @@ def test_completed_session_is_cleared_from_the_database(server, application):
 def test_question_count_is_capped(server, application):
     body = start(server, application["token"]).json()
     assert body["total_questions"] <= rd.MAX_INTERVIEW_QUESTIONS
+
+
+
+
+# --- resuming is not restarting (application 135, 2026-08-21) ----------------
+
+def test_reload_resumes_without_consuming_an_attempt(server, application):
+    """A page reload used to burn an attempt and lock the candidate out."""
+    token = application["token"]
+    assert start(server, token).status_code == 200
+    FakeLLM.next_action = {"action": "next_question", "reply": "Ok.", "question": "", "reason": "ok"}
+    turn(server, token, "A real answer about reconciliations and month end close.", 1)
+
+    rd.WEB_INTERVIEW_SESSIONS.clear()          # browser reload / server restart
+    r = start(server, token)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("resumed") is True
+    assert body["question_number"] == 2, "must pick up where they left off"
+
+    db = ra.RecruiterDatabase()
+    used = db.one(
+        "SELECT interview_attempts FROM recruiter_applications WHERE id = %s",
+        (application["id"],),
+    )["interview_attempts"]
+    db.close()
+    assert used == 1, f"a resume must not consume an attempt (used {used})"
+
+
+def test_a_genuinely_fresh_start_still_counts(server, application):
+    token = application["token"]
+    db = ra.RecruiterDatabase()
+    db.clear_interview_session(application["id"])
+    db.execute(
+        "UPDATE recruiter_applications SET interview_attempts = %s WHERE id = %s",
+        (rd.MAX_INTERVIEW_ATTEMPTS, application["id"]),
+    )
+    db.close()
+    rd.WEB_INTERVIEW_SESSIONS.clear()
+    assert start(server, token).status_code == 429
+
+
+def test_reopening_clears_the_lockout(server, application):
+    token = application["token"]
+    db = ra.RecruiterDatabase()
+    db.clear_interview_session(application["id"])
+    db.execute(
+        "UPDATE recruiter_applications SET interview_attempts = %s WHERE id = %s",
+        (rd.MAX_INTERVIEW_ATTEMPTS + 5, application["id"]),
+    )
+    db.close()
+    rd.WEB_INTERVIEW_SESSIONS.clear()
+    assert start(server, token).status_code == 429
+
+    db = ra.RecruiterDatabase()
+    db.execute("UPDATE recruiter_applications SET interview_attempts = 0 WHERE id = %s", (application["id"],))
+    db.close()
+    rd.WEB_INTERVIEW_SESSIONS.clear()
+    assert start(server, token).status_code == 200
 
 
 if __name__ == "__main__":
