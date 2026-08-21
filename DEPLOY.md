@@ -179,7 +179,40 @@ sent twice.
 
 ---
 
-## 8. Not covered by this deploy
+## 8. Scanned CVs (OCR)
+
+Some candidates send a photograph or scan of a printed CV. Those PDFs carry no
+text layer at all, so nothing can be read from them and the agent replies asking
+for a text-based file. Two real examples: `CV Parveen Kumar.pdf` and
+`YOUNIS Updated Resume 2026-1.pdf`, both zero extractable characters.
+
+Installing Tesseract lets the agent read them:
+
+```bash
+sudo apt-get install -y tesseract-ocr
+venv/bin/pip install -r requirements-recruiter.txt   # pymupdf, pytesseract, pillow
+sudo systemctl restart recruiter-agent recruiter-dashboard
+```
+
+Confirm it works:
+
+```bash
+venv/bin/python -c "import pytesseract; print(pytesseract.get_tesseract_version())"
+```
+
+The chain is pypdf, then PyMuPDF, then OCR - each only if the previous found
+nothing - so a normal CV never pays the OCR cost. Measured on the two CVs above:
+2.7s and 3.5s, recovering 3816 and 4142 characters.
+
+Without Tesseract nothing breaks: `ocr_unavailable` is logged once and the
+candidate gets the same "I could not read your CV" reply as before.
+
+Tunable: `RECRUITER_OCR_ENABLED` (default true), `RECRUITER_OCR_MAX_PAGES`
+(default 5), `RECRUITER_OCR_DPI` (default 200).
+
+---
+
+## 9. Not covered by this deploy
 
 - **Rotate the credentials in `.env`** (Graph client secret, DeepSeek, LangSmith,
   dashboard login). They were exposed during the audit and are unchanged.

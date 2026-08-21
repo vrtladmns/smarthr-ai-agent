@@ -2606,12 +2606,20 @@ def _extract_docx_text(path: Path) -> str:
     return " ".join(paragraphs)
 
 
-def extract_pdf_text(path: Path) -> str:
+# Scanned CVs are common - people photograph or scan a printout - and they carry
+# no text layer at all. OCR is attempted only after the cheap paths fail, is
+# capped, and degrades to "unreadable" if the tooling is not installed.
+OCR_ENABLED = os.getenv("RECRUITER_OCR_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+OCR_MAX_PAGES = int(os.getenv("RECRUITER_OCR_MAX_PAGES", "5"))
+OCR_DPI = int(os.getenv("RECRUITER_OCR_DPI", "200"))
+_OCR_UNAVAILABLE_LOGGED = False
+
+
+def extract_pdf_text_pypdf(path: Path) -> str:
     try:
         pypdf = require_package("pypdf", "./venv/bin/python -m pip install pypdf")
     except RuntimeError:
         pypdf = require_package("PyPDF2", "./venv/bin/python -m pip install pypdf")
-
     try:
         reader = pypdf.PdfReader(str(path))
     except Exception as exc:
@@ -2627,6 +2635,87 @@ def extract_pdf_text(path: Path) -> str:
         except Exception as exc:
             log_json(logging.WARNING, "pdf_page_extract_failed", page=index, error=str(exc)[:200])
     return "\n".join(pages).strip()
+
+
+def extract_pdf_text_pymupdf(path: Path) -> str:
+    """Second opinion on the text layer; reads some files pypdf cannot."""
+    try:
+        import pymupdf
+    except ImportError:
+        try:
+            import fitz as pymupdf  # older name
+        except ImportError:
+            return ""
+    try:
+        with pymupdf.open(str(path)) as document:
+            return "\n".join(page.get_text() or "" for page in document).strip()
+    except Exception as exc:
+        log_json(logging.WARNING, "pymupdf_extract_failed", error=str(exc)[:200])
+        return ""
+
+
+def ocr_pdf_text(path: Path) -> str:
+    """Read a scanned CV by rendering its pages and running OCR.
+
+    Optional: without PyMuPDF and Tesseract installed this returns nothing and
+    the caller falls back to telling the candidate the file was unreadable.
+    """
+    global _OCR_UNAVAILABLE_LOGGED
+    if not OCR_ENABLED:
+        return ""
+    try:
+        try:
+            import pymupdf
+        except ImportError:
+            import fitz as pymupdf
+        import pytesseract
+        from PIL import Image
+    except ImportError as exc:
+        if not _OCR_UNAVAILABLE_LOGGED:
+            _OCR_UNAVAILABLE_LOGGED = True
+            log_json(
+                logging.WARNING,
+                "ocr_unavailable",
+                error=str(exc),
+                hint="sudo apt-get install -y tesseract-ocr && "
+                     "./venv/bin/python -m pip install pymupdf pytesseract pillow",
+            )
+        return ""
+
+    started = time.monotonic()
+    pages_text = []
+    try:
+        with pymupdf.open(str(path)) as document:
+            for index, page in enumerate(document):
+                if index >= OCR_MAX_PAGES:
+                    break
+                pixmap = page.get_pixmap(dpi=OCR_DPI)
+                image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+                pages_text.append(pytesseract.image_to_string(image) or "")
+    except Exception as exc:
+        log_json(logging.WARNING, "ocr_failed", error=str(exc)[:300])
+        return ""
+
+    text = "\n".join(pages_text).strip()
+    log_json(
+        logging.INFO,
+        "ocr_completed",
+        pages=len(pages_text),
+        chars=len(text),
+        elapsed_ms=round((time.monotonic() - started) * 1000),
+    )
+    return text
+
+
+def extract_pdf_text(path: Path) -> str:
+    text = extract_pdf_text_pypdf(path)
+    if text:
+        return text
+    text = extract_pdf_text_pymupdf(path)
+    if text:
+        log_json(logging.INFO, "pdf_text_recovered_by_pymupdf", chars=len(text))
+        return text
+    return ocr_pdf_text(path)
 
 
 def sanitize_db_text(value: Any) -> str:

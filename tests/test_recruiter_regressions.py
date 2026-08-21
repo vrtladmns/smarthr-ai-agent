@@ -12,6 +12,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest
+
 import recruiter_agent as ra
 
 
@@ -845,6 +847,40 @@ def test_unrelated_replies_are_not_treated_as_delays():
     ]:
         assert not ra.is_interview_delay_reply(text), text
         assert not ra.wants_a_fresh_interview_link(text), text
+
+
+
+
+# --- scanned CVs (parveenhaier / naikoo738, 2026-08-22) ---------------------
+
+def test_pdf_extraction_falls_through_to_ocr(monkeypatch, tmp_path):
+    """pypdf -> PyMuPDF -> OCR, each only when the previous found nothing."""
+    calls = []
+    monkeypatch.setattr(ra, "extract_pdf_text_pypdf", lambda p: calls.append("pypdf") or "")
+    monkeypatch.setattr(ra, "extract_pdf_text_pymupdf", lambda p: calls.append("pymupdf") or "")
+    monkeypatch.setattr(ra, "ocr_pdf_text", lambda p: calls.append("ocr") or "SCANNED TEXT")
+    assert ra.extract_pdf_text(tmp_path / "x.pdf") == "SCANNED TEXT"
+    assert calls == ["pypdf", "pymupdf", "ocr"]
+
+
+def test_a_readable_pdf_never_reaches_ocr(monkeypatch, tmp_path):
+    """OCR is slow; it must not run when the text layer is fine."""
+    monkeypatch.setattr(ra, "extract_pdf_text_pypdf", lambda p: "real text")
+    monkeypatch.setattr(ra, "ocr_pdf_text", lambda p: pytest.fail("OCR should not run"))
+    assert ra.extract_pdf_text(tmp_path / "x.pdf") == "real text"
+
+
+def test_ocr_can_be_switched_off(monkeypatch, tmp_path):
+    monkeypatch.setattr(ra, "OCR_ENABLED", False)
+    assert ra.ocr_pdf_text(tmp_path / "x.pdf") == ""
+
+
+def test_missing_ocr_tooling_degrades_to_unreadable(monkeypatch, tmp_path):
+    """Without Tesseract the candidate still gets a clear explanation."""
+    monkeypatch.setattr(ra, "extract_pdf_text_pypdf", lambda p: "")
+    monkeypatch.setattr(ra, "extract_pdf_text_pymupdf", lambda p: "")
+    monkeypatch.setattr(ra, "ocr_pdf_text", lambda p: "")
+    assert ra.extract_pdf_text(tmp_path / "x.pdf") == ""
 
 
 if __name__ == "__main__":
