@@ -1973,19 +1973,49 @@ def application_prompt_facts(application: dict[str, Any] | None) -> dict[str, An
     return facts
 
 
+# "tomorrow" is misspelled more often than not, and candidates say they will
+# "give", "attend" or "sit" the interview as readily as "complete" it.
+LATER_WORDS = r"(later|soon|tomorrow|tommorow|tommorrow|tomorow|tmrw|tmr|next week|monday|tuesday|wednesday|thursday|friday|weekend|in a few days|after a few days)"
+INTERVIEW_VERBS = r"(do|complete|finish|take|attempt|give|attend|sit|join|start)"
+
+
+def wants_a_fresh_interview_link(latest_body: str) -> bool:
+    """Candidate is asking for the link again, not reporting a problem with it."""
+    text = normalize_position_text(latest_reply_text(latest_body or ""))
+    if not text:
+        return False
+    return any(
+        re.search(pattern, text)
+        for pattern in [
+            r"\b(send|share|resend|re send|forward|give)\b[^.]{0,24}\b(new|another|fresh|again|link)\b",
+            r"\bnew link\b",
+            r"\banother link\b",
+            r"\blink again\b",
+            r"\bresend\b",
+        ]
+    )
+
+
 def is_interview_delay_reply(latest_body: str) -> bool:
-    text = normalize_position_text(latest_body)
+    """Candidate intends to sit the interview, just not right now."""
+    text = normalize_position_text(latest_reply_text(latest_body or ""))
     if not text:
         return False
     patterns = [
-        r"\b(i am|i'm|im)\s+(busy|occupied|tied up)\b",
-        r"\bnot\s+(available|free)\s+(today|right now|currently|at the moment)\b",
-        r"\b(i will|i'll|will)\s+(do|complete|finish|take|attempt)\s+(it|the interview)\s+(later|soon|tomorrow|in a few days|after a few days|next week)\b",
-        r"\b(i will|i'll|will)\s+(do|complete|finish|take|attempt)\s+(later|soon|tomorrow|next week)\b",
+        r"\b(i am|i'm|im)\s+(busy|occupied|tied up|travelling|traveling|unwell|sick)\b",
+        r"\bnot\s+(available|free)\s+(today|right now|currently|at the moment|now)\b",
+        rf"\b(i will|i'll|will|can i|i can|i would)\s+{INTERVIEW_VERBS}\s+(it|the interview|this)?\s*{LATER_WORDS}\b",
+        rf"\b(i will|i'll|will)\s+{INTERVIEW_VERBS}\b[^.]{{0,30}}\b{LATER_WORDS}\b",
+        rf"\b{LATER_WORDS}\s+(i will|i'll|i can|i would)\b",
         r"\b(in|after)\s+(a\s+)?few\s+days\b",
         r"\bneed\s+(some|a little|more)?\s*time\b",
-        r"\bcan\s+i\s+(do|complete|take)\s+it\s+later\b",
-        r"\bwill\s+complete\s+(soon|later|tomorrow|next week)\b",
+        r"\bcan\s+i\s+(do|complete|take|give|attend)\s+it\s+later\b",
+        rf"\bwill\s+(complete|do|give|attend)\s+{LATER_WORDS}\b",
+        rf"\b{LATER_WORDS}\b[^.]{{0,20}}\b(i will|i'll|i ll|i can)\b",
+        # Apostrophes are stripped by normalisation, so "I'll" arrives as "i ll".
+        rf"\b(i ll|ill)\s+{INTERVIEW_VERBS}\b[^.]{{0,30}}\b{LATER_WORDS}\b",
+        # Catch-all: an interview verb and a later-word in the same clause.
+        rf"\b{INTERVIEW_VERBS}\b[^.]{{0,30}}\b{LATER_WORDS}\b",
     ]
     return any(re.search(pattern, text) for pattern in patterns)
 
@@ -5953,7 +5983,12 @@ class AIRecruiterAgent:
                 scenario="status_followup_no_application",
             )
 
-    def reply_interview_delay_acknowledged(self, inbox_email: InboxEmail, application: dict[str, Any]):
+    def reply_interview_delay_acknowledged(
+        self,
+        inbox_email: InboxEmail,
+        application: dict[str, Any],
+        asked_for_new_link: bool = False,
+    ):
         position = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
         position_text = f" for the {position} role" if position else ""
         token = application.get("interview_link_token")
@@ -5962,18 +5997,28 @@ class AIRecruiterAgent:
             "No problem, thank you for letting me know.",
             f"You can complete the AI interview{position_text} whenever you are available over the next few days.",
         ]
-        if link:
+        if link and asked_for_new_link:
+            # He asked for a new one; the honest answer is that he does not need
+            # one. Issuing a fresh token would invalidate the link he already has.
+            lines.append(
+                f"You do not need a new link - the one already sent to you still works: {link}"
+            )
+        elif link:
             lines.append(f"The same link will remain active: {link}")
         lines.append("Once you complete it, I will review it and get back to you with the next update.")
         fallback_body = recruiter_email_body(*lines)
         body = self.ai.draft_reply(
             inbox_email,
-            "candidate says they are busy and will complete the pending AI interview later; acknowledge politely, keep the same link active, and do not pressure them",
+            "candidate says they will complete the pending AI interview later, and may have asked "
+            "for a new link; acknowledge warmly, tell them plainly that the link they already have "
+            "still works and no new one is needed, keep it active, and do not pressure them",
             {
                 "application_id": application.get("id"),
                 "position": position,
                 "interview_pending": True,
                 "interview_link": link,
+                "asked_for_new_link": asked_for_new_link,
+                "same_link_still_valid": True,
                 "automatic_reminder_suppressed": True,
             },
             fallback_body,
@@ -6529,7 +6574,10 @@ class AIRecruiterAgent:
             and not inbox_email.attachments
             and (active_application.get("application_status") or "").lower() in {"interview_link_sent", "interview_started"}
             and not active_application.get("interview_completed_at")
-            and is_interview_delay_reply(inbox_email.body)
+            and (
+                is_interview_delay_reply(inbox_email.body)
+                or wants_a_fresh_interview_link(inbox_email.body)
+            )
         ):
             self.db.mark_interview_reminder_handled(active_application["id"])
             self.db.log_email_event(
@@ -6550,7 +6598,11 @@ class AIRecruiterAgent:
                     "next_action": "reply_with_same_interview_link",
                 },
             )
-            self.reply_interview_delay_acknowledged(inbox_email, active_application)
+            self.reply_interview_delay_acknowledged(
+                inbox_email,
+                active_application,
+                asked_for_new_link=wants_a_fresh_interview_link(inbox_email.body),
+            )
             return True
 
         if active_application and not inbox_email.attachments:
