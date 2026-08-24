@@ -236,30 +236,39 @@ them, and nothing in the logs would tell their queries apart from the agent's.
 
 ### Create his login
 
-One command. It creates the role and prints the exact connection string to send:
+Creating a role needs `CREATEROLE`, which the `recruiter` account does not have
+on the server — that is correct, and the script now finds an administrative
+connection for you:
 
 ```bash
-./scripts/setup_dashboard_developer.sh
+sudo ./scripts/setup_dashboard_developer.sh
 ```
 
-It generates a password, or takes one: `./scripts/setup_dashboard_developer.sh 'my-password'`
+It tries `ADMIN_DATABASE_URL`, then `sudo -u postgres`, then a Postgres
+container, then `DATABASE_URL`, and uses the first that can create a role. It
+prints which route it took. If none works it stops and shows the exact command
+for each kind of install rather than half-applying anything.
 
-The role is `dashboard_dev` with **full read and write on every table**, plus
-`CREATE` on the schema so he can add his own tables. It is not a superuser: it
-cannot create roles, drop the database, or become the owner. Default privileges
-are set too, so tables the agent adds in a later migration do not lock him out.
+The role is `dashboard_dev`: **full read and write on every table**, plus
+`CREATE` on the schema for his own tables. Not a superuser — it cannot create
+roles, drop the database, or become the owner.
 
 Verified behaviour:
 
 ```
 ALLOWED  SELECT / INSERT / UPDATE / DELETE on every table
 ALLOWED  CREATE TABLE for his own app tables, sequences, the dash_* views
+ALLOWED  tables the agent creates in a later migration, with no extra grant
 BLOCKED  CREATE ROLE, superuser
 LIMITS   30 connections, 60s statement timeout, 120s idle-in-transaction
 ```
 
+That third line matters: default privileges are attached to the role that owns
+the tables, not to whoever ran the script. Get that wrong and the developer
+loses access to every table added by a future migration.
+
 If you would rather he could not write at all, `scripts/create_dashboard_role.sql`
-is the read-only equivalent and `scripts/create_dashboard_rw_role.sql` is the
+is the read-only equivalent, and `scripts/create_dashboard_rw_role.sql` is the
 middle option that keeps the two reply ledgers read-only.
 
 ### Opening the network
