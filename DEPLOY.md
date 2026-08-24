@@ -233,49 +233,85 @@ developer's laptop it points at their own computer, not your server.
 
 **It is the owner account.** `recruiter` created every table, so it can also drop
 them, and nothing in the logs would tell their queries apart from the agent's.
-It reads raw CV bytes, full CV text, phone numbers and salary expectations for
-every candidate you have ever received.
 
-### Create a scoped role instead
+### Create his login
+
+One command. It creates the role and prints the exact connection string to send:
 
 ```bash
-psql "$DATABASE_URL" -v webdev_password="'a-strong-password'" \
-     -f scripts/create_webdev_role.sql
+./scripts/setup_dashboard_developer.sh
 ```
 
-That role is read-only, cannot create or drop anything, has a 30s statement
-timeout, and sees candidates and applications through views that omit
-`attachment_payload` and `raw_cv_text`. Verified behaviour:
+It generates a password, or takes one: `./scripts/setup_dashboard_developer.sh 'my-password'`
+
+The role is `dashboard_dev` with **full read and write on every table**, plus
+`CREATE` on the schema so he can add his own tables. It is not a superuser: it
+cannot create roles, drop the database, or become the owner. Default privileges
+are set too, so tables the agent adds in a later migration do not lock him out.
+
+Verified behaviour:
 
 ```
-ALLOWED  read requirements / candidate view / application view
-BLOCKED  raw candidates table, raw CV bytes, reply ledger
-BLOCKED  INSERT, UPDATE, DELETE, DROP, CREATE
+ALLOWED  SELECT / INSERT / UPDATE / DELETE on every table
+ALLOWED  CREATE TABLE for his own app tables, sequences, the dash_* views
+BLOCKED  CREATE ROLE, superuser
+LIMITS   30 connections, 60s statement timeout, 120s idle-in-transaction
 ```
 
-Revoking it later is one command: `DROP OWNED BY webdev; DROP ROLE webdev;`
+If you would rather he could not write at all, `scripts/create_dashboard_role.sql`
+is the read-only equivalent and `scripts/create_dashboard_rw_role.sql` is the
+middle option that keeps the two reply ledgers read-only.
 
-### Reaching it over the network
+### Opening the network
 
-Postgres listens on loopback only, which is the right default. Pick one:
+Postgres listens on loopback, so the string will not connect until you do this.
+The script prints these with your server's IP filled in:
 
-1. **SSH tunnel (simplest, nothing exposed).** The developer runs:
-   `ssh -L 5432:127.0.0.1:5432 ubuntu@<server>` and connects to
-   `postgresql://webdev:...@127.0.0.1:5432/recruitment`. Give them an SSH key,
-   not the database port.
-2. **Open the port to one address.** In `postgresql.conf` set
-   `listen_addresses = '*'`, add a `hostssl recruitment webdev <their-ip>/32 scram-sha-256`
-   line to `pg_hba.conf`, and allow that single IP in the AWS security group.
-   Require TLS; never open 5432 to `0.0.0.0/0`.
-3. **Give them an API, not the database.** Usually the right answer for a front
-   end, and it keeps schema changes from breaking their code.
+```
+1. postgresql.conf     listen_addresses = '*'
+2. pg_hba.conf         hostssl recruitment dashboard_dev <HIS.IP>/32 scram-sha-256
+3. AWS security group  allow TCP 5432 from <HIS.IP>/32   -- that address only
+4. restart             sudo systemctl restart postgresql   (or docker restart)
+```
 
-### Before you send anything
+In Docker, step 1 is already done - Docker publishes on all interfaces and
+bypasses ufw. Check with `sudo ss -ltnp | grep 5432`. Never open 5432 to
+`0.0.0.0/0`.
 
-This data is candidate personal information - names, phone numbers, salaries,
-CVs. Worth a written agreement about what they may store and for how long, and
-worth deciding whether they need real data at all or a scrubbed copy would do.
+### Managing it afterwards
 
+```sql
+ALTER ROLE dashboard_dev WITH PASSWORD 'new-one';    -- rotate
+DROP OWNED BY dashboard_dev; DROP ROLE dashboard_dev;  -- revoke, one command
+```
+
+Watch what he is doing:
+
+```sql
+SELECT usename, state, query_start, left(query,80)
+  FROM pg_stat_activity WHERE usename = 'dashboard_dev';
+```
+
+### Two things to tell him
+
+**Writing a status is not an action.** Nine dashboard actions send email and one
+also books a calendar meeting. `UPDATE ... SET application_status='hr_approved'`
+changes the row and sends nothing - the candidate waits for a message nobody
+sent. Actions go through `requested_action` (§11). The full list is in
+PROJECT_DATABASE_AUDIT.md §2.3.
+
+**Build against the `dash_*` views, not the raw tables.** `recruiter_applications`
+has 54 columns and changed shape several times this month. The views absorb that;
+his dashboard keeps working.
+
+He now has write access to `recruiter_sent_replies` and
+`recruiter_processed_messages`. Nothing needs to touch them - they are how the
+agent avoids emailing a candidate the same thing twice and avoids answering one
+email twice. Leaving them alone keeps that protection intact.
+
+This is candidate personal data - phone numbers, salary expectations, CVs,
+interview transcripts. Worth a written agreement about what he may store, for how
+long, and what happens when the engagement ends.
 
 ---
 
