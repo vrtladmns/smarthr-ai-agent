@@ -883,6 +883,43 @@ def test_missing_ocr_tooling_degrades_to_unreadable(monkeypatch, tmp_path):
     assert ra.extract_pdf_text(tmp_path / "x.pdf") == ""
 
 
+
+
+# --- external dashboard action queue (2026-08-24) ----------------------------
+
+def test_every_dashboard_action_maps_to_a_real_function():
+    """A SQL status change cannot send an email; these handlers can."""
+    handlers = ra.agent_action_handlers()
+    for name in [
+        "approve_interview", "approve_hr_round", "reject_after_interview",
+        "send_interview_link", "send_teams_link", "revoke_jd_rejection",
+        "reevaluate", "select_after_hr_round", "reject_after_hr_round",
+        "hold_after_hr_round", "reopen_interview",
+    ]:
+        assert name in handlers, name
+        assert callable(handlers[name])
+
+
+def test_ddl_splitter_handles_comments_and_function_bodies():
+    """Splitting on every ';' cut a plpgsql body and a comment in half."""
+    script = """
+    CREATE TABLE a (id int);
+    -- a comment; with a semicolon in it
+    CREATE FUNCTION f() RETURNS TRIGGER AS $$
+    BEGIN
+        NEW.x := 1;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    CREATE TABLE b (id int);
+    """
+    statements = ra.split_sql_statements(script)
+    assert len(statements) == 3, statements
+    assert statements[0].startswith("CREATE TABLE a")
+    assert "RETURN NEW" in statements[1] and statements[1].startswith("CREATE FUNCTION")
+    assert statements[2].startswith("CREATE TABLE b")
+
+
 if __name__ == "__main__":
     import pytest
 

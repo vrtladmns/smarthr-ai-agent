@@ -275,3 +275,30 @@ Postgres listens on loopback only, which is the right default. Pick one:
 This data is candidate personal information - names, phone numbers, salaries,
 CVs. Worth a written agreement about what they may store and for how long, and
 worth deciding whether they need real data at all or a scrubbed copy would do.
+
+
+---
+
+## 11. External dashboard action queue
+
+An outside dashboard with database access can ask the agent to act by setting
+`requested_action` on an application. A trigger queues it, and the agent runs it
+with the same code the built-in dashboard uses.
+
+The webhook service drains the queue automatically. To run it standalone:
+
+```bash
+venv/bin/python recruiter_agent.py --watch-actions      # continuous
+venv/bin/python recruiter_agent.py --process-actions    # one pass
+```
+
+Check what is waiting or failed:
+
+```sql
+SELECT id, application_id, action, status, error, created_at
+  FROM agent_action_queue
+ WHERE status <> 'done'
+ ORDER BY created_at DESC;
+```
+
+Full detail, including the list of actions, is in DASHBOARD_ACCESS_AUDIT.md §4.
