@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# Create the developer's database login and print everything to send him.
+# Create the dashboard developer's database login and print what to send him.
 #
 #   ./scripts/setup_dashboard_developer.sh                 # generates a password
 #   ./scripts/setup_dashboard_developer.sh 'my-password'
 #
-# Creates the role only. It does not open any port - the network steps it
-# prints are for you to apply deliberately.
+# Creating a role needs CREATEROLE, which the application's own role usually
+# does not have. This finds an administrative connection by trying, in order:
+#
+#   ADMIN_DATABASE_URL   if you set it
+#   sudo -u postgres     the normal native install
+#   docker exec          if postgres runs in a container
+#   DATABASE_URL         only if that role happens to have CREATEROLE
+#
+# It creates the role only. The network steps it prints are for you to apply
+# deliberately - it opens nothing.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -15,28 +23,99 @@ SQL_FILE="scripts/create_dashboard_full_role.sql"
 
 PASSWORD="${1:-$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | head -c 24)}"
 
-DB_URL="$(grep -E '^DATABASE_URL=' .env 2>/dev/null | head -1 | cut -d= -f2-)"
+DB_URL="$(grep -E '^DATABASE_URL=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"'')"
 DB_NAME="${DB_URL##*/}"; DB_NAME="${DB_NAME%%\?*}"; DB_NAME="${DB_NAME:-recruitment}"
 
-CONTAINER=""
-for candidate in $(docker ps --format '{{.Names}}\t{{.Image}}' 2>/dev/null | grep -i postgres | cut -f1); do
-  if docker exec -i "$candidate" psql -U recruiter -d "$DB_NAME" -tAc 'select 1' >/dev/null 2>&1; then
-    CONTAINER="$candidate"; break
-  fi
-done
+# --- find a connection that can create a role --------------------------------
+MODE=""; CONTAINER=""
 
-if [ -n "$CONTAINER" ]; then
-  echo "postgres : docker container '$CONTAINER'"
-  docker exec -i "$CONTAINER" psql -U recruiter -d "$DB_NAME" \
-    -v app_password="'$PASSWORD'" -q < "$SQL_FILE"
+can_sudo_postgres() {
+  command -v sudo >/dev/null || return 1
+  # sudo -n so the script never hangs on a password prompt. Warn rather than
+  # fall through silently, because the next route is unlikely to be right.
+  if sudo -n true 2>/dev/null; then return 0; fi
+  if id postgres >/dev/null 2>&1; then
+    echo "note: a postgres OS user exists but passwordless sudo is not available." >&2
+    echo "      re-run as: sudo $0 ${1:+'<password>'}" >&2
+  fi
+  return 1
+}
+
+can_create_role() {   # can_create_role <mode> [container]
+  local probe="select 1 from pg_roles where rolname = current_user and (rolsuper or rolcreaterole)"
+  local out
+  case "$1" in
+    admin_url) out="$(psql "$ADMIN_DATABASE_URL" -tAc "$probe" 2>/dev/null || true)" ;;
+    sudo)      out="$(sudo -n -u postgres psql -d "$DB_NAME" -tAc "$probe" 2>/dev/null || true)" ;;
+    docker)    out="$(docker exec -i "$2" psql -U postgres -d "$DB_NAME" -tAc "$probe" 2>/dev/null || true)" ;;
+    app_url)   out="$(psql "$DB_URL" -tAc "$probe" 2>/dev/null || true)" ;;
+  esac
+  [ "$out" = "1" ]
+}
+
+if [ -n "${ADMIN_DATABASE_URL:-}" ] && can_create_role admin_url; then
+  MODE=admin_url; ROUTE="ADMIN_DATABASE_URL"
+elif can_sudo_postgres && can_create_role sudo; then
+  MODE=sudo; ROUTE="sudo -u postgres"
 else
-  echo "postgres : native service"
-  psql "$DB_URL" -v app_password="'$PASSWORD'" -q -f "$SQL_FILE"
+  for c in $(docker ps --format '{{.Names}}' 2>/dev/null | grep -i postgres || true); do
+    if can_create_role docker "$c"; then MODE=docker; CONTAINER="$c"; ROUTE="docker exec $c (postgres)"; break; fi
+  done
+  if [ -z "$MODE" ] && can_create_role app_url; then MODE=app_url; ROUTE="DATABASE_URL"; fi
 fi
+
+if [ -z "$MODE" ]; then
+  cat <<MSG
+
+No connection available that can create a role.
+
+The application's own role cannot do it - that is expected and correct. Use the
+postgres superuser instead. Pick whichever matches your server:
+
+  # native install, run as a user with sudo
+  sudo -u postgres ./scripts/setup_dashboard_developer.sh
+
+  # postgres in Docker
+  docker exec -i <container> psql -U postgres -d ${DB_NAME} \\
+      -v app_password="'a-strong-password'" -v owner_role=recruiter \\
+      < scripts/create_dashboard_full_role.sql
+
+  # managed Postgres (RDS) - use the master user
+  ADMIN_DATABASE_URL='postgresql://master:pw@host:5432/${DB_NAME}' \\
+      ./scripts/setup_dashboard_developer.sh
+
+Or grant the application role the right once, then re-run this script:
+
+  sudo -u postgres psql -d ${DB_NAME} -c 'ALTER ROLE recruiter CREATEROLE'
+
+MSG
+  exit 1
+fi
+
+run_admin() {   # run_admin <psql args...>
+  case "$MODE" in
+    admin_url) psql "$ADMIN_DATABASE_URL" "$@" ;;
+    sudo)      sudo -n -u postgres psql -d "$DB_NAME" "$@" ;;
+    docker)    docker exec -i "$CONTAINER" psql -U postgres -d "$DB_NAME" "$@" ;;
+    app_url)   psql "$DB_URL" "$@" ;;
+  esac
+}
+
+echo "admin route : $ROUTE"
+
+# Default privileges must be attached to whoever owns the agent's tables.
+OWNER="$(run_admin -tAc "select tableowner from pg_tables where tablename='recruiter_applications'" 2>/dev/null | tr -d '[:space:]')"
+OWNER="${OWNER:-recruiter}"
+echo "table owner : $OWNER"
+
+# Fed on stdin, not with -f: psql would reopen the path as the postgres OS
+# user, which cannot read a file under /home/ubuntu on a default install.
+run_admin -q -v ON_ERROR_STOP=1 -v app_password="'$PASSWORD'" \
+          -v owner_role="$OWNER" < "$SQL_FILE"
 
 PUBLIC_IP="$(curl -s --max-time 4 https://checkip.amazonaws.com 2>/dev/null | tr -d '\n' || true)"
 PUBLIC_IP="${PUBLIC_IP:-<YOUR-ELASTIC-IP>}"
-LISTENING="$(ss -ltn 2>/dev/null | awk '$4 ~ /:5432$/ {print $4}' | head -1 || true)"
+LISTENING="$(ss -ltn 2>/dev/null | awk '$4 ~ /:5432$/ {print $4}' | paste -sd' ' || true)"
 
 cat <<MSG
 
@@ -52,13 +131,13 @@ cat <<MSG
 
    postgresql://dashboard_dev:${PASSWORD}@${PUBLIC_IP}:5432/${DB_NAME}?sslmode=require
 
- Send the password in a separate message from the host.
+ Send the password separately from the host.
 
 ──────────────────────────────────────────────────────────────────
  STILL TO DO - the string above will not connect until you do this
 ──────────────────────────────────────────────────────────────────
 
- Currently listening on: ${LISTENING:-127.0.0.1:5432 (loopback only)}
+ Listening on now: ${LISTENING:-127.0.0.1:5432 (loopback only)}
 
  1. postgresql.conf
        listen_addresses = '*'
@@ -69,17 +148,17 @@ cat <<MSG
  3. AWS security group
        allow TCP 5432 from <HIS.SERVER.IP>/32   -- that address only
 
- 4. Restart
-       sudo systemctl restart postgresql        # or: docker restart ${CONTAINER:-<container>}
+ 4. Reload
+       sudo systemctl reload postgresql     # or: docker restart ${CONTAINER:-<container>}
 
- If Postgres runs in Docker, step 1 is already done - Docker publishes
- on all interfaces. Steps 2-4 still apply.
+ If Postgres runs in Docker, step 1 is already done - Docker publishes on all
+ interfaces and bypasses ufw. Steps 2-4 still apply.
 
 ──────────────────────────────────────────────────────────────────
  Verify from his side:
    psql "postgresql://dashboard_dev:PASSWORD@${PUBLIC_IP}:5432/${DB_NAME}?sslmode=require" -c "select count(*) from recruiter_applications"
 
- Change the password later:
+ Rotate the password later:
    ALTER ROLE dashboard_dev WITH PASSWORD 'new-one';
 
  Revoke completely:
