@@ -221,3 +221,57 @@ Tunable: `RECRUITER_OCR_ENABLED` (default true), `RECRUITER_OCR_MAX_PAGES`
   vocabulary destroyed by speech-to-text.
 - **`recruiter_agent copy*.py`** are untracked local files and were not deleted.
   They will not appear on the server.
+
+---
+
+## 10. Giving a developer database access
+
+Do not hand over `DATABASE_URL` as it stands. Two reasons:
+
+**It will not work.** `127.0.0.1` means "the machine running the query". From the
+developer's laptop it points at their own computer, not your server.
+
+**It is the owner account.** `recruiter` created every table, so it can also drop
+them, and nothing in the logs would tell their queries apart from the agent's.
+It reads raw CV bytes, full CV text, phone numbers and salary expectations for
+every candidate you have ever received.
+
+### Create a scoped role instead
+
+```bash
+psql "$DATABASE_URL" -v webdev_password="'a-strong-password'" \
+     -f scripts/create_webdev_role.sql
+```
+
+That role is read-only, cannot create or drop anything, has a 30s statement
+timeout, and sees candidates and applications through views that omit
+`attachment_payload` and `raw_cv_text`. Verified behaviour:
+
+```
+ALLOWED  read requirements / candidate view / application view
+BLOCKED  raw candidates table, raw CV bytes, reply ledger
+BLOCKED  INSERT, UPDATE, DELETE, DROP, CREATE
+```
+
+Revoking it later is one command: `DROP OWNED BY webdev; DROP ROLE webdev;`
+
+### Reaching it over the network
+
+Postgres listens on loopback only, which is the right default. Pick one:
+
+1. **SSH tunnel (simplest, nothing exposed).** The developer runs:
+   `ssh -L 5432:127.0.0.1:5432 ubuntu@<server>` and connects to
+   `postgresql://webdev:...@127.0.0.1:5432/recruitment`. Give them an SSH key,
+   not the database port.
+2. **Open the port to one address.** In `postgresql.conf` set
+   `listen_addresses = '*'`, add a `hostssl recruitment webdev <their-ip>/32 scram-sha-256`
+   line to `pg_hba.conf`, and allow that single IP in the AWS security group.
+   Require TLS; never open 5432 to `0.0.0.0/0`.
+3. **Give them an API, not the database.** Usually the right answer for a front
+   end, and it keeps schema changes from breaking their code.
+
+### Before you send anything
+
+This data is candidate personal information - names, phone numbers, salaries,
+CVs. Worth a written agreement about what they may store and for how long, and
+worth deciding whether they need real data at all or a scrubbed copy would do.
