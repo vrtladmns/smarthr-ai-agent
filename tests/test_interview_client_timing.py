@@ -46,8 +46,8 @@ def test_silence_uses_microphone_activity():
 def test_microphone_activity_is_tracked_unconditionally():
     """It used to only record activity after speechStarted, so it was stale."""
     monitor = js_block("startAudioActivityMonitor")
-    assert "rms >= MIC_ACTIVITY_THRESHOLD && speechStarted" not in monitor
-    assert "rms >= MIC_ACTIVITY_THRESHOLD" in monitor
+    assert "speechStarted" not in monitor, "the monitor must not be gated on speechStarted"
+    assert "lastMicActivityAt = Date.now();" in monitor
 
 
 def test_final_result_path_also_respects_the_microphone():
@@ -62,6 +62,10 @@ def test_final_result_path_also_respects_the_microphone():
 
 def _const(name: str) -> int:
     return int(re.search(rf"const {name} = (\d+);", SOURCE).group(1))
+
+
+def _const_float(name: str) -> float:
+    return float(re.search(rf"const {name} = ([\d.]+);", SOURCE).group(1))
 
 
 def test_silence_thresholds_are_not_trigger_happy():
@@ -126,6 +130,43 @@ def test_transcript_digest_is_bounded():
     )
     assert len(digest) <= 6
     assert all(len(d["answer"]) <= 600 for d in digest)
+
+
+
+
+# --- background noise must not hold the turn open (2026-08-21) ---------------
+
+def test_microphone_threshold_adapts_to_the_room():
+    """A fan sits above the old fixed threshold, so the mic never went quiet
+    and the candidate had to mute to advance."""
+    monitor = js_block("startAudioActivityMonitor")
+    assert "noiseFloor" in monitor
+    assert "NOISE_FLOOR_MULTIPLIER" in monitor
+    assert "speechThreshold" in monitor
+    assert "rms >= MIC_ACTIVITY_THRESHOLD" not in monitor, (
+        "a fixed threshold cannot tell a fan from speech"
+    )
+
+
+def test_the_noise_floor_only_learns_from_non_speech():
+    """Otherwise a few seconds of talking drags the floor past the speaker."""
+    monitor = js_block("startAudioActivityMonitor")
+    assert "if (!soundsLikeSpeech)" in monitor, (
+        "the floor must not be updated from speech frames"
+    )
+
+
+def test_the_microphone_can_never_block_a_turn_forever():
+    body = js_block("currentSilenceMs")
+    assert "MIC_VETO_CEILING_MS" in body
+    assert _const("MIC_VETO_CEILING_MS") <= 10000, "the ceiling must actually bite"
+
+
+def test_noise_floor_constants_are_sane():
+    assert _const_float("NOISE_FLOOR_MULTIPLIER") > 1.0, "speech must exceed the room"
+    assert 0 < _const_float("NOISE_FLOOR_RISE") < _const_float("NOISE_FLOOR_FALL"), (
+        "the floor should fall to a quiet room quickly and rise reluctantly"
+    )
 
 
 if __name__ == "__main__":

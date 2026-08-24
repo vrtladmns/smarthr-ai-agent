@@ -4059,6 +4059,7 @@ Conversation so far:
     // can interrupt. Previously recognition only started in the speak() onend
     // callback, so anything said over the agent was lost entirely - it reached
     // the recording but never the transcript.
+    let noiseFloor = null;
     let aiIsSpeaking = false;
     let bargeInWords = 0;
     const BARGE_IN_MIN_WORDS = 3;
@@ -4100,6 +4101,13 @@ Conversation so far:
     const FINAL_TRANSCRIPT_GRACE_MS = 1200;
     const PROCESSING_NUDGE_MS = {int(RECRUITER_BROWSER_PROCESSING_NUDGE_MS)};
     const MIC_ACTIVITY_THRESHOLD = 0.026;
+    // Adaptive noise-floor tracking, so a fan does not read as speech.
+    const NOISE_FLOOR_MULTIPLIER = 2.2;
+    const NOISE_FLOOR_MARGIN = 0.012;
+    const NOISE_FLOOR_FALL = 0.25;
+    const NOISE_FLOOR_RISE = 0.002;
+    // However noisy the room, stop waiting on the microphone after this.
+    const MIC_VETO_CEILING_MS = 6000;
     const RECORDING_MIME_TYPE = 'video/webm;codecs=vp8,opus';
     const FEMALE_VOICE_HINTS = {json.dumps([hint.strip().lower() for hint in RECRUITER_BROWSER_TTS_VOICE_HINTS.split(",") if hint.strip()])};
 
@@ -4326,6 +4334,13 @@ Conversation so far:
       // away. Web Speech interim results arrive in bursts and routinely stall
       // for a second or more mid-sentence, which is exactly when a candidate got
       // cut off and the interview moved on without them.
+      const transcriptQuietFor = lastTextActivity ? now - lastTextActivity : 0;
+      // The microphone can hold the turn open, but not indefinitely. In a noisy
+      // room even an adaptive floor can stay triggered, and the candidate should
+      // never have to mute their mic to be heard out.
+      if (transcriptQuietFor >= MIC_VETO_CEILING_MS) {{
+        return transcriptQuietFor;
+      }}
       const lastActivity = Math.max(
         lastTextActivity,
         lastSpeechResultAt || 0,
@@ -4437,7 +4452,29 @@ Conversation so far:
             sum += value * value;
           }}
           const rms = Math.sqrt(sum / data.length);
-          if (rms >= MIC_ACTIVITY_THRESHOLD) {{
+
+          // Track the room's noise floor rather than comparing against a fixed
+          // number. A fan or cooler holds a steady low level that never dipped
+          // below the old constant, so the microphone never looked quiet, the
+          // turn never ended, and the candidate had to mute to move on.
+          // Falls quickly toward a new quiet level, rises very slowly, so a
+          // sentence cannot drag the floor up with it.
+          if (noiseFloor === null) noiseFloor = rms;
+          const speechThreshold = Math.max(
+            MIC_ACTIVITY_THRESHOLD,
+            noiseFloor * NOISE_FLOOR_MULTIPLIER + NOISE_FLOOR_MARGIN
+          );
+          const soundsLikeSpeech = rms >= speechThreshold;
+
+          // Learn the room only from frames that are NOT speech. Letting every
+          // frame feed the estimate meant a few seconds of continuous talking
+          // dragged the floor up past the speaker's own level, and they stopped
+          // registering mid-answer - the cut-off bug in a new disguise.
+          if (!soundsLikeSpeech) {{
+            const rate = rms < noiseFloor ? NOISE_FLOOR_FALL : NOISE_FLOOR_RISE;
+            noiseFloor = noiseFloor + (rms - noiseFloor) * rate;
+          }}
+          if (soundsLikeSpeech) {{
             lastMicActivityAt = Date.now();
           }}
           audioMonitorId = window.requestAnimationFrame(tick);

@@ -12,6 +12,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pytest
+
 import recruiter_agent as ra
 
 
@@ -845,6 +847,77 @@ def test_unrelated_replies_are_not_treated_as_delays():
     ]:
         assert not ra.is_interview_delay_reply(text), text
         assert not ra.wants_a_fresh_interview_link(text), text
+
+
+
+
+# --- scanned CVs (parveenhaier / naikoo738, 2026-08-22) ---------------------
+
+def test_pdf_extraction_falls_through_to_ocr(monkeypatch, tmp_path):
+    """pypdf -> PyMuPDF -> OCR, each only when the previous found nothing."""
+    calls = []
+    monkeypatch.setattr(ra, "extract_pdf_text_pypdf", lambda p: calls.append("pypdf") or "")
+    monkeypatch.setattr(ra, "extract_pdf_text_pymupdf", lambda p: calls.append("pymupdf") or "")
+    monkeypatch.setattr(ra, "ocr_pdf_text", lambda p: calls.append("ocr") or "SCANNED TEXT")
+    assert ra.extract_pdf_text(tmp_path / "x.pdf") == "SCANNED TEXT"
+    assert calls == ["pypdf", "pymupdf", "ocr"]
+
+
+def test_a_readable_pdf_never_reaches_ocr(monkeypatch, tmp_path):
+    """OCR is slow; it must not run when the text layer is fine."""
+    monkeypatch.setattr(ra, "extract_pdf_text_pypdf", lambda p: "real text")
+    monkeypatch.setattr(ra, "ocr_pdf_text", lambda p: pytest.fail("OCR should not run"))
+    assert ra.extract_pdf_text(tmp_path / "x.pdf") == "real text"
+
+
+def test_ocr_can_be_switched_off(monkeypatch, tmp_path):
+    monkeypatch.setattr(ra, "OCR_ENABLED", False)
+    assert ra.ocr_pdf_text(tmp_path / "x.pdf") == ""
+
+
+def test_missing_ocr_tooling_degrades_to_unreadable(monkeypatch, tmp_path):
+    """Without Tesseract the candidate still gets a clear explanation."""
+    monkeypatch.setattr(ra, "extract_pdf_text_pypdf", lambda p: "")
+    monkeypatch.setattr(ra, "extract_pdf_text_pymupdf", lambda p: "")
+    monkeypatch.setattr(ra, "ocr_pdf_text", lambda p: "")
+    assert ra.extract_pdf_text(tmp_path / "x.pdf") == ""
+
+
+
+
+# --- external dashboard action queue (2026-08-24) ----------------------------
+
+def test_every_dashboard_action_maps_to_a_real_function():
+    """A SQL status change cannot send an email; these handlers can."""
+    handlers = ra.agent_action_handlers()
+    for name in [
+        "approve_interview", "approve_hr_round", "reject_after_interview",
+        "send_interview_link", "send_teams_link", "revoke_jd_rejection",
+        "reevaluate", "select_after_hr_round", "reject_after_hr_round",
+        "hold_after_hr_round", "reopen_interview",
+    ]:
+        assert name in handlers, name
+        assert callable(handlers[name])
+
+
+def test_ddl_splitter_handles_comments_and_function_bodies():
+    """Splitting on every ';' cut a plpgsql body and a comment in half."""
+    script = """
+    CREATE TABLE a (id int);
+    -- a comment; with a semicolon in it
+    CREATE FUNCTION f() RETURNS TRIGGER AS $$
+    BEGIN
+        NEW.x := 1;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    CREATE TABLE b (id int);
+    """
+    statements = ra.split_sql_statements(script)
+    assert len(statements) == 3, statements
+    assert statements[0].startswith("CREATE TABLE a")
+    assert "RETURN NEW" in statements[1] and statements[1].startswith("CREATE FUNCTION")
+    assert statements[2].startswith("CREATE TABLE b")
 
 
 if __name__ == "__main__":

@@ -362,6 +362,8 @@ EVIDENCE_WEAK_TOKENS = {
 # unread, and the candidate is never answered. Re-processing is safe because the
 # reply ledger still blocks duplicate emails.
 MESSAGE_CLAIM_STALE_MINUTES = int(os.getenv("RECRUITER_MESSAGE_CLAIM_STALE_MINUTES", "30"))
+# How often to pick up work an external dashboard has queued.
+ACTION_QUEUE_POLL_SECONDS = int(os.getenv("RECRUITER_ACTION_QUEUE_POLL_SECONDS", "15"))
 
 # Never send the same scenario to the same application twice inside this window.
 # This is the backstop that caps the blast radius of any single logic bug.
@@ -726,6 +728,47 @@ ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_session JS
 -- Attempt counter lives here rather than in process memory, which reset on every
 -- restart and made the cap unenforceable.
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS interview_attempts INTEGER NOT NULL DEFAULT 0;
+-- Set by an external dashboard to ask the agent to actually DO something.
+-- Writing a status in SQL changes a row; it does not send the email, create the
+-- Teams meeting or re-score the CV. Setting this column does.
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS requested_action TEXT;
+ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS requested_action_by TEXT;
+
+-- Work queued for the agent by anyone with database access.
+CREATE TABLE IF NOT EXISTS agent_action_queue (
+    id BIGSERIAL PRIMARY KEY,
+    application_id BIGINT NOT NULL,
+    action TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    requested_by TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS agent_action_queue_pending_idx
+ON agent_action_queue (status, created_at)
+WHERE status = 'pending';
+
+-- Setting requested_action enqueues the work and clears the column, so the
+-- dashboard can simply write a value and watch the queue row for the outcome.
+CREATE OR REPLACE FUNCTION enqueue_requested_action() RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.requested_action IS NOT NULL AND NEW.requested_action <> '' THEN
+        INSERT INTO agent_action_queue (application_id, action, requested_by)
+        VALUES (NEW.id, NEW.requested_action, NEW.requested_action_by);
+        NEW.requested_action := NULL;
+        NEW.requested_action_by := NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS recruiter_applications_requested_action ON recruiter_applications;
+CREATE TRIGGER recruiter_applications_requested_action
+BEFORE UPDATE OF requested_action ON recruiter_applications
+FOR EACH ROW EXECUTE FUNCTION enqueue_requested_action();
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS budget_disclosed_at TIMESTAMPTZ;
 ALTER TABLE recruiter_applications ADD COLUMN IF NOT EXISTS budget_response TEXT;
 """
@@ -2606,12 +2649,20 @@ def _extract_docx_text(path: Path) -> str:
     return " ".join(paragraphs)
 
 
-def extract_pdf_text(path: Path) -> str:
+# Scanned CVs are common - people photograph or scan a printout - and they carry
+# no text layer at all. OCR is attempted only after the cheap paths fail, is
+# capped, and degrades to "unreadable" if the tooling is not installed.
+OCR_ENABLED = os.getenv("RECRUITER_OCR_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+OCR_MAX_PAGES = int(os.getenv("RECRUITER_OCR_MAX_PAGES", "5"))
+OCR_DPI = int(os.getenv("RECRUITER_OCR_DPI", "200"))
+_OCR_UNAVAILABLE_LOGGED = False
+
+
+def extract_pdf_text_pypdf(path: Path) -> str:
     try:
         pypdf = require_package("pypdf", "./venv/bin/python -m pip install pypdf")
     except RuntimeError:
         pypdf = require_package("PyPDF2", "./venv/bin/python -m pip install pypdf")
-
     try:
         reader = pypdf.PdfReader(str(path))
     except Exception as exc:
@@ -2627,6 +2678,87 @@ def extract_pdf_text(path: Path) -> str:
         except Exception as exc:
             log_json(logging.WARNING, "pdf_page_extract_failed", page=index, error=str(exc)[:200])
     return "\n".join(pages).strip()
+
+
+def extract_pdf_text_pymupdf(path: Path) -> str:
+    """Second opinion on the text layer; reads some files pypdf cannot."""
+    try:
+        import pymupdf
+    except ImportError:
+        try:
+            import fitz as pymupdf  # older name
+        except ImportError:
+            return ""
+    try:
+        with pymupdf.open(str(path)) as document:
+            return "\n".join(page.get_text() or "" for page in document).strip()
+    except Exception as exc:
+        log_json(logging.WARNING, "pymupdf_extract_failed", error=str(exc)[:200])
+        return ""
+
+
+def ocr_pdf_text(path: Path) -> str:
+    """Read a scanned CV by rendering its pages and running OCR.
+
+    Optional: without PyMuPDF and Tesseract installed this returns nothing and
+    the caller falls back to telling the candidate the file was unreadable.
+    """
+    global _OCR_UNAVAILABLE_LOGGED
+    if not OCR_ENABLED:
+        return ""
+    try:
+        try:
+            import pymupdf
+        except ImportError:
+            import fitz as pymupdf
+        import pytesseract
+        from PIL import Image
+    except ImportError as exc:
+        if not _OCR_UNAVAILABLE_LOGGED:
+            _OCR_UNAVAILABLE_LOGGED = True
+            log_json(
+                logging.WARNING,
+                "ocr_unavailable",
+                error=str(exc),
+                hint="sudo apt-get install -y tesseract-ocr && "
+                     "./venv/bin/python -m pip install pymupdf pytesseract pillow",
+            )
+        return ""
+
+    started = time.monotonic()
+    pages_text = []
+    try:
+        with pymupdf.open(str(path)) as document:
+            for index, page in enumerate(document):
+                if index >= OCR_MAX_PAGES:
+                    break
+                pixmap = page.get_pixmap(dpi=OCR_DPI)
+                image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+                pages_text.append(pytesseract.image_to_string(image) or "")
+    except Exception as exc:
+        log_json(logging.WARNING, "ocr_failed", error=str(exc)[:300])
+        return ""
+
+    text = "\n".join(pages_text).strip()
+    log_json(
+        logging.INFO,
+        "ocr_completed",
+        pages=len(pages_text),
+        chars=len(text),
+        elapsed_ms=round((time.monotonic() - started) * 1000),
+    )
+    return text
+
+
+def extract_pdf_text(path: Path) -> str:
+    text = extract_pdf_text_pypdf(path)
+    if text:
+        return text
+    text = extract_pdf_text_pymupdf(path)
+    if text:
+        log_json(logging.INFO, "pdf_text_recovered_by_pymupdf", chars=len(text))
+        return text
+    return ocr_pdf_text(path)
 
 
 def sanitize_db_text(value: Any) -> str:
@@ -2726,6 +2858,47 @@ def save_cv_attachment_file(application_id: int, filename: str, payload: bytes) 
         return str(target)
 
 
+def split_sql_statements(script: str) -> list[str]:
+    """Split a DDL script on statement boundaries.
+
+    Splitting on every ";" breaks two things: a semicolon inside a `--` comment,
+    and the body of a dollar-quoted function, which is full of them.
+    """
+    statements = []
+    buffer = []
+    dollar_tag = None
+    for raw_line in script.splitlines():
+        line = raw_line
+        if dollar_tag is None:
+            without_comment = re.sub(r"--.*$", "", line)
+        else:
+            without_comment = line
+
+        search_from = 0
+        while True:
+            match = re.search(r"\$[A-Za-z_]*\$", without_comment[search_from:])
+            if not match:
+                break
+            tag = match.group(0)
+            search_from += match.end()
+            if dollar_tag is None:
+                dollar_tag = tag
+            elif tag == dollar_tag:
+                dollar_tag = None
+
+        buffer.append(without_comment)
+        if dollar_tag is None and without_comment.rstrip().endswith(";"):
+            statement = "\n".join(buffer).strip().rstrip(";").strip()
+            if statement:
+                statements.append(statement)
+            buffer = []
+
+    tail = "\n".join(buffer).strip().rstrip(";").strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
 class RecruiterDatabase:
     """PostgreSQL-backed store for the recruiter agent.
 
@@ -2786,10 +2959,8 @@ class RecruiterDatabase:
 
     def init_schema(self):
         with self.conn.cursor() as cursor:
-            for statement in CREATE_TABLES_SQL.split(";"):
-                statement = statement.strip()
-                if statement:
-                    cursor.execute(statement)
+            for statement in split_sql_statements(CREATE_TABLES_SQL):
+                cursor.execute(statement)
         self.conn.commit()
 
     def log_email_event(self, inbox_email: InboxEmail, event_type: str, details: dict[str, Any]):
@@ -7900,6 +8071,121 @@ def send_tracked_direct_email(
 REMATCH_DEFAULT_STATUSES = ("manual_hr_review", "no_open_requirement")
 
 
+# What an outside dashboard may ask the agent to do. Each maps to a function
+# that already exists and does the real work - the email, the meeting, the
+# scoring - which a plain UPDATE never would.
+def agent_action_handlers() -> dict[str, Any]:
+    return {
+        "approve_interview": lambda app_id, payload: send_interview_request_after_hr_approval(app_id),
+        "approve_hr_round": lambda app_id, payload: send_final_hr_round_request(app_id, approved_by_hr=True),
+        "reject_after_interview": lambda app_id, payload: send_interview_rejection(
+            app_id, payload.get("reason")
+        ),
+        "send_interview_link": lambda app_id, payload: send_interview_link_for_application(app_id),
+        "send_teams_link": lambda app_id, payload: send_teams_link_for_application(app_id),
+        "revoke_jd_rejection": lambda app_id, payload: revoke_jd_score_rejection(app_id),
+        "reevaluate": lambda app_id, payload: reevaluate_application_against_requirement(app_id),
+        "select_after_hr_round": lambda app_id, payload: select_candidate_after_hr_round(app_id),
+        "reject_after_hr_round": lambda app_id, payload: reject_candidate_after_hr_round(app_id),
+        "hold_after_hr_round": lambda app_id, payload: hold_candidate_after_hr_round(app_id),
+        "reopen_interview": lambda app_id, payload: reopen_interview_attempts(app_id),
+    }
+
+
+def reopen_interview_attempts(application_id: int):
+    db = RecruiterDatabase()
+    try:
+        db.execute(
+            "UPDATE recruiter_applications SET interview_attempts = 0 WHERE id = %s",
+            (application_id,),
+        )
+    finally:
+        db.close()
+
+
+def process_action_queue(limit: int = 20) -> int:
+    """Run whatever the dashboard has asked for.
+
+    An external app can read and write this database directly, but a row change
+    cannot send an email or book a Teams meeting. Writing requested_action puts
+    a job here, and this performs it with the same code path the built-in
+    dashboard uses, so both interfaces behave identically.
+    """
+    db = RecruiterDatabase()
+    handlers = agent_action_handlers()
+    done = 0
+    try:
+        db.init_schema()
+        pending = db.rows(
+            """
+            SELECT id, application_id, action, payload, requested_by
+            FROM agent_action_queue
+            WHERE status = 'pending'
+            ORDER BY created_at
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        for job in pending:
+            # Claim it first so two workers cannot run the same action twice.
+            claimed = db.one(
+                """
+                UPDATE agent_action_queue
+                SET status = 'running', started_at = NOW()
+                WHERE id = %s AND status = 'pending'
+                RETURNING id
+                """,
+                (job["id"],),
+            )
+            db.conn.commit()
+            if not claimed:
+                continue
+
+            action = str(job.get("action") or "").strip()
+            handler = handlers.get(action)
+            if not handler:
+                db.execute(
+                    "UPDATE agent_action_queue SET status='failed', error=%s, finished_at=NOW() WHERE id=%s",
+                    (f"unknown action '{action}'. Known: {', '.join(sorted(handlers))}", job["id"]),
+                )
+                log_json(logging.WARNING, "agent_action_unknown", action=action, job_id=job["id"])
+                continue
+
+            try:
+                handler(job["application_id"], json_dict(job.get("payload")))
+                db.execute(
+                    "UPDATE agent_action_queue SET status='done', finished_at=NOW() WHERE id=%s",
+                    (job["id"],),
+                )
+                done += 1
+                log_json(
+                    logging.INFO,
+                    "agent_action_completed",
+                    job_id=job["id"],
+                    action=action,
+                    application_id=job["application_id"],
+                    requested_by=job.get("requested_by"),
+                )
+            except Exception as exc:
+                LOGGER.exception("agent action %s failed: %s", action, exc)
+                db.rollback()
+                db.execute(
+                    "UPDATE agent_action_queue SET status='failed', error=%s, finished_at=NOW() WHERE id=%s",
+                    (str(exc)[:800], job["id"]),
+                )
+                log_json(
+                    logging.ERROR,
+                    "agent_action_failed",
+                    job_id=job["id"],
+                    action=action,
+                    application_id=job["application_id"],
+                    error=str(exc)[:400],
+                )
+        return done
+    finally:
+        db.close()
+
+
 def rematch_stored_applications(
     statuses: tuple[str, ...] = REMATCH_DEFAULT_STATUSES,
     apply_changes: bool = False,
@@ -9288,6 +9574,15 @@ class GraphWebhookServer:
                 log_json(logging.ERROR, "graph_subscription_renew_error", error=str(exc)[:300])
             time.sleep(interval)
 
+    def drain_action_queue_forever(self):
+        """Perform whatever an external dashboard has asked for."""
+        while True:
+            try:
+                process_action_queue()
+            except Exception as exc:
+                LOGGER.exception("Action queue pass failed: %s", exc)
+            time.sleep(ACTION_QUEUE_POLL_SECONDS)
+
     def serve_forever(self):
         httpd = ReusableThreadingHTTPServer(
             (GRAPH_WEBHOOK_HOST, GRAPH_WEBHOOK_PORT),
@@ -9302,6 +9597,8 @@ class GraphWebhookServer:
             print("Subscription auto-renewal is running.")
         else:
             print("GRAPH_NOTIFICATION_URL/GRAPH_CLIENT_STATE not set; auto-renewal is OFF.")
+        Thread(target=self.drain_action_queue_forever, daemon=True).start()
+        print("Watching agent_action_queue for dashboard requests.")
         httpd.serve_forever()
 
 
@@ -9509,6 +9806,16 @@ def main():
         help="List every application the agent has stopped replying to (manual_hr_review, hr_escalated, human_handled, ...)",
     )
     parser.add_argument(
+        "--process-actions",
+        action="store_true",
+        help="Run any actions an external dashboard has queued, then exit",
+    )
+    parser.add_argument(
+        "--watch-actions",
+        action="store_true",
+        help="Continuously run actions queued by an external dashboard",
+    )
+    parser.add_argument(
         "--reopen-interview",
         type=int,
         help="Clear the interview attempt counter for an application so the candidate can start again",
@@ -9670,6 +9977,20 @@ def main():
         finally:
             db.close()
         return
+
+    if args.process_actions:
+        count = process_action_queue()
+        print(f"Processed {count} queued action(s).")
+        return
+
+    if args.watch_actions:
+        print("Watching agent_action_queue. Press Ctrl+C to stop.")
+        while True:
+            try:
+                process_action_queue()
+            except Exception as exc:
+                LOGGER.exception("Action queue pass failed: %s", exc)
+            time.sleep(ACTION_QUEUE_POLL_SECONDS)
 
     if args.reopen_interview:
         db = RecruiterDatabase()
