@@ -29,6 +29,18 @@ DB_NAME="${DB_URL##*/}"; DB_NAME="${DB_NAME%%\?*}"; DB_NAME="${DB_NAME:-recruitm
 # --- find a connection that can create a role --------------------------------
 MODE=""; CONTAINER=""
 
+can_sudo_postgres() {
+  command -v sudo >/dev/null || return 1
+  # sudo -n so the script never hangs on a password prompt. Warn rather than
+  # fall through silently, because the next route is unlikely to be right.
+  if sudo -n true 2>/dev/null; then return 0; fi
+  if id postgres >/dev/null 2>&1; then
+    echo "note: a postgres OS user exists but passwordless sudo is not available." >&2
+    echo "      re-run as: sudo $0 ${1:+'<password>'}" >&2
+  fi
+  return 1
+}
+
 can_create_role() {   # can_create_role <mode> [container]
   local probe="select 1 from pg_roles where rolname = current_user and (rolsuper or rolcreaterole)"
   local out
@@ -43,7 +55,7 @@ can_create_role() {   # can_create_role <mode> [container]
 
 if [ -n "${ADMIN_DATABASE_URL:-}" ] && can_create_role admin_url; then
   MODE=admin_url; ROUTE="ADMIN_DATABASE_URL"
-elif command -v sudo >/dev/null && can_create_role sudo; then
+elif can_sudo_postgres && can_create_role sudo; then
   MODE=sudo; ROUTE="sudo -u postgres"
 else
   for c in $(docker ps --format '{{.Names}}' 2>/dev/null | grep -i postgres || true); do
@@ -96,7 +108,10 @@ OWNER="$(run_admin -tAc "select tableowner from pg_tables where tablename='recru
 OWNER="${OWNER:-recruiter}"
 echo "table owner : $OWNER"
 
-run_admin -q -v app_password="'$PASSWORD'" -v owner_role="$OWNER" -f /dev/stdin < "$SQL_FILE"
+# Fed on stdin, not with -f: psql would reopen the path as the postgres OS
+# user, which cannot read a file under /home/ubuntu on a default install.
+run_admin -q -v ON_ERROR_STOP=1 -v app_password="'$PASSWORD'" \
+          -v owner_role="$OWNER" < "$SQL_FILE"
 
 PUBLIC_IP="$(curl -s --max-time 4 https://checkip.amazonaws.com 2>/dev/null | tr -d '\n' || true)"
 PUBLIC_IP="${PUBLIC_IP:-<YOUR-ELASTIC-IP>}"
