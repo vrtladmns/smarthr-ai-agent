@@ -337,6 +337,16 @@ NEAR_MISS_AMBIGUOUS_BAND = float(os.getenv("RECRUITER_NEAR_MISS_AMBIGUOUS_BAND",
 # conversation closes. Disclosing the range to someone asking for twice it just
 # buys one more round of email and then a human. Set to 0 to always disclose.
 BUDGET_GAP_MAX_RATIO = float(os.getenv("RECRUITER_BUDGET_GAP_MAX_RATIO", "1.4"))
+# Salary figures reach this code in two different units. "Business Development
+# Executive" was entered as 40000-60000, which is per month, while every other
+# role is annual, and candidates answer in whichever unit they think in - one
+# countered at 42000 for that role and another at 660000. Anything below this
+# floor is read as a monthly figure and annualised for the comparison only; the
+# range quoted to a candidate is always what HR typed.
+BUDGET_ANNUAL_FLOOR = float(os.getenv("RECRUITER_BUDGET_ANNUAL_FLOOR", "120000"))
+# A gap this large is a unit or data-entry problem, not a candidate asking too
+# much, and must never close an application on its own.
+BUDGET_IMPLAUSIBLE_GAP_RATIO = float(os.getenv("RECRUITER_BUDGET_IMPLAUSIBLE_GAP_RATIO", "3"))
 
 # Evidence of doing the work counts slightly less than carrying the job title,
 # so an exact title match still wins when both requirements look plausible.
@@ -1506,14 +1516,33 @@ def requirement_budget_text(requirement: dict[str, Any] | None) -> str:
     return "the approved budget"
 
 
+def annualised_amount(value: Any) -> float | None:
+    """Put a salary figure on an annual footing so two of them can be compared.
+
+    A number below the floor is a monthly figure: nobody is paid 60000 a year,
+    and both requirements and candidates supply monthly numbers in practice.
+    """
+    amount = score_number(value)
+    if amount is None or amount <= 0:
+        return None
+    return amount * 12 if amount < BUDGET_ANNUAL_FLOOR else amount
+
+
 def screening_fit(answers: dict[str, Any], requirement: dict[str, Any] | None) -> tuple[bool, list[str]]:
     issues = []
     if answers.get("comfortable_with_terms") is False:
         issues.append("candidate is not comfortable with the shift/office terms")
-    expected_salary = score_number(answers.get("expected_salary"))
-    budget_max = score_number(requirement.get("budget_max") if requirement else None)
+    expected_salary = annualised_amount(answers.get("expected_salary"))
+    budget_max = annualised_amount(requirement.get("budget_max") if requirement else None)
     if expected_salary is not None and budget_max is not None and expected_salary > budget_max:
-        issues.append(f"expected salary is above budget ({expected_salary} > {budget_max})")
+        raw_expected = score_number(answers.get("expected_salary"))
+        raw_budget = score_number((requirement or {}).get("budget_max"))
+        issues.append(
+            f"expected salary is above budget ({raw_expected} > {raw_budget})"
+            if (raw_expected, raw_budget) == (expected_salary, budget_max)
+            else f"expected salary is above budget ({raw_expected} > {raw_budget}, "
+                 f"compared annually as {expected_salary:.0f} > {budget_max:.0f})"
+        )
     return not issues, issues
 
 
@@ -1877,8 +1906,8 @@ def budget_gap_ratio(answers: dict[str, Any], requirement: dict[str, Any] | None
     1.1 means they want ten percent more than the ceiling, which is worth a
     conversation. 2.0 means they are applying to the wrong salary band.
     """
-    expected = score_number((answers or {}).get("expected_salary"))
-    budget_max = score_number((requirement or {}).get("budget_max"))
+    expected = annualised_amount((answers or {}).get("expected_salary"))
+    budget_max = annualised_amount((requirement or {}).get("budget_max"))
     if expected is None or not budget_max or budget_max <= 0:
         return None
     return expected / budget_max
@@ -3106,7 +3135,7 @@ class RecruiterDatabase:
                 inbox_email.sender,
                 inbox_email.subject,
                 event_type,
-                json.dumps(details),
+                json.dumps(details, default=str),
             ),
         )
 
@@ -3347,7 +3376,7 @@ class RecruiterDatabase:
                 budget_disclosed_at = COALESCE(budget_disclosed_at, NOW())
             WHERE id = %s
             """,
-            (json.dumps(screening_details), application_id),
+            (json.dumps(screening_details, default=str), application_id),
         )
 
     def record_budget_response(self, application_id: int, response: str, screening_details: dict[str, Any]):
@@ -3358,7 +3387,7 @@ class RecruiterDatabase:
                 screening_details = %s::jsonb
             WHERE id = %s
             """,
-            (response, json.dumps(screening_details), application_id),
+            (response, json.dumps(screening_details, default=str), application_id),
         )
 
     def open_application_for_candidate(self, candidate_email: str, requirement_id: int | None) -> dict[str, Any] | None:
@@ -3508,7 +3537,7 @@ class RecruiterDatabase:
                 interview_completed_at = NOW()
             WHERE id = %s
             """,
-            ("interview_completed", json.dumps(report), application_id),
+            ("interview_completed", json.dumps(report, default=str), application_id),
         )
 
     def mark_post_interview_outcome(self, application_id: int, status: str, reason: str | None = None):
@@ -3664,7 +3693,7 @@ class RecruiterDatabase:
         details = screening_details or {}
         values = (
             status,
-            json.dumps(details),
+            json.dumps(details, default=str),
             score_number(details.get("current_salary")),
             score_number(details.get("expected_salary")),
             details.get("current_location"),
@@ -3844,7 +3873,7 @@ class RecruiterDatabase:
             sanitize_db_text(cv_text),
             evaluation.get("short_description"),
             numeric_value(evaluation.get("ats_score")),
-            json.dumps(evaluation),
+            json.dumps(evaluation, default=str),
         )
         try:
             with self.conn.cursor() as cursor:
@@ -3912,7 +3941,7 @@ class RecruiterDatabase:
             json.dumps(evaluation.get("risks", [])),
             json.dumps(evaluation.get("missing_requirements", [])),
             evaluation.get("short_description"),
-            json.dumps(evaluation),
+            json.dumps(evaluation, default=str),
             attachment_filename,
             attachment_sha256,
             attachment_payload,
@@ -6478,7 +6507,7 @@ class AIRecruiterAgent:
             and not already_disclosed
             and BUDGET_GAP_MAX_RATIO > 0
             and gap_ratio is not None
-            and gap_ratio > BUDGET_GAP_MAX_RATIO
+            and BUDGET_GAP_MAX_RATIO < gap_ratio <= BUDGET_IMPLAUSIBLE_GAP_RATIO
         ):
             # Too far apart to be worth stating the range and asking. Close it
             # here rather than spending a disclosure, a reply and then a human.
@@ -6650,6 +6679,13 @@ class AIRecruiterAgent:
     @traceable(name="process_recruiting_email")
     def process_email(self, inbox_email: InboxEmail) -> bool:
         started_at = time.monotonic()
+        # Bound up front because the follow-up path reads these before the
+        # attachment loop that assigns them, and Python makes them locals for
+        # the whole method. That was 8 UnboundLocalError crashes in a fortnight,
+        # each one an email the agent silently never answered.
+        cv_role_summary: dict[str, Any] = {}
+        extracted: dict[str, Any] = {}
+        cv_text: str = ""
         log_json(logging.INFO, "email_processing_started", **inbox_email_summary(inbox_email))
         trace_recruiter_event(
             "email_processing_started",

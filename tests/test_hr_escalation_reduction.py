@@ -220,3 +220,79 @@ def test_a_real_sales_candidate_still_is():
         reqs, {"primary_role": "Sales Executive"}, {"current_title": "Sales Executive"}, ""
     )
     assert match is not None and match["position_title"] == "Business Development Executive"
+
+
+# --- salary units (found in production data, 2026-08-28) ----------------------
+
+def test_a_monthly_budget_is_compared_annually():
+    """Business Development Executive is stored as 40000-60000, which is per
+    month; every other open role is annual. A candidate expecting 660000 a year
+    was escalated as over budget against 60000, and is in fact under it."""
+    ok, issues = ra.screening_fit({"expected_salary": 660000}, {"budget_max": 60000})
+    assert ok, issues
+
+
+def test_a_monthly_answer_against_a_monthly_budget_also_fits():
+    """One candidate countered at 42000 for that role, meaning per month."""
+    ok, _ = ra.screening_fit({"expected_salary": 42000}, {"budget_max": 60000})
+    assert ok
+
+
+def test_a_genuine_overshoot_is_still_caught():
+    ok, issues = ra.screening_fit({"expected_salary": 1400000}, {"budget_max": 1200000})
+    assert not ok and "above budget" in issues[0]
+
+
+def test_the_issue_text_keeps_the_figures_hr_typed():
+    _, issues = ra.screening_fit({"expected_salary": 1400000}, {"budget_max": 1200000})
+    assert "1400000.0 > 1200000.0" in issues[0], "HR must see the numbers they entered"
+
+
+def test_annualised_amount():
+    assert ra.annualised_amount(60000) == 720000      # monthly
+    assert ra.annualised_amount(660000) == 660000     # already annual
+    assert ra.annualised_amount(None) is None
+    assert ra.annualised_amount(0) is None
+
+
+def test_an_implausible_gap_never_closes_an_application_by_itself():
+    """11x is a unit or data-entry problem, not a candidate asking too much.
+    Closing those automatically would have rejected every BDE applicant."""
+    assert ra.BUDGET_IMPLAUSIBLE_GAP_RATIO > ra.BUDGET_GAP_MAX_RATIO
+    source = Path(__file__).resolve().parent.parent.joinpath("recruiter_agent.py").read_text()
+    assert "BUDGET_GAP_MAX_RATIO < gap_ratio <= BUDGET_IMPLAUSIBLE_GAP_RATIO" in source
+
+
+# --- two crashes found in the production event log ----------------------------
+
+def test_event_details_survive_a_decimal():
+    """Every NUMERIC column comes back as Decimal. log_email_event serialised
+    details with a bare json.dumps, so the budget_disclosed event - which logs
+    budget_max - raised and took the disclosure down with it. There are zero
+    budget_disclosed rows on the server and four 'Object of type Decimal is not
+    JSON serializable' failures."""
+    import json
+    from decimal import Decimal
+    payload = {"application_id": 1, "budget_max": Decimal("60000.00"),
+               "candidate_expected_salary": Decimal("660000.00")}
+    json.dumps(payload, default=str)          # must not raise
+    source = Path(__file__).resolve().parent.parent.joinpath("recruiter_agent.py").read_text()
+    assert "json.dumps(details, default=str)" in source
+
+
+def test_the_follow_up_path_has_its_locals_bound():
+    """8 emails died on 'cannot access local variable cv_role_summary'. It is
+    read on the follow-up path and only assigned in the attachment loop."""
+    source = Path(__file__).resolve().parent.parent.joinpath("recruiter_agent.py").read_text()
+    body = source[source.index("    def process_email(self, inbox_email: InboxEmail) -> bool:"):]
+    body = body[: body.index("\n    def ", 10)]
+    first_use = body.index("cv_role_summary")
+    assert 'cv_role_summary: dict[str, Any] = {}' in body[:first_use + 40], \
+        "cv_role_summary must be bound before any path can read it"
+
+
+def test_the_role_helpers_tolerate_an_empty_summary():
+    reqs = [{"id": 1, "position_title": "US Bookkeeper", "job_description": "x"}]
+    assert ra.single_family_requirement(reqs, {}, {}, "") is None
+    assert ra.near_miss_requirements(reqs, {}, {}, "") == []
+    assert ra.candidate_role_families({}, {}, "") == set()
