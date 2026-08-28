@@ -15,7 +15,11 @@ from config import (
 # Without an explicit timeout the OpenAI client waits 600 seconds per attempt,
 # and retries on top of that. On a live voice interview that reads as "processing
 # your answer" and never coming back.
-LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+#
+# 90s is chosen from the traces rather than guessed: the slowest call in 30 days
+# was 59.1s and the slowest excluding interview reports was 29.2s. Callers who
+# have someone waiting pass something much tighter.
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "1"))
 
 

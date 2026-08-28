@@ -443,7 +443,8 @@ def text_similarity(left: str, right: str) -> float:
 INTERVIEW_MAX_REPEATS = int(os.getenv("RECRUITER_INTERVIEW_MAX_REPEATS", "2"))
 # A candidate is sitting in silence waiting for this one, so it fails fast and
 # is recovered from rather than retried patiently.
-INTERVIEW_TURN_LLM_TIMEOUT = float(os.getenv("RECRUITER_INTERVIEW_TURN_LLM_TIMEOUT", "20"))
+INTERVIEW_TURN_LLM_TIMEOUT = float(os.getenv("RECRUITER_INTERVIEW_TURN_LLM_TIMEOUT", "25"))
+INTERVIEW_REPORT_LLM_TIMEOUT = float(os.getenv("RECRUITER_INTERVIEW_REPORT_LLM_TIMEOUT", "240"))
 
 
 def interview_turn_fallback(session: dict, current_index: int, max_questions: int) -> dict:
@@ -1199,7 +1200,14 @@ Context:
         completion_context: dict | None = None,
     ) -> dict:
         normalized_camera_monitoring = normalize_camera_monitoring(camera_monitoring)
-        llm = make_chat_model(json_mode=True, max_tokens=max(OLLAMA_NUM_PREDICT, 1800))
+        # Nobody is waiting on this one - it runs after the candidate has gone -
+        # and it is the slowest call in the system: 59.1s for a real interview
+        # in the traces. It needs room, not a short leash.
+        llm = make_chat_model(
+            json_mode=True,
+            max_tokens=max(OLLAMA_NUM_PREDICT, 1800),
+            timeout=INTERVIEW_REPORT_LLM_TIMEOUT,
+        )
         response = llm.invoke(
             f"""
 Return one valid JSON object only.
@@ -4162,9 +4170,9 @@ Conversation so far:
     const INCOMPLETE_ANSWER_SILENCE_MS = 7000;
     const FINAL_TRANSCRIPT_GRACE_MS = 1200;
     const PROCESSING_NUDGE_MS = {int(RECRUITER_BROWSER_PROCESSING_NUDGE_MS)};
-    // Comfortably longer than the server's own 20s turn timeout, so the server
+    // Comfortably longer than the server's own turn timeout, so the server
     // normally answers first and this is only the backstop.
-    const TURN_TIMEOUT_MS = 35000;
+    const TURN_TIMEOUT_MS = 40000;
     const MIC_ACTIVITY_THRESHOLD = 0.026;
     // Adaptive noise-floor tracking, so a fan does not read as speech.
     const NOISE_FLOOR_MULTIPLIER = 2.2;
