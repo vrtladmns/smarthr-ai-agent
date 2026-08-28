@@ -323,6 +323,20 @@ THREAD_FETCH_LIMIT = int(os.getenv("RECRUITER_THREAD_FETCH_LIMIT", "25"))
 # questions or an explained rejection HR can revoke - both better outcomes than
 # asking a human to assign the requirement by hand.
 LLM_MATCH_MIN_CONFIDENCE = float(os.getenv("RECRUITER_LLM_MATCH_MIN_CONFIDENCE", "0.5"))
+# Above this, the model's match is kept even when the titles share no words.
+# "Sr. Accountant" and "US Bookkeeper" have no token in common, so the overlap
+# check vetoed a correct match and the candidate went to a human. The JD score
+# is the real gate and runs immediately after.
+LLM_MATCH_TRUST_CONFIDENCE = float(os.getenv("RECRUITER_LLM_MATCH_TRUST_CONFIDENCE", "0.7"))
+# How many open roles a CV may be scored against when nothing matched by title.
+REQUIREMENT_SCORING_MAX = int(os.getenv("RECRUITER_REQUIREMENT_SCORING_MAX", "4"))
+# A JD score this far below the screening minimum is still close enough that a
+# person should look, rather than the candidate being told there is no opening.
+NEAR_MISS_AMBIGUOUS_BAND = float(os.getenv("RECRUITER_NEAR_MISS_AMBIGUOUS_BAND", "10"))
+# Expecting more than this multiple of the approved maximum is not a gap that a
+# conversation closes. Disclosing the range to someone asking for twice it just
+# buys one more round of email and then a human. Set to 0 to always disclose.
+BUDGET_GAP_MAX_RATIO = float(os.getenv("RECRUITER_BUDGET_GAP_MAX_RATIO", "1.4"))
 
 # Evidence of doing the work counts slightly less than carrying the job title,
 # so an exact title match still wins when both requirements look plausible.
@@ -375,7 +389,7 @@ REPLY_SCENARIO_COOLDOWN_HOURS = int(os.getenv("RECRUITER_REPLY_SCENARIO_COOLDOWN
 # exists for - the original fault was a dozen near-identical emails.
 REPLY_SCENARIO_MAX_PER_WINDOW = int(os.getenv("RECRUITER_REPLY_SCENARIO_MAX_PER_WINDOW", "2"))
 # Scenarios that must never be repeated for an application, at any interval.
-ONCE_PER_APPLICATION_SCENARIOS = {"budget_disclosure", "holding_reply"}
+ONCE_PER_APPLICATION_SCENARIOS = {"budget_disclosure", "holding_reply", "budget_out_of_range"}
 
 # The AI interview has already happened by these points. "Approve For Interview"
 # is a pre-interview control and must never appear here - clicking it re-sends
@@ -1807,6 +1821,29 @@ ACKNOWLEDGEMENT_CONTENT_PATTERN = re.compile(
 )
 
 
+HUMAN_ATTENTION_PATTERNS = (
+    r"\?",
+    r"\b(please|kindly|could you|can you|would you|request)\b",
+    r"\b(reconsider|revert|update me|follow ?up|status|any other|other role|other position)\b",
+    r"\b(when|why|how|what|which|where)\b",
+    r"\b(call|contact|discuss|clarify|explain)\b",
+)
+
+
+def message_needs_human_attention(latest_body: str) -> bool:
+    """Whether a reply on a closed thread is actually asking for something.
+
+    A candidate answering a final update with "Noted, thank you for letting me
+    know, I appreciate the update on my application" is past the courtesy-note
+    test - it is too long and too varied - but it still asks for nothing. Eight
+    of sixteen manual-review emails in the sampled fortnight were exactly this.
+    """
+    text = latest_reply_text(latest_body or "").strip()
+    if not text:
+        return False
+    return any(re.search(pattern, text, flags=re.I) for pattern in HUMAN_ATTENTION_PATTERNS)
+
+
 def is_pure_acknowledgement(latest_body: str) -> bool:
     """True when the message is a courtesy note that needs no reply.
 
@@ -1832,6 +1869,19 @@ def is_pure_acknowledgement(latest_body: str) -> bool:
         return False
     substantive = [word for word in words if word not in ACKNOWLEDGEMENT_FILLER]
     return len(substantive) <= 4
+
+
+def budget_gap_ratio(answers: dict[str, Any], requirement: dict[str, Any] | None) -> float | None:
+    """How far above the approved maximum the candidate is, as a multiple.
+
+    1.1 means they want ten percent more than the ceiling, which is worth a
+    conversation. 2.0 means they are applying to the wrong salary band.
+    """
+    expected = score_number((answers or {}).get("expected_salary"))
+    budget_max = score_number((requirement or {}).get("budget_max"))
+    if expected is None or not budget_max or budget_max <= 0:
+        return None
+    return expected / budget_max
 
 
 def screening_issue_kind(issues: list[str]) -> str | None:
@@ -2444,7 +2494,11 @@ ROLE_FAMILY_KEYWORDS = {
     "sales": {
         "sales",
         "selling",
-        "business",
+        # "business" on its own is not a sales signal: HR Business Partner,
+        # Business Analyst and Business Operations are all something else, and
+        # it also made the requirement "Business Development Executive" look
+        # adjacent to any candidate whose CV used the word. The phrase is
+        # matched instead, in ROLE_FAMILY_PHRASES.
         "bd",
         "revenue",
         "prospecting",
@@ -2489,9 +2543,24 @@ STEMMED_ROLE_FAMILIES = {
 }
 
 
+# Phrases carry a field where the separate words do not.
+ROLE_FAMILY_PHRASES = {
+    "sales": {"business development", "inside sales", "field sales", "lead generation"},
+    "hr": {"human resource", "talent acquisition", "people operations"},
+    "accounting": {"accounts payable", "accounts receivable", "book keeping", "general ledger"},
+    "it_support": {"help desk", "service desk", "desktop support"},
+}
+
+
 def role_families_from_text(value: str | None) -> set[str]:
     tokens = stem_role_tokens(value)
-    return {family for family, keywords in STEMMED_ROLE_FAMILIES.items() if tokens & keywords}
+    families = {family for family, keywords in STEMMED_ROLE_FAMILIES.items() if tokens & keywords}
+    text = normalize_position_text(value) or ""
+    if text:
+        for family, phrases in ROLE_FAMILY_PHRASES.items():
+            if any(phrase in text for phrase in phrases):
+                families.add(family)
+    return families
 
 
 def candidate_role_families(
@@ -2505,6 +2574,12 @@ def candidate_role_families(
     declared = str(summary.get("role_family") or "").strip().lower()
     if declared:
         families.add(declared)
+    # Titles only, for the same reason requirement_role_families takes the title
+    # and not the JD. Scanning CV prose read "payroll", "employees" and "client"
+    # out of an ordinary accounting CV and returned {accounting, hr, sales}, so
+    # every accountant looked adjacent to Business Development Executive. That
+    # inflation both fired the near-miss handoff and stopped
+    # single_family_requirement finding its one unambiguous match.
     families |= role_families_from_text(
         " ".join(
             str(value)
@@ -2512,8 +2587,6 @@ def candidate_role_families(
                 summary.get("primary_role"),
                 (extracted or {}).get("target_position"),
                 (extracted or {}).get("current_title"),
-                " ".join(str(skill) for skill in ensure_list((extracted or {}).get("skills"))),
-                cv_text[:2000],
             ]
             if value
         )
@@ -2555,6 +2628,64 @@ def single_family_requirement(
         if len(matches) == 1:
             return matches[0]
     return None
+
+
+def best_requirement_by_score(
+    ai: Any,
+    requirements: list[dict[str, Any]],
+    cv_role_summary: dict[str, Any] | None,
+    extracted: dict[str, Any],
+    cv_text: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, list[dict[str, Any]]]:
+    """Score the CV against the plausible open roles and pick the best one.
+
+    Titles are a poor way to decide whether a CV fits a job: "Sr. Accountant"
+    and "US Bookkeeper" share no word, and "Assistant Manager" yields no role
+    family at all, so both went to a human. The JD score already answers the
+    question and the thresholds already route the answer, so ask it rather than
+    asking HR.
+
+    Returns (requirement, its evaluation, every evaluation tried). The caller
+    decides; a role is only returned when it clears the screening bar.
+    """
+    shortlist = near_miss_requirements(requirements, cv_role_summary, extracted, cv_text)
+    if not shortlist:
+        # No family agreed, which with a seven-word vocabulary means "unknown"
+        # far more often than "unrelated". Score against what is open instead.
+        shortlist = list(requirements or [])
+    shortlist = shortlist[:REQUIREMENT_SCORING_MAX]
+
+    scored: list[dict[str, Any]] = []
+    best: dict[str, Any] | None = None
+    best_evaluation: dict[str, Any] | None = None
+    best_score = -1.0
+    for requirement in shortlist:
+        try:
+            evaluation = ai.evaluate_cv(cv_text, extracted, requirement)
+        except Exception as exc:  # one bad call must not lose the others
+            log_json(
+                logging.WARNING,
+                "requirement_scoring_failed",
+                requirement=requirement.get("position_title"),
+                error=str(exc),
+            )
+            continue
+        score = score_number(evaluation.get("jd_match_score"))
+        scored.append(
+            {
+                "requirement_id": requirement.get("id"),
+                "position_title": requirement.get("position_title"),
+                "ats_score": evaluation.get("ats_score"),
+                "jd_match_score": evaluation.get("jd_match_score"),
+                "passes": passes_screening_threshold(evaluation, requirement, extracted),
+            }
+        )
+        if score is not None and score > best_score:
+            best, best_evaluation, best_score = requirement, evaluation, score
+
+    if best and passes_screening_threshold(best_evaluation or {}, best, extracted):
+        return best, best_evaluation, scored
+    return None, best_evaluation, scored
 
 
 def near_miss_requirements(
@@ -5740,6 +5871,41 @@ class AIRecruiterAgent:
             application=application,
         )
 
+    def reply_budget_out_of_range(self, inbox_email: InboxEmail, application: dict[str, Any]):
+        """Close the loop kindly when the figures are nowhere near each other.
+
+        No range is quoted and no negotiation is invited, because there is
+        nothing to negotiate; the point is that the candidate hears back and is
+        not left waiting on a thread nobody is going to answer.
+        """
+        fallback_body = recruiter_email_body(
+            "Thank you for sharing your details and for the time you have put into this.",
+            "Having looked at what you are expecting alongside what has been approved for this "
+            "role, the two are too far apart for this one to work out.",
+            "I would rather tell you now than keep you waiting. Do keep an eye on our openings - "
+            "if something closer to your range comes up, I would be glad to hear from you.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "tell the candidate warmly and briefly that their salary expectation is too far above "
+            "what is approved for this role for it to work out, thank them, and encourage them to "
+            "apply again for a future opening; do not quote figures, do not negotiate, and do not "
+            "mention anyone else being involved",
+            {
+                "role": (application or {}).get("requirement_position"),
+                "final": True,
+                "ask_for_nothing": True,
+            },
+            fallback_body,
+        )
+        return self.send_candidate_reply(
+            inbox_email,
+            f"Update on your application: {inbox_email.subject}",
+            body,
+            scenario="budget_out_of_range",
+            application=application,
+        )
+
     def reply_holding(self, inbox_email: InboxEmail, application: dict[str, Any] | None):
         """One short acknowledgement while a human owns the thread.
 
@@ -6306,6 +6472,43 @@ class AIRecruiterAgent:
             "budget_disclosure",
         )
 
+        gap_ratio = budget_gap_ratio(answers, application)
+        if (
+            issue_kind == "budget"
+            and not already_disclosed
+            and BUDGET_GAP_MAX_RATIO > 0
+            and gap_ratio is not None
+            and gap_ratio > BUDGET_GAP_MAX_RATIO
+        ):
+            # Too far apart to be worth stating the range and asking. Close it
+            # here rather than spending a disclosure, a reply and then a human.
+            log_json(
+                logging.INFO,
+                "budget_gap_beyond_disclosure",
+                **inbox_email_summary(inbox_email),
+                application_id=application_id,
+                expected_salary=answers.get("expected_salary"),
+                budget_max=application.get("budget_max"),
+                gap_ratio=round(gap_ratio, 2),
+            )
+            self.db.log_email_event(
+                inbox_email,
+                "budget_gap_beyond_disclosure",
+                {
+                    "application_id": application_id,
+                    "expected_salary": answers.get("expected_salary"),
+                    "budget_max": application.get("budget_max"),
+                    "gap_ratio": round(gap_ratio, 2),
+                },
+            )
+            self.db.update_application_screening(
+                application_id,
+                "rejected",
+                {**answers, "issues": issues, "rejection_reason": "expectation far above the approved range"},
+            )
+            self.reply_budget_out_of_range(inbox_email, application)
+            return True
+
         if issue_kind == "budget" and not already_disclosed:
             self.db.mark_budget_disclosed(application_id, {**answers, "issues": issues})
             self.db.log_email_event(
@@ -6668,13 +6871,39 @@ class AIRecruiterAgent:
                 },
             )
             if (active_application.get("application_status") or "").lower() != "manual_hr_review":
-                self.notify_manual_hr_review(
-                    inbox_email,
-                    active_application,
-                    "Candidate replied after the agent had already sent a final update. HR should handle further communication.",
-                    event_type="final_status_handoff_to_hr",
-                    mark_application=False,
-                )
+                if not message_needs_human_attention(inbox_email.body):
+                    # Nothing was asked. The thread is closed and the candidate
+                    # has been told; there is nothing for a person to do.
+                    log_json(
+                        logging.INFO,
+                        "final_status_reply_needs_nobody",
+                        **inbox_email_summary(inbox_email),
+                        application_id=active_application["id"],
+                        status=active_application.get("application_status"),
+                    )
+                    self.db.log_email_event(
+                        inbox_email,
+                        "final_status_reply_needs_nobody",
+                        {
+                            "application_id": active_application["id"],
+                            "status": active_application.get("application_status"),
+                        },
+                    )
+                else:
+                    self.notify_hr_rate_limited(
+                        inbox_email,
+                        active_application,
+                        f"Candidate replied after a final update: {inbox_email.sender}",
+                        recruiter_email_body(
+                            "This application is closed and the candidate has written back with a question.",
+                            f"Candidate: {inbox_email.sender}",
+                            f"Current status: {active_application.get('application_status')}",
+                            f"Application: {dashboard_application_url(active_application['id'])}",
+                            "Their message:",
+                            latest_reply_text(inbox_email.body)[:1200] or "-",
+                        ),
+                        "final_status_handoff",
+                    )
             return True
 
         if self.db.recent_event_count(
@@ -7175,14 +7404,25 @@ class AIRecruiterAgent:
                 # file, nothing. Tell them, and let HR know if it keeps happening.
                 self.reply_unreadable_cv(inbox_email, filename)
                 if self.db.recent_event_count(inbox_email.sender, ["cv_text_extract_failed"], hours=72) > 1:
-                    self.notify_manual_hr_review(
+                    # Rate limited: the same unreadable file arriving again is
+                    # not new information. One file was escalated four times in
+                    # the sampled fortnight.
+                    self.notify_hr_rate_limited(
                         inbox_email,
                         active_application,
-                        f"The CV attachment '{attachment_display_name(filename)}' could not be read as text "
-                        "(it is most likely a scan or image). The candidate has now sent an unreadable file "
-                        "more than once.",
-                        event_type="repeated_unreadable_cv_handoff_to_hr",
-                        mark_application=bool(active_application),
+                        f"Unreadable CV from {inbox_email.sender}",
+                        recruiter_email_body(
+                            f"The CV attachment '{attachment_display_name(filename)}' could not be read as text "
+                            "(it is most likely a scan or image). The candidate has now sent an unreadable file "
+                            "more than once and has been asked for a text-based file.",
+                            f"Candidate: {inbox_email.sender}",
+                            f"Subject: {inbox_email.subject}",
+                            RECRUITER_DASHBOARD_BASE_URL
+                            if not active_application
+                            else dashboard_application_url(active_application["id"]),
+                        ),
+                        "repeated_unreadable_cv",
+                        hours=72,
                     )
                 continue
 
@@ -7361,7 +7601,28 @@ class AIRecruiterAgent:
 
             matched_requirement_id = safe_int(match.get("requirement_id"))
             requirement = next((row for row in requirements if row["id"] == matched_requirement_id), None)
-            if requirement and not requirement_is_compatible_with_candidate_role(extracted, classification_for_match, requirement):
+            match_confidence = score_number(match.get("confidence"))
+            title_veto = bool(
+                requirement
+                and not requirement_is_compatible_with_candidate_role(
+                    extracted, classification_for_match, requirement
+                )
+            )
+            if title_veto and match_confidence is not None and match_confidence >= LLM_MATCH_TRUST_CONFIDENCE:
+                # Shared words are not what makes two job titles the same job.
+                # Keep the match; passes_screening_threshold decides on the JD
+                # score a few lines below, and a bad match fails there with a
+                # reason the candidate can be told.
+                log_json(
+                    logging.INFO,
+                    "requirement_title_veto_overridden",
+                    **inbox_email_summary(inbox_email),
+                    requirement=requirement.get("position_title"),
+                    candidate_role=extracted.get("current_title") or extracted.get("target_position"),
+                    confidence=match_confidence,
+                )
+                title_veto = False
+            if title_veto:
                 match = {
                     "requirement_id": None,
                     "confidence": 0,
@@ -7404,7 +7665,36 @@ class AIRecruiterAgent:
                 },
             )
 
-            evaluation = self.ai.evaluate_cv(cv_text, extracted, requirement)
+            scored_requirements: list[dict[str, Any]] = []
+            fallback_evaluation: dict[str, Any] | None = None
+            if requirement is None and requirements and cv_text:
+                # Nothing matched by title. Decide it here on the JD score
+                # instead of mailing HR "possible match needs your call".
+                requirement, fallback_evaluation, scored_requirements = best_requirement_by_score(
+                    self.ai, requirements, cv_role_summary, extracted, cv_text
+                )
+                log_json(
+                    logging.INFO,
+                    "requirement_resolved_by_score" if requirement else "requirement_scoring_found_no_fit",
+                    **inbox_email_summary(inbox_email),
+                    application_id=application_id,
+                    resolved=requirement.get("position_title") if requirement else None,
+                    scored=scored_requirements,
+                )
+                self.db.log_email_event(
+                    inbox_email,
+                    "requirement_resolved_by_score" if requirement else "requirement_scoring_found_no_fit",
+                    {
+                        "application_id": application_id,
+                        "resolved_requirement": requirement.get("position_title") if requirement else None,
+                        "scored": scored_requirements,
+                    },
+                )
+
+            if requirement is not None and fallback_evaluation is not None:
+                evaluation = fallback_evaluation      # already scored, do not pay twice
+            else:
+                evaluation = self.ai.evaluate_cv(cv_text, extracted, requirement)
             log_json(
                 logging.INFO,
                 "cv_evaluated",
@@ -7662,6 +7952,23 @@ class AIRecruiterAgent:
                     self.reply_received(inbox_email, {"id": application_id} if application_id else None)
             else:
                 near_misses = near_miss_requirements(requirements, cv_role_summary, extracted, cv_text)
+                best_scored = max(
+                    (score_number(row.get("jd_match_score")) or 0.0 for row in scored_requirements),
+                    default=None,
+                )
+                # Every open role was scored just above and none cleared the bar.
+                # Only a CV that came close is worth a person's time; the rest
+                # get told there is no opening, which is the honest answer.
+                if best_scored is not None and best_scored < RECRUITER_SCREENING_JD_MIN - NEAR_MISS_AMBIGUOUS_BAND:
+                    log_json(
+                        logging.INFO,
+                        "near_miss_scored_below_band_no_handoff",
+                        **inbox_email_summary(inbox_email),
+                        application_id=application_id,
+                        best_jd_match_score=best_scored,
+                        scored=scored_requirements,
+                    )
+                    near_misses = []
                 if near_misses:
                     # Same domain, different title. Auto-rejecting these loses
                     # genuinely relevant people, so a human decides instead.
