@@ -9,6 +9,7 @@ import mimetypes
 import os
 import random
 import re
+import subprocess
 import smtplib
 import time
 import urllib.request
@@ -2813,6 +2814,9 @@ def _extract_docx_text(path: Path) -> str:
 # no text layer at all. OCR is attempted only after the cheap paths fail, is
 # capped, and degrades to "unreadable" if the tooling is not installed.
 OCR_ENABLED = os.getenv("RECRUITER_OCR_ENABLED", "true").strip().lower() not in {"false", "0", "no"}
+# Ceiling for the adaptive render: past this the page is slower to OCR without
+# reading any better.
+OCR_MAX_DPI = int(os.getenv("RECRUITER_OCR_MAX_DPI", "400"))
 OCR_MAX_PAGES = int(os.getenv("RECRUITER_OCR_MAX_PAGES", "5"))
 OCR_DPI = int(os.getenv("RECRUITER_OCR_DPI", "200"))
 _OCR_UNAVAILABLE_LOGGED = False
@@ -2857,6 +2861,30 @@ def extract_pdf_text_pymupdf(path: Path) -> str:
         return ""
 
 
+def ocr_dpi_for_page(page: Any) -> int:
+    """Render at least as finely as the scan already is.
+
+    A scanned CV is one full-page JPEG. Rendering it at a fixed 200 dpi threw
+    away detail the file already had - Kanika_Sr.BDM.pdf carries 1153x1612 per
+    page and was being handed to Tesseract at 800x1200 - and OCR accuracy falls
+    off quickly once characters get small.
+    """
+    try:
+        width_pt = float(page.rect.width) or 0.0
+        if width_pt <= 0:
+            return OCR_DPI
+        native_width = max(
+            (int(image[2]) for image in page.get_images(full=True) if len(image) > 2),
+            default=0,
+        )
+        if native_width <= 0:
+            return OCR_DPI
+        needed = int(native_width * 72.0 / width_pt)
+        return max(OCR_DPI, min(needed, OCR_MAX_DPI))
+    except Exception:
+        return OCR_DPI
+
+
 def ocr_pdf_text(path: Path) -> str:
     """Read a scanned CV by rendering its pages and running OCR.
 
@@ -2892,7 +2920,7 @@ def ocr_pdf_text(path: Path) -> str:
             for index, page in enumerate(document):
                 if index >= OCR_MAX_PAGES:
                     break
-                pixmap = page.get_pixmap(dpi=OCR_DPI)
+                pixmap = page.get_pixmap(dpi=ocr_dpi_for_page(page))
                 image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
                 pages_text.append(pytesseract.image_to_string(image) or "")
     except Exception as exc:
@@ -2970,20 +2998,92 @@ def clean_cv_text(text: str) -> str:
     return sanitize_db_text(repair_letter_spaced_text(text))
 
 
+def sniff_cv_format(payload: bytes) -> str | None:
+    """What the file actually is, regardless of what it is called.
+
+    Candidates send a PDF named .doc, a .docx named .doc, and Word's "save as"
+    leaves RTF behind a .doc extension. Trusting the extension meant those were
+    read with the wrong parser or, for .doc, with no parser at all.
+    """
+    head = (payload or b"")[:8]
+    if head.startswith(b"%PDF"):
+        return "pdf"
+    if head.startswith(b"PK\x03\x04"):
+        return "docx"
+    if head.startswith(b"{\\rtf"):
+        return "rtf"
+    if head.startswith(b"\xd0\xcf\x11\xe0"):
+        return "doc"
+    return None
+
+
+def extract_rtf_text(payload: bytes) -> str:
+    """Enough RTF handling to recover the words of a CV."""
+    text = payload.decode("latin-1", errors="ignore")
+    # Font and colour tables are metadata, not the CV.
+    text = re.sub(r"\{\\\*?\\(?:fonttbl|colortbl|stylesheet|info|pict)[^{}]*(?:\{[^{}]*\}[^{}]*)*\}",
+                  " ", text)
+    text = re.sub(r"\\'[0-9a-fA-F]{2}", " ", text)
+    text = re.sub(r"\\par[d]?\b", "\n", text)
+    text = re.sub(r"\\[a-zA-Z]+-?\d* ?", " ", text)
+    return re.sub(r"[{}]", " ", text)
+
+
+def extract_legacy_doc_text(path: Path) -> str:
+    """Legacy binary .doc, via whichever converter the host happens to have.
+
+    .doc was accepted as a CV but had no branch in extract_cv_text at all, so
+    every one of them read as empty and the candidate was told their CV could
+    not be read.
+    """
+    for command in (
+        ["antiword", str(path)],
+        ["catdoc", str(path)],
+        ["libreoffice", "--headless", "--cat", str(path)],
+    ):
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=60)
+        except (FileNotFoundError, subprocess.SubprocessError):
+            continue
+        text = (result.stdout or b"").decode("utf-8", errors="ignore").strip()
+        if text:
+            return text
+    log_json(
+        logging.WARNING,
+        "legacy_doc_converter_unavailable",
+        hint="sudo apt-get install -y antiword",
+    )
+    return ""
+
+
 def extract_cv_text(filename: str, payload: bytes) -> str:
     suffix = Path(filename.lower()).suffix
+    by_extension = {".txt": "txt", ".docx": "docx", ".pdf": "pdf", ".doc": "doc"}.get(suffix)
+    # Content wins. PDF, DOCX, RTF and legacy DOC all carry a signature; only
+    # plain text has none, and that is the fallback at the end anyway. A .doc
+    # with no OLE2 header is not a Word document whatever it is called, so it
+    # must not be sent to the Word converter.
+    kind = sniff_cv_format(payload)
+    if kind and by_extension and kind != by_extension:
+        log_json(logging.INFO, "cv_format_differs_from_extension",
+                 filename=filename, named=by_extension, detected=kind)
+
     with TemporaryDirectory() as directory:
         path = Path(directory) / filename
         path.write_bytes(payload)
 
-        if suffix == ".txt":
+        if kind == "txt":
             return clean_cv_text(payload.decode("utf-8", errors="ignore"))
-        if suffix == ".docx":
+        if kind == "docx":
             return clean_cv_text(extract_docx_text(path))
-        if suffix == ".pdf":
+        if kind == "pdf":
             return clean_cv_text(extract_pdf_text(path))
-
-    return ""
+        if kind == "rtf":
+            return clean_cv_text(extract_rtf_text(payload))
+        if kind == "doc":
+            return clean_cv_text(extract_legacy_doc_text(path))
+        # Unknown container: a CV is mostly text, so try that before giving up.
+        return clean_cv_text(payload.decode("utf-8", errors="ignore"))
 
 
 def safe_cv_storage_filename(filename: str) -> str:
