@@ -403,3 +403,56 @@ def test_the_cap_is_disabled_by_default(server, application):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_answering_after_a_repeat_moves_on(server, application):
+    """Reported 2026-08-29: "it repeats it but after that I give answer again it
+    keeps on repeating question only."
+
+    The answer box was never cleared on a repeat, and beginListening() seeds the
+    transcript from that box, so the request stayed glued to the front of every
+    later answer and was read as another request each time.
+    """
+    token = application["token"]
+    started = start(server, token).json()
+    question = started["question"]
+
+    assert turn(server, token, "Can you please repeat the question?", 1).json()["action"] == "repeat"
+
+    # What the browser sends next now that the box is cleared.
+    second = turn(server, token, "I reconcile every bank account and then post the accruals.", 2).json()
+    assert second["action"] != "repeat", "the answer after a repeat must not repeat again"
+
+    session = rd.WEB_INTERVIEW_SESSIONS[token]
+    answered = [e for e in session["transcript"] if e.get("status") == "answered"]
+    assert answered, "the answer given after the repeat must be recorded"
+    assert "reconcile" in answered[0]["answer"]
+    assert session["current_question"] != question, "the interview must have moved on"
+
+
+def test_the_interview_cannot_sit_on_one_question_forever(server, application):
+    """Belt and braces: even if a client regresses and keeps resending the
+    request glued to the answer, the question is not read out indefinitely."""
+    token = application["token"]
+    start(server, token)
+    glued = "can you please repeat the question"
+    actions = []
+    for i in range(1, 6):
+        glued = f"{glued} and I also handle the month end close for three entities"
+        actions.append(turn(server, token, glued, i).json()["action"])
+    assert actions.count("repeat") <= rd.INTERVIEW_MAX_REPEATS + 1, actions
+    assert "repeat" not in actions[-2:], f"still looping: {actions}"
+
+
+def test_a_repeat_request_with_the_answer_attached_is_an_answer(server, application):
+    """Speech to text has no punctuation, so "sorry can you repeat that ... ok so
+    I do X" arrives as one run-on utterance."""
+    token = application["token"]
+    start(server, token)
+    r = turn(
+        server, token,
+        "sorry can you repeat the question ok so I reconcile all the bank accounts "
+        "first and then I post accruals and review the trial balance before closing",
+        1,
+    ).json()
+    assert r["action"] != "repeat", "the answer was attached and must be taken"

@@ -173,3 +173,40 @@ if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# --- the answer box must not carry a request into the next answer (2026-08-29) -
+
+def _branch(action: str) -> str:
+    """The body of one `if (action === '...')` arm in the submit handler."""
+    marker = "if (action === '" + action + "')"
+    start = SOURCE.index(marker)
+    depth = 0
+    for i in range(SOURCE.index("{", start), len(SOURCE)):
+        if SOURCE[i] == "{":
+            depth += 1
+        elif SOURCE[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return SOURCE[start : i + 1]
+    raise AssertionError(f"could not extract the {action} branch")
+
+
+def test_the_answer_box_is_cleared_before_listening_again():
+    """Reported: after a repeat, every later answer was read as another repeat
+    request. beginListening() seeds the transcript from the answer box, so
+    anything left in it is prepended to whatever the candidate says next."""
+    listening = js_block("beginListening")
+    assert "finalTranscript = answerEl.value.trim()" in listening, (
+        "precondition: the transcript is seeded from the answer box"
+    )
+    for action in ["repeat", "clarify", "wait"]:
+        body = _branch(action)
+        assert "answerEl.value = '';" in body, (
+            f"the {action} branch must clear the answer box before listening again"
+        )
+
+
+def test_the_seeded_transcript_is_cleared_too():
+    for action in ["repeat", "clarify", "wait"]:
+        assert "finalTranscript = '';" in _branch(action), action

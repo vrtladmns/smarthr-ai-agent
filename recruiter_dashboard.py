@@ -438,7 +438,12 @@ def text_similarity(left: str, right: str) -> float:
     return len(left_words & right_words) / len(smaller)
 
 
-def classify_interview_turn(answer_text: str, current_question: str) -> str:
+# How many times one question may be read out again before the interview moves
+# on regardless. Two is generous for a genuine mishearing.
+INTERVIEW_MAX_REPEATS = int(os.getenv("RECRUITER_INTERVIEW_MAX_REPEATS", "2"))
+
+
+def classify_interview_turn(answer_text: str, current_question: str, already_repeated: int = 0) -> str:
     """What did the candidate actually just do?
 
     Returns one of: answer, repeat_request, thinking, question_echo.
@@ -447,6 +452,12 @@ def classify_interview_turn(answer_text: str, current_question: str) -> str:
     repeat request between 10 and 12 words, because the browser refused to submit
     anything shorter and the server refused anything longer, so a natural request
     like "could you please repeat the question?" could never be delivered.
+
+    already_repeated is how many times this same question has been repeated. Once
+    it has been read out again, anything with real content in it is the answer.
+    Without that the interview could sit on one question indefinitely: the
+    request stayed in the answer box, was resent with the reply, and read as
+    another request every time.
     """
     text = " ".join((answer_text or "").split())
     if not text:
@@ -460,10 +471,14 @@ def classify_interview_turn(answer_text: str, current_question: str) -> str:
     # Candidates commonly say "could you repeat? ... so your question is ..."
     remainder = text
     if asked_to_repeat:
-        parts = re.split(r"(?<=[.?!])\s+", text)
-        remainder = " ".join(part for part in parts if not any(
-            re.search(pattern, part.lower()) for pattern in INTERVIEW_REPEAT_PATTERNS
-        )).strip()
+        # Remove the request itself, not the sentence containing it. Speech to
+        # text emits no punctuation, so splitting on [.?!] left one single
+        # "sentence", the whole utterance matched, and the remainder came back
+        # empty however much the candidate had actually said.
+        remainder = text
+        for pattern in INTERVIEW_REPEAT_PATTERNS:
+            remainder = re.sub(pattern, " ", remainder, flags=re.I)
+        remainder = " ".join(remainder.split()).strip(" ,.?!-")
 
     echoes_question = bool(current_question) and text_similarity(remainder or text, current_question) >= 0.7
 
@@ -472,10 +487,18 @@ def classify_interview_turn(answer_text: str, current_question: str) -> str:
         # also explicitly asked for a repeat.
         return "question_echo" if not asked_to_repeat else "repeat_request"
     if asked_to_repeat and len(normalized_words(remainder)) < 12:
+        # Already read out once; if they have said anything of substance since,
+        # that is their answer and the question must not be repeated again.
+        if already_repeated and len(normalized_words(remainder)) >= 3:
+            return "answer"
         return "repeat_request"
     if thinking and len(normalized_words(remainder)) < 25:
         return "thinking"
     if asked_to_repeat and not remainder:
+        if already_repeated >= INTERVIEW_MAX_REPEATS:
+            # Read out INTERVIEW_MAX_REPEATS times already. Repeating it again
+            # is not going to help; move the interview along instead.
+            return "answer"
         return "repeat_request"
     return "answer"
 
@@ -1298,9 +1321,13 @@ Camera monitoring:
                 "question": current_question,
             }
 
-        intent = classify_interview_turn(answer_text, current_question)
+        repeat_counts = session.setdefault("repeat_counts", {})
+        repeat_key = str(current_index)
+        already_repeated = int(repeat_counts.get(repeat_key) or 0)
+        intent = classify_interview_turn(answer_text, current_question, already_repeated)
 
         if intent == "repeat_request":
+            repeat_counts[repeat_key] = already_repeated + 1
             return {
                 "action": "repeat",
                 "reply": f"Of course. {current_question}",
@@ -5136,6 +5163,12 @@ Conversation so far:
         if (action === 'repeat') {{
           setMessage('Repeating the question.');
           questionEl.textContent = `Question ${{index + 1}}: ${{currentQuestion}}`;
+          // beginListening() seeds the transcript from this box, so leaving the
+          // request in it prepended "can you repeat the question" to whatever
+          // the candidate said next - which the classifier then read as another
+          // repeat request, forever.
+          answerEl.value = '';
+          finalTranscript = '';
           isSubmitting = false;
           speak(reply || `Sure, let me repeat that. ${{currentQuestion}}`, () => {{
             if (interviewClosed || submitFlow !== flowVersion) return;
@@ -5145,6 +5178,8 @@ Conversation so far:
         }}
         if (action === 'clarify') {{
           setMessage('The interviewer is clarifying before continuing.');
+          answerEl.value = '';
+          finalTranscript = '';
           isSubmitting = false;
           speak(reply || 'Could you explain that a little differently?', () => {{
             if (interviewClosed || submitFlow !== flowVersion) return;
@@ -5158,6 +5193,7 @@ Conversation so far:
           // question instead of scoring the pause and moving on.
           setMessage('Take your time.');
           answerEl.value = '';
+          finalTranscript = '';
           isSubmitting = false;
           speak(reply || 'Take your time.', () => {{
             if (interviewClosed || submitFlow !== flowVersion) return;
