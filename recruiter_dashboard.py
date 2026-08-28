@@ -441,6 +441,25 @@ def text_similarity(left: str, right: str) -> float:
 # How many times one question may be read out again before the interview moves
 # on regardless. Two is generous for a genuine mishearing.
 INTERVIEW_MAX_REPEATS = int(os.getenv("RECRUITER_INTERVIEW_MAX_REPEATS", "2"))
+# A candidate is sitting in silence waiting for this one, so it fails fast and
+# is recovered from rather than retried patiently.
+INTERVIEW_TURN_LLM_TIMEOUT = float(os.getenv("RECRUITER_INTERVIEW_TURN_LLM_TIMEOUT", "20"))
+
+
+def interview_turn_fallback(session: dict, current_index: int, max_questions: int) -> dict:
+    """What to say when the model does not answer in time.
+
+    Keeps the interview moving on the questions already planned, so a slow or
+    failed call costs a follow-up rather than the whole session.
+    """
+    if current_index + 1 >= max_questions:
+        return {"action": "complete", "reply": closing_interview_reply()}
+    return {
+        "action": "next_question",
+        "reply": random.choice(["Thank you.", "Understood, thank you.", "Got it, thank you."]),
+        "question": session["questions"][current_index + 1],
+        "question_number": current_index + 2,
+    }
 
 
 def classify_interview_turn(answer_text: str, current_question: str, already_repeated: int = 0) -> str:
@@ -1365,9 +1384,13 @@ Camera monitoring:
                 "question": next_question,
                 "question_number": current_index + 2,
             }
-        llm = make_chat_model(json_mode=True, max_tokens=max(OLLAMA_NUM_PREDICT, 900))
-        response = llm.invoke(
-            f"""
+        llm = make_chat_model(
+            json_mode=True,
+            max_tokens=max(OLLAMA_NUM_PREDICT, 900),
+            timeout=INTERVIEW_TURN_LLM_TIMEOUT,
+            max_retries=0,
+        )
+        prompt = f"""
 Return one valid JSON object only.
 You are the same AI HR technical interviewer, now running inside a browser video interview room.
 Decide the next conversational action after the candidate answered.
@@ -1410,7 +1433,19 @@ Candidate answer:
 Conversation so far:
 {json.dumps(interview_transcript_digest(transcript), default=str)}
 """
-        ).content
+        try:
+            response = llm.invoke(prompt).content
+        except Exception as exc:
+            # The candidate has answered and is waiting in silence. Take the
+            # answer, say something neutral and move on; stalling the room is a
+            # worse outcome than losing one follow-up.
+            log_json(
+                logging.WARNING,
+                "interview_turn_llm_failed",
+                error=str(exc)[:200],
+                question_number=current_index + 1,
+            )
+            return interview_turn_fallback(session, current_index, max_questions)
         try:
             decision = json.loads(extract_json_object(response))
         except Exception:
@@ -4127,6 +4162,9 @@ Conversation so far:
     const INCOMPLETE_ANSWER_SILENCE_MS = 7000;
     const FINAL_TRANSCRIPT_GRACE_MS = 1200;
     const PROCESSING_NUDGE_MS = {int(RECRUITER_BROWSER_PROCESSING_NUDGE_MS)};
+    // Comfortably longer than the server's own 20s turn timeout, so the server
+    // normally answers first and this is only the backstop.
+    const TURN_TIMEOUT_MS = 35000;
     const MIC_ACTIVITY_THRESHOLD = 0.026;
     // Adaptive noise-floor tracking, so a fan does not read as speech.
     const NOISE_FLOOR_MULTIPLIER = 2.2;
@@ -5103,16 +5141,28 @@ Conversation so far:
       const turnId = ++clientTurnId;
       let response;
       let data;
+      // fetch() has no timeout of its own. Without this the room sat on
+      // "Processing your answer..." indefinitely whenever the turn did not come
+      // back, and the candidate had no way out of it.
+      const turnAbort = new AbortController();
+      const turnTimer = window.setTimeout(() => turnAbort.abort(), TURN_TIMEOUT_MS);
       try {{
         response = await fetch(`/api/interview/${{token}}/turn`, {{
           method: 'POST',
           headers: {{'Content-Type': 'application/json'}},
-          body: JSON.stringify({{answer, turn_id: turnId, camera_monitoring: cameraMonitoring}})
+          body: JSON.stringify({{answer, turn_id: turnId, camera_monitoring: cameraMonitoring}}),
+          signal: turnAbort.signal
         }});
         data = await response.json();
+        window.clearTimeout(turnTimer);
       }} catch (error) {{
+        window.clearTimeout(turnTimer);
         clearProcessingNudge();
         isSubmitting = false;
+        // They are about to be asked to answer again, so start them clean
+        // rather than appending the retry to the attempt that was lost.
+        answerEl.value = '';
+        finalTranscript = '';
         listenBtn.disabled = false;
         replayBtn.disabled = false;
         nextBtn.disabled = false;

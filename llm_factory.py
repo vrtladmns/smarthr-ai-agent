@@ -1,3 +1,5 @@
+import os
+
 from config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
@@ -10,8 +12,28 @@ from config import (
 )
 
 
-def make_chat_model(json_mode: bool = False, max_tokens: int | None = None):
+# Without an explicit timeout the OpenAI client waits 600 seconds per attempt,
+# and retries on top of that. On a live voice interview that reads as "processing
+# your answer" and never coming back.
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "1"))
+
+
+def make_chat_model(
+    json_mode: bool = False,
+    max_tokens: int | None = None,
+    timeout: float | None = None,
+    max_retries: int | None = None,
+):
+    """Build the chat model.
+
+    timeout and max_retries are worth setting explicitly wherever someone is
+    waiting: a turn in a voice interview needs to fail fast and be recovered
+    from, while a background email decision can afford to wait and retry.
+    """
     provider = LLM_PROVIDER.lower()
+    request_timeout = LLM_TIMEOUT_SECONDS if timeout is None else timeout
+    retries = LLM_MAX_RETRIES if max_retries is None else max_retries
 
     if provider == "deepseek":
         if not DEEPSEEK_API_KEY:
@@ -30,6 +52,8 @@ def make_chat_model(json_mode: bool = False, max_tokens: int | None = None):
             temperature=0,
             max_tokens=max_tokens or DEEPSEEK_MAX_TOKENS,
             model_kwargs=model_kwargs,
+            timeout=request_timeout,
+            max_retries=retries,
         )
 
     if provider == "ollama":
@@ -44,6 +68,11 @@ def make_chat_model(json_mode: bool = False, max_tokens: int | None = None):
         }
         if json_mode:
             kwargs["format"] = "json"
-        return ChatOllama(**kwargs)
+        # Not every langchain-ollama release accepts a timeout; losing it is
+        # better than failing to build the model at all.
+        try:
+            return ChatOllama(timeout=request_timeout, **kwargs)
+        except TypeError:
+            return ChatOllama(**kwargs)
 
     raise RuntimeError(f"Unsupported LLM_PROVIDER={LLM_PROVIDER!r}. Use 'deepseek' or 'ollama'.")

@@ -924,3 +924,15 @@ if __name__ == "__main__":
     import pytest
 
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# --- LLM client must not wait forever (2026-08-29) ----------------------------
+
+def test_chat_models_are_built_with_a_timeout():
+    """The OpenAI client defaults to 600 seconds per attempt, plus retries."""
+    import llm_factory
+    assert llm_factory.LLM_TIMEOUT_SECONDS <= 120
+    assert llm_factory.LLM_MAX_RETRIES <= 2
+    import inspect
+    params = inspect.signature(llm_factory.make_chat_model).parameters
+    assert "timeout" in params and "max_retries" in params
