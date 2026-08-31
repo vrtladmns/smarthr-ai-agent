@@ -1406,6 +1406,12 @@ def parse_joining_date(value: Any):
     except ValueError:
         return None
     if candidate < now.date():
+        days_past = (now.date() - candidate).days
+        if days_past <= JOINING_DATE_RECENT_PAST_DAYS:
+            # "after 31 August", read on 1 September. They are free now. Saying
+            # the answer is unreadable makes the agent ask again for something
+            # the candidate has already told it.
+            return now.date()
         # A joining date that has passed means next year only across a year end.
         try:
             rolled = datetime(now.year + 1, month, int(day), tzinfo=now.tzinfo).date()
@@ -1589,6 +1595,9 @@ WEEKDAY_NAMES = {
 # A bare "19 Aug" that has already passed almost never means next year. Rolling
 # the year forward is only sensible across a December/January boundary, so it is
 # accepted only when it lands inside this window.
+# A stated joining date this recently past means "available now", not next year
+# and not unreadable.
+JOINING_DATE_RECENT_PAST_DAYS = int(os.getenv("RECRUITER_JOINING_DATE_RECENT_PAST_DAYS", "60"))
 YEAR_ROLLOVER_MAX_DAYS = int(os.getenv("RECRUITER_YEAR_ROLLOVER_MAX_DAYS", "60"))
 # Nothing in a recruiting pipeline is scheduled further out than this. Anything
 # beyond it is a parsing error, not an intention.
@@ -7551,6 +7560,12 @@ class AIRecruiterAgent:
             return True
 
         for filename, payload in cv_attachments:
+            # Bound per attachment. Everything from the scoring log onwards reads
+            # this, and it is only assigned once the application row is inserted
+            # further down, so any path that logged or replied before that raised
+            # UnboundLocalError and the candidate got no reply at all. Reset per
+            # iteration so a second attachment cannot report the first one's row.
+            application_id = None
             log_json(
                 logging.INFO,
                 "cv_processing_started",
