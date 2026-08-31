@@ -210,3 +210,57 @@ def test_the_answer_box_is_cleared_before_listening_again():
 def test_the_seeded_transcript_is_cleared_too():
     for action in ["repeat", "clarify", "wait"]:
         assert "finalTranscript = '';" in _branch(action), action
+
+
+# --- the room must never hang on "Processing your answer..." (2026-08-29) ------
+
+def test_the_turn_request_has_a_timeout():
+    """fetch() has none of its own, so a turn that never came back left the room
+    on 'Processing your answer...' with no way out."""
+    assert "TURN_TIMEOUT_MS" in SOURCE
+    assert "new AbortController()" in SOURCE
+    assert "signal: turnAbort.signal" in SOURCE
+    ms = int(re.search(r"const TURN_TIMEOUT_MS = (\d+);", SOURCE).group(1))
+    assert 20000 <= ms <= 60000, "long enough for a real turn, short enough to rescue"
+
+
+def test_the_turn_timeout_clears_real_observed_latency():
+    """From LangSmith, 30 days: interview turns ran p50 5.5s, p90 14.2s, max
+    14.2s. A timeout at or below that would cut off turns that were working."""
+    import recruiter_dashboard as rd
+    assert rd.INTERVIEW_TURN_LLM_TIMEOUT >= 20, "must clear the observed 14.2s max with margin"
+    assert rd.INTERVIEW_TURN_LLM_TIMEOUT <= 40, "a candidate is sitting in silence"
+
+
+def test_the_report_is_allowed_to_be_slow():
+    """The slowest real call in 30 days was a 59.1s interview report. It runs
+    after the candidate has gone, so it must not inherit a short leash."""
+    import recruiter_dashboard as rd, llm_factory
+    assert rd.INTERVIEW_REPORT_LLM_TIMEOUT > 60
+    assert rd.INTERVIEW_REPORT_LLM_TIMEOUT > llm_factory.LLM_TIMEOUT_SECONDS
+    assert rd.INTERVIEW_REPORT_LLM_TIMEOUT > rd.INTERVIEW_TURN_LLM_TIMEOUT
+
+
+def test_the_client_waits_longer_than_the_server():
+    """Otherwise the client gives up on turns the server was about to answer."""
+    import recruiter_dashboard as rd
+    ms = int(re.search(r"const TURN_TIMEOUT_MS = (\d+);", SOURCE).group(1))
+    assert ms > rd.INTERVIEW_TURN_LLM_TIMEOUT * 1000
+
+
+def test_a_failed_turn_leaves_the_room_usable():
+    start = SOURCE.index("} catch (error)", SOURCE.index("const turnAbort"))
+    depth = 0
+    for i in range(SOURCE.index("{", start), len(SOURCE)):
+        if SOURCE[i] == "{":
+            depth += 1
+        elif SOURCE[i] == "}":
+            depth -= 1
+            if depth == 0:
+                catch = SOURCE[start : i + 1]
+                break
+    else:
+        raise AssertionError("could not extract the catch block")
+    assert "isSubmitting = false;" in catch
+    assert "answerEl.value = '';" in catch, "the retry must not append to the lost attempt"
+    assert "beginListening()" in catch, "the candidate must be listened to again"

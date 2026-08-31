@@ -400,7 +400,7 @@ REPLY_SCENARIO_COOLDOWN_HOURS = int(os.getenv("RECRUITER_REPLY_SCENARIO_COOLDOWN
 # exists for - the original fault was a dozen near-identical emails.
 REPLY_SCENARIO_MAX_PER_WINDOW = int(os.getenv("RECRUITER_REPLY_SCENARIO_MAX_PER_WINDOW", "2"))
 # Scenarios that must never be repeated for an application, at any interval.
-ONCE_PER_APPLICATION_SCENARIOS = {"budget_disclosure", "holding_reply", "budget_out_of_range"}
+ONCE_PER_APPLICATION_SCENARIOS = {"budget_disclosure", "holding_reply", "budget_out_of_range", "not_selected"}
 
 # The AI interview has already happened by these points. "Approve For Interview"
 # is a pre-interview control and must never appear here - clicking it re-sends
@@ -6000,6 +6000,53 @@ class AIRecruiterAgent:
             application=application,
         )
 
+    def reply_not_selected(
+        self,
+        inbox_email: InboxEmail,
+        application: dict[str, Any],
+        is_referral: bool = False,
+    ):
+        """Tell them the answer, warmly, once the agent has decided.
+
+        No scores, no mention of how the decision was reached, and nothing that
+        invites a negotiation - just a clear answer so the candidate can move on
+        instead of waiting on a thread that was never going to be picked up.
+        """
+        role = (application or {}).get("requirement_position")
+        fallback_body = recruiter_email_body(
+            "Thank you for applying and for taking the time to send your CV.",
+            (
+                f"I have gone through your profile against what the {role} role needs, and on this "
+                "occasion it is not the right fit, so I will not be taking it forward."
+                if role
+                else "I have gone through your profile carefully, and on this occasion it is not the "
+                     "right fit for what we are hiring for, so I will not be taking it forward."
+            ),
+            "Thank you again for your interest. Do apply again if you see something that suits you "
+            "better - I would be glad to take another look.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "tell the candidate warmly and briefly that after reviewing their CV against this role "
+            "they have not been shortlisted, thank them, and invite them to apply for future "
+            "openings; give no scores and no detailed critique, do not invite a discussion, and do "
+            "not mention anyone else being involved or any review still to happen",
+            {
+                "role": role,
+                "final": True,
+                "ask_for_nothing": True,
+                "referral": bool(is_referral),
+            },
+            fallback_body,
+        )
+        return self.send_candidate_reply(
+            inbox_email,
+            f"Update on your application: {inbox_email.subject}",
+            body,
+            scenario="not_selected",
+            application=application,
+        )
+
     def reply_budget_out_of_range(self, inbox_email: InboxEmail, application: dict[str, Any]):
         """Close the loop kindly when the figures are nowhere near each other.
 
@@ -8036,7 +8083,9 @@ class AIRecruiterAgent:
                         {"id": application_id} if application_id else None,
                     )
                     continue
+                jd_rejected = False
                 if application_id:
+                    jd_rejected = True
                     reason = jd_rejection_reason(evaluation, requirement, extracted)
                     log_json(
                         logging.INFO,
@@ -8080,7 +8129,18 @@ class AIRecruiterAgent:
                             "recommendation": evaluation.get("recommendation"),
                         },
                     )
-                if is_referral and candidate_email:
+                if jd_rejected:
+                    # The decision has already been made and recorded. Telling
+                    # the candidate their application is "under review" and
+                    # waiting for HR to confirm a rejection the agent is
+                    # confident about leaves them waiting for a letter nobody
+                    # was going to write.
+                    self.reply_not_selected(
+                        inbox_email,
+                        {"id": application_id, "requirement_position": requirement.get("position_title")},
+                        is_referral=is_referral,
+                    )
+                elif is_referral and candidate_email:
                     self.reply_referral_received(inbox_email, candidate_email, requirement["position_title"])
                 elif is_referral:
                     self.reply_referral_missing_candidate_email(inbox_email, requirement["position_title"])
@@ -9067,11 +9127,15 @@ def send_final_hr_round_request(application_id: int, approved_by_hr: bool = Fals
             raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
         role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
         db.mark_post_interview_outcome(application_id, "hr_round_time_requested")
-        intro = (
-            "Thank you for your patience while we reviewed your interview."
-            if approved_by_hr
-            else "Congratulations, you have cleared the AI technical interview round."
-        )
+        if not interview_actually_happened(application):
+            # Advanced without an AI interview - a legitimate decision, but the
+            # candidate must not be congratulated on clearing a round they never
+            # sat.
+            intro = "Thank you for your patience while we reviewed your application."
+        elif approved_by_hr:
+            intro = "Thank you for your patience while we reviewed your interview."
+        else:
+            intro = "Congratulations, you have cleared the AI technical interview round."
         body = recruiter_email_body(
             intro,
             f"We would like to move ahead with the final round with our HR Manager{f' for the {role} role' if role else ''}.",
@@ -9087,6 +9151,25 @@ def send_final_hr_round_request(application_id: int, approved_by_hr: bool = Fals
         db.close()
 
 
+def interview_actually_happened(application: dict[str, Any]) -> bool:
+    """Did this candidate sit the AI interview?
+
+    Thirteen applications reached interview_on_hold_hr_review without one - the
+    status can be set by hand from the dashboard, and nothing there checks. The
+    post-interview emails talk about "the conversation we had", so they must not
+    be sent to someone who never had it.
+    """
+    if application.get("interview_completed_at"):
+        return True
+    report = application.get("interview_report")
+    if isinstance(report, str):
+        try:
+            report = json.loads(report or "{}")
+        except ValueError:
+            report = {}
+    return bool(report)
+
+
 def send_interview_rejection(application_id: int, reason: str | None = None):
     db = RecruiterDatabase()
     mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
@@ -9100,12 +9183,22 @@ def send_interview_rejection(application_id: int, reason: str | None = None):
             raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
         role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
         db.mark_post_interview_outcome(application_id, "interview_rejected", reason)
-        body = recruiter_email_body(
-            f"Thank you for taking the time to interview with me{f' for the {role} role' if role else ''}.",
-            "I appreciate the effort you put into the conversation and the experience you shared.",
-            "You did well in the discussion, but at the moment we have decided to move forward with another candidate whose profile is a closer match for this opening.",
-            "Thank you again for your interest, and I wish you the very best in your job search.",
-        )
+        if interview_actually_happened(application):
+            body = recruiter_email_body(
+                f"Thank you for taking the time to interview with me{f' for the {role} role' if role else ''}.",
+                "I appreciate the effort you put into the conversation and the experience you shared.",
+                "You did well in the discussion, but at the moment we have decided to move forward with another candidate whose profile is a closer match for this opening.",
+                "Thank you again for your interest, and I wish you the very best in your job search.",
+            )
+        else:
+            # No interview took place, so thanking them for one would be a lie
+            # the candidate can see through.
+            body = recruiter_email_body(
+                f"Thank you for your interest{f' in the {role} role' if role else ''} and for the time you have spent with us.",
+                "Having reviewed your application, we have decided to move forward with another candidate "
+                "whose profile is a closer match for this opening.",
+                "Thank you again, and I wish you the very best in your job search.",
+            )
         send_tracked_direct_email(
             db, mailer, application_id, recipient,
             f"Interview feedback{f' - {role}' if role else ''}", body, "interview_feedback",
@@ -9222,7 +9315,8 @@ def notify_jd_score_rejection_to_hr(application_id: int, evaluation: dict[str, A
             f"Recommendation: {evaluation.get('recommendation') or '-'}",
             f"Reason: {evaluation.get('reasoning') or evaluation.get('short_description') or '-'}",
             f"Dashboard: {dashboard_url}",
-            "If this should continue, open the application and click Revoke JD Rejection.",
+            "The candidate has been told. If this was the wrong call, open the application "
+            "and click Revoke JD Rejection to reopen it and send the screening questions.",
         )
         for recipient in recipients:
             mailer.send_direct_email(

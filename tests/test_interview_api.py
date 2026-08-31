@@ -456,3 +456,52 @@ def test_a_repeat_request_with_the_answer_attached_is_an_answer(server, applicat
         1,
     ).json()
     assert r["action"] != "repeat", "the answer was attached and must be taken"
+
+
+def test_a_stalled_model_does_not_strand_the_candidate(server, application, monkeypatch):
+    """Reported 2026-08-29: "it keeps in processing your answer for so long and
+    never comes back."
+
+    ChatOpenAI was built with no timeout, so the OpenAI client waited its 600s
+    default per attempt and retried on top. The turn must fail fast and keep the
+    interview moving instead.
+    """
+    token = application["token"]
+    start(server, token)
+
+    class Stalled:
+        def invoke(self, prompt):
+            raise TimeoutError("Request timed out.")
+
+    real = rd.make_chat_model
+    rd.make_chat_model = lambda *a, **k: Stalled()
+    try:
+        r = turn(server, token, "I reconcile the bank accounts every month end.", 1)
+    finally:
+        rd.make_chat_model = real
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["action"] in {"next_question", "complete"}, body
+    session = rd.WEB_INTERVIEW_SESSIONS[token]
+    answered = [e for e in session["transcript"] if e.get("status") == "answered"]
+    assert answered and "reconcile" in answered[0]["answer"], "the answer must not be lost"
+
+
+def test_the_turn_model_is_built_to_fail_fast(server, application):
+    captured = {}
+    real = rd.make_chat_model
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real(*args, **kwargs)
+
+    rd.make_chat_model = spy
+    try:
+        start(server, application["token"])
+        turn(server, application["token"], "I close the books by the fifth working day.", 1)
+    finally:
+        rd.make_chat_model = real
+
+    assert captured.get("timeout") == rd.INTERVIEW_TURN_LLM_TIMEOUT
+    assert captured.get("max_retries") == 0, "a waiting candidate must not sit through retries"

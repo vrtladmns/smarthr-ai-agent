@@ -441,6 +441,26 @@ def text_similarity(left: str, right: str) -> float:
 # How many times one question may be read out again before the interview moves
 # on regardless. Two is generous for a genuine mishearing.
 INTERVIEW_MAX_REPEATS = int(os.getenv("RECRUITER_INTERVIEW_MAX_REPEATS", "2"))
+# A candidate is sitting in silence waiting for this one, so it fails fast and
+# is recovered from rather than retried patiently.
+INTERVIEW_TURN_LLM_TIMEOUT = float(os.getenv("RECRUITER_INTERVIEW_TURN_LLM_TIMEOUT", "25"))
+INTERVIEW_REPORT_LLM_TIMEOUT = float(os.getenv("RECRUITER_INTERVIEW_REPORT_LLM_TIMEOUT", "240"))
+
+
+def interview_turn_fallback(session: dict, current_index: int, max_questions: int) -> dict:
+    """What to say when the model does not answer in time.
+
+    Keeps the interview moving on the questions already planned, so a slow or
+    failed call costs a follow-up rather than the whole session.
+    """
+    if current_index + 1 >= max_questions:
+        return {"action": "complete", "reply": closing_interview_reply()}
+    return {
+        "action": "next_question",
+        "reply": random.choice(["Thank you.", "Understood, thank you.", "Got it, thank you."]),
+        "question": session["questions"][current_index + 1],
+        "question_number": current_index + 2,
+    }
 
 
 def classify_interview_turn(answer_text: str, current_question: str, already_repeated: int = 0) -> str:
@@ -1180,7 +1200,14 @@ Context:
         completion_context: dict | None = None,
     ) -> dict:
         normalized_camera_monitoring = normalize_camera_monitoring(camera_monitoring)
-        llm = make_chat_model(json_mode=True, max_tokens=max(OLLAMA_NUM_PREDICT, 1800))
+        # Nobody is waiting on this one - it runs after the candidate has gone -
+        # and it is the slowest call in the system: 59.1s for a real interview
+        # in the traces. It needs room, not a short leash.
+        llm = make_chat_model(
+            json_mode=True,
+            max_tokens=max(OLLAMA_NUM_PREDICT, 1800),
+            timeout=INTERVIEW_REPORT_LLM_TIMEOUT,
+        )
         response = llm.invoke(
             f"""
 Return one valid JSON object only.
@@ -1365,9 +1392,13 @@ Camera monitoring:
                 "question": next_question,
                 "question_number": current_index + 2,
             }
-        llm = make_chat_model(json_mode=True, max_tokens=max(OLLAMA_NUM_PREDICT, 900))
-        response = llm.invoke(
-            f"""
+        llm = make_chat_model(
+            json_mode=True,
+            max_tokens=max(OLLAMA_NUM_PREDICT, 900),
+            timeout=INTERVIEW_TURN_LLM_TIMEOUT,
+            max_retries=0,
+        )
+        prompt = f"""
 Return one valid JSON object only.
 You are the same AI HR technical interviewer, now running inside a browser video interview room.
 Decide the next conversational action after the candidate answered.
@@ -1410,7 +1441,19 @@ Candidate answer:
 Conversation so far:
 {json.dumps(interview_transcript_digest(transcript), default=str)}
 """
-        ).content
+        try:
+            response = llm.invoke(prompt).content
+        except Exception as exc:
+            # The candidate has answered and is waiting in silence. Take the
+            # answer, say something neutral and move on; stalling the room is a
+            # worse outcome than losing one follow-up.
+            log_json(
+                logging.WARNING,
+                "interview_turn_llm_failed",
+                error=str(exc)[:200],
+                question_number=current_index + 1,
+            )
+            return interview_turn_fallback(session, current_index, max_questions)
         try:
             decision = json.loads(extract_json_object(response))
         except Exception:
@@ -2205,15 +2248,57 @@ Conversation so far:
             database.close()
 
     def update_application_status(self, form: dict[str, str]):
+        """Set a status by hand, and leave a trace that it was done by hand.
+
+        This is the only writer that changes application_status and nothing
+        else, which is how thirteen applications came to sit in
+        interview_on_hold_hr_review having never been interviewed - and with
+        nothing anywhere recording who moved them or when.
+        """
+        application_id = parse_int(form.get("id"))
+        new_status = (form.get("application_status") or "reviewed").strip()
+        allowed = set(self.application_status_values())
+        if new_status not in allowed:
+            # The dropdown offers this list; the POST accepted anything at all.
+            log_json(logging.WARNING, "dashboard_status_rejected",
+                     application_id=application_id, requested=new_status[:60])
+            return
         database = self.db()
         try:
+            previous = database.one(
+                "SELECT application_status FROM recruiter_applications WHERE id = %s",
+                (application_id,),
+            )
             database.execute(
                 """
                 UPDATE recruiter_applications
                 SET application_status = %s
                 WHERE id = %s
                 """,
-                (form.get("application_status", "reviewed"), parse_int(form.get("id"))),
+                (new_status, application_id),
+            )
+            database.execute(
+                """
+                INSERT INTO recruiter_email_events
+                    (email_message_id, source_email, email_subject, event_type, details)
+                VALUES (%s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    f"dashboard-status-{application_id}-{int(time.time())}",
+                    "dashboard",
+                    f"Status changed by hand on application {application_id}",
+                    "dashboard_status_changed",
+                    json.dumps(
+                        {
+                            "application_id": application_id,
+                            "from": (previous or {}).get("application_status"),
+                            "to": new_status,
+                            # One shared dashboard login, so this is as specific as it gets.
+                            "by": RECRUITER_DASHBOARD_LOGIN_EMAIL or "dashboard",
+                        },
+                        default=str,
+                    ),
+                ),
             )
         finally:
             database.close()
@@ -4127,6 +4212,9 @@ Conversation so far:
     const INCOMPLETE_ANSWER_SILENCE_MS = 7000;
     const FINAL_TRANSCRIPT_GRACE_MS = 1200;
     const PROCESSING_NUDGE_MS = {int(RECRUITER_BROWSER_PROCESSING_NUDGE_MS)};
+    // Comfortably longer than the server's own turn timeout, so the server
+    // normally answers first and this is only the backstop.
+    const TURN_TIMEOUT_MS = 40000;
     const MIC_ACTIVITY_THRESHOLD = 0.026;
     // Adaptive noise-floor tracking, so a fan does not read as speech.
     const NOISE_FLOOR_MULTIPLIER = 2.2;
@@ -5103,16 +5191,28 @@ Conversation so far:
       const turnId = ++clientTurnId;
       let response;
       let data;
+      // fetch() has no timeout of its own. Without this the room sat on
+      // "Processing your answer..." indefinitely whenever the turn did not come
+      // back, and the candidate had no way out of it.
+      const turnAbort = new AbortController();
+      const turnTimer = window.setTimeout(() => turnAbort.abort(), TURN_TIMEOUT_MS);
       try {{
         response = await fetch(`/api/interview/${{token}}/turn`, {{
           method: 'POST',
           headers: {{'Content-Type': 'application/json'}},
-          body: JSON.stringify({{answer, turn_id: turnId, camera_monitoring: cameraMonitoring}})
+          body: JSON.stringify({{answer, turn_id: turnId, camera_monitoring: cameraMonitoring}}),
+          signal: turnAbort.signal
         }});
         data = await response.json();
+        window.clearTimeout(turnTimer);
       }} catch (error) {{
+        window.clearTimeout(turnTimer);
         clearProcessingNudge();
         isSubmitting = false;
+        // They are about to be asked to answer again, so start them clean
+        // rather than appending the retry to the attempt that was lost.
+        answerEl.value = '';
+        finalTranscript = '';
         listenBtn.disabled = false;
         replayBtn.disabled = false;
         nextBtn.disabled = false;
