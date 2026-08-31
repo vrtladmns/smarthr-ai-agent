@@ -400,7 +400,7 @@ REPLY_SCENARIO_COOLDOWN_HOURS = int(os.getenv("RECRUITER_REPLY_SCENARIO_COOLDOWN
 # exists for - the original fault was a dozen near-identical emails.
 REPLY_SCENARIO_MAX_PER_WINDOW = int(os.getenv("RECRUITER_REPLY_SCENARIO_MAX_PER_WINDOW", "2"))
 # Scenarios that must never be repeated for an application, at any interval.
-ONCE_PER_APPLICATION_SCENARIOS = {"budget_disclosure", "holding_reply", "budget_out_of_range"}
+ONCE_PER_APPLICATION_SCENARIOS = {"budget_disclosure", "holding_reply", "budget_out_of_range", "not_selected"}
 
 # The AI interview has already happened by these points. "Approve For Interview"
 # is a pre-interview control and must never appear here - clicking it re-sends
@@ -6000,6 +6000,53 @@ class AIRecruiterAgent:
             application=application,
         )
 
+    def reply_not_selected(
+        self,
+        inbox_email: InboxEmail,
+        application: dict[str, Any],
+        is_referral: bool = False,
+    ):
+        """Tell them the answer, warmly, once the agent has decided.
+
+        No scores, no mention of how the decision was reached, and nothing that
+        invites a negotiation - just a clear answer so the candidate can move on
+        instead of waiting on a thread that was never going to be picked up.
+        """
+        role = (application or {}).get("requirement_position")
+        fallback_body = recruiter_email_body(
+            "Thank you for applying and for taking the time to send your CV.",
+            (
+                f"I have gone through your profile against what the {role} role needs, and on this "
+                "occasion it is not the right fit, so I will not be taking it forward."
+                if role
+                else "I have gone through your profile carefully, and on this occasion it is not the "
+                     "right fit for what we are hiring for, so I will not be taking it forward."
+            ),
+            "Thank you again for your interest. Do apply again if you see something that suits you "
+            "better - I would be glad to take another look.",
+        )
+        body = self.ai.draft_reply(
+            inbox_email,
+            "tell the candidate warmly and briefly that after reviewing their CV against this role "
+            "they have not been shortlisted, thank them, and invite them to apply for future "
+            "openings; give no scores and no detailed critique, do not invite a discussion, and do "
+            "not mention anyone else being involved or any review still to happen",
+            {
+                "role": role,
+                "final": True,
+                "ask_for_nothing": True,
+                "referral": bool(is_referral),
+            },
+            fallback_body,
+        )
+        return self.send_candidate_reply(
+            inbox_email,
+            f"Update on your application: {inbox_email.subject}",
+            body,
+            scenario="not_selected",
+            application=application,
+        )
+
     def reply_budget_out_of_range(self, inbox_email: InboxEmail, application: dict[str, Any]):
         """Close the loop kindly when the figures are nowhere near each other.
 
@@ -8036,7 +8083,9 @@ class AIRecruiterAgent:
                         {"id": application_id} if application_id else None,
                     )
                     continue
+                jd_rejected = False
                 if application_id:
+                    jd_rejected = True
                     reason = jd_rejection_reason(evaluation, requirement, extracted)
                     log_json(
                         logging.INFO,
@@ -8080,7 +8129,18 @@ class AIRecruiterAgent:
                             "recommendation": evaluation.get("recommendation"),
                         },
                     )
-                if is_referral and candidate_email:
+                if jd_rejected:
+                    # The decision has already been made and recorded. Telling
+                    # the candidate their application is "under review" and
+                    # waiting for HR to confirm a rejection the agent is
+                    # confident about leaves them waiting for a letter nobody
+                    # was going to write.
+                    self.reply_not_selected(
+                        inbox_email,
+                        {"id": application_id, "requirement_position": requirement.get("position_title")},
+                        is_referral=is_referral,
+                    )
+                elif is_referral and candidate_email:
                     self.reply_referral_received(inbox_email, candidate_email, requirement["position_title"])
                 elif is_referral:
                     self.reply_referral_missing_candidate_email(inbox_email, requirement["position_title"])
@@ -9222,7 +9282,8 @@ def notify_jd_score_rejection_to_hr(application_id: int, evaluation: dict[str, A
             f"Recommendation: {evaluation.get('recommendation') or '-'}",
             f"Reason: {evaluation.get('reasoning') or evaluation.get('short_description') or '-'}",
             f"Dashboard: {dashboard_url}",
-            "If this should continue, open the application and click Revoke JD Rejection.",
+            "The candidate has been told. If this was the wrong call, open the application "
+            "and click Revoke JD Rejection to reopen it and send the screening questions.",
         )
         for recipient in recipients:
             mailer.send_direct_email(
