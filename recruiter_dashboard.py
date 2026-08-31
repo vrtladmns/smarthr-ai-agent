@@ -2248,15 +2248,57 @@ Conversation so far:
             database.close()
 
     def update_application_status(self, form: dict[str, str]):
+        """Set a status by hand, and leave a trace that it was done by hand.
+
+        This is the only writer that changes application_status and nothing
+        else, which is how thirteen applications came to sit in
+        interview_on_hold_hr_review having never been interviewed - and with
+        nothing anywhere recording who moved them or when.
+        """
+        application_id = parse_int(form.get("id"))
+        new_status = (form.get("application_status") or "reviewed").strip()
+        allowed = set(self.application_status_values())
+        if new_status not in allowed:
+            # The dropdown offers this list; the POST accepted anything at all.
+            log_json(logging.WARNING, "dashboard_status_rejected",
+                     application_id=application_id, requested=new_status[:60])
+            return
         database = self.db()
         try:
+            previous = database.one(
+                "SELECT application_status FROM recruiter_applications WHERE id = %s",
+                (application_id,),
+            )
             database.execute(
                 """
                 UPDATE recruiter_applications
                 SET application_status = %s
                 WHERE id = %s
                 """,
-                (form.get("application_status", "reviewed"), parse_int(form.get("id"))),
+                (new_status, application_id),
+            )
+            database.execute(
+                """
+                INSERT INTO recruiter_email_events
+                    (email_message_id, source_email, email_subject, event_type, details)
+                VALUES (%s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    f"dashboard-status-{application_id}-{int(time.time())}",
+                    "dashboard",
+                    f"Status changed by hand on application {application_id}",
+                    "dashboard_status_changed",
+                    json.dumps(
+                        {
+                            "application_id": application_id,
+                            "from": (previous or {}).get("application_status"),
+                            "to": new_status,
+                            # One shared dashboard login, so this is as specific as it gets.
+                            "by": RECRUITER_DASHBOARD_LOGIN_EMAIL or "dashboard",
+                        },
+                        default=str,
+                    ),
+                ),
             )
         finally:
             database.close()

@@ -9127,11 +9127,15 @@ def send_final_hr_round_request(application_id: int, approved_by_hr: bool = Fals
             raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
         role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
         db.mark_post_interview_outcome(application_id, "hr_round_time_requested")
-        intro = (
-            "Thank you for your patience while we reviewed your interview."
-            if approved_by_hr
-            else "Congratulations, you have cleared the AI technical interview round."
-        )
+        if not interview_actually_happened(application):
+            # Advanced without an AI interview - a legitimate decision, but the
+            # candidate must not be congratulated on clearing a round they never
+            # sat.
+            intro = "Thank you for your patience while we reviewed your application."
+        elif approved_by_hr:
+            intro = "Thank you for your patience while we reviewed your interview."
+        else:
+            intro = "Congratulations, you have cleared the AI technical interview round."
         body = recruiter_email_body(
             intro,
             f"We would like to move ahead with the final round with our HR Manager{f' for the {role} role' if role else ''}.",
@@ -9147,6 +9151,25 @@ def send_final_hr_round_request(application_id: int, approved_by_hr: bool = Fals
         db.close()
 
 
+def interview_actually_happened(application: dict[str, Any]) -> bool:
+    """Did this candidate sit the AI interview?
+
+    Thirteen applications reached interview_on_hold_hr_review without one - the
+    status can be set by hand from the dashboard, and nothing there checks. The
+    post-interview emails talk about "the conversation we had", so they must not
+    be sent to someone who never had it.
+    """
+    if application.get("interview_completed_at"):
+        return True
+    report = application.get("interview_report")
+    if isinstance(report, str):
+        try:
+            report = json.loads(report or "{}")
+        except ValueError:
+            report = {}
+    return bool(report)
+
+
 def send_interview_rejection(application_id: int, reason: str | None = None):
     db = RecruiterDatabase()
     mailer = MicrosoftGraphProvider() if MAIL_PROVIDER.lower() in {"graph", "microsoft_graph", "outlook_graph"} else RecruiterMailer()
@@ -9160,12 +9183,22 @@ def send_interview_rejection(application_id: int, reason: str | None = None):
             raise RuntimeError(f"Application {application_id} does not have a candidate/source email.")
         role = application.get("requirement_position") or application.get("matched_position") or application.get("detected_position")
         db.mark_post_interview_outcome(application_id, "interview_rejected", reason)
-        body = recruiter_email_body(
-            f"Thank you for taking the time to interview with me{f' for the {role} role' if role else ''}.",
-            "I appreciate the effort you put into the conversation and the experience you shared.",
-            "You did well in the discussion, but at the moment we have decided to move forward with another candidate whose profile is a closer match for this opening.",
-            "Thank you again for your interest, and I wish you the very best in your job search.",
-        )
+        if interview_actually_happened(application):
+            body = recruiter_email_body(
+                f"Thank you for taking the time to interview with me{f' for the {role} role' if role else ''}.",
+                "I appreciate the effort you put into the conversation and the experience you shared.",
+                "You did well in the discussion, but at the moment we have decided to move forward with another candidate whose profile is a closer match for this opening.",
+                "Thank you again for your interest, and I wish you the very best in your job search.",
+            )
+        else:
+            # No interview took place, so thanking them for one would be a lie
+            # the candidate can see through.
+            body = recruiter_email_body(
+                f"Thank you for your interest{f' in the {role} role' if role else ''} and for the time you have spent with us.",
+                "Having reviewed your application, we have decided to move forward with another candidate "
+                "whose profile is a closer match for this opening.",
+                "Thank you again, and I wish you the very best in your job search.",
+            )
         send_tracked_direct_email(
             db, mailer, application_id, recipient,
             f"Interview feedback{f' - {role}' if role else ''}", body, "interview_feedback",
