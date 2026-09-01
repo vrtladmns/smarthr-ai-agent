@@ -1074,8 +1074,26 @@ def short_fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
 
 
+BULLET_LINE = re.compile(r"^\s*[-*\u2022\u00b7]\s+(.+)$")
+NUMBERED_LINE = re.compile(r"^\s*\d+[.)]\s+(.+)$")
+
+
 def recruiter_email_body(*paragraphs: str) -> str:
-    clean_paragraphs = [re.sub(r"\s+", " ", paragraph).strip() for paragraph in paragraphs if paragraph and paragraph.strip()]
+    """Join paragraphs, keeping any line structure inside them.
+
+    Whitespace is collapsed per line rather than per paragraph. Collapsing the
+    whole paragraph turned every newline into a space, so a list written as
+    separate lines arrived as one long run-on sentence and bullets were
+    impossible to send.
+    """
+    clean_paragraphs = []
+    for paragraph in paragraphs:
+        if not paragraph or not str(paragraph).strip():
+            continue
+        lines = [re.sub(r"[ \t]+", " ", line).strip() for line in str(paragraph).splitlines()]
+        lines = [line for line in lines if line]
+        if lines:
+            clean_paragraphs.append("\n".join(lines))
     return "\r\n\r\n".join(["Hi,", *clean_paragraphs])
 
 
@@ -1111,11 +1129,53 @@ def linkify_html_text(value: str) -> str:
 
 
 def email_body_to_html(body: str) -> str:
+    """Render the plain-text body as HTML, turning written lists into real ones.
+
+    A run of lines beginning "- " or "1." becomes <ul>/<ol>. Sent as <br>
+    separated text they looked like a wall of dashes in Outlook, which is what
+    the screening questions read like.
+    """
     paragraphs = [part.strip() for part in re.split(r"\r?\n\r?\n", body) if part.strip()]
     html_parts = []
     for paragraph in paragraphs:
         normalized = paragraph.replace("\r\n", "\n").replace("\r", "\n")
-        html_parts.append(f"<p>{linkify_html_text(normalized).replace(chr(10), '<br>')}</p>")
+        buffer: list[str] = []
+        items: list[str] = []
+        ordered = False
+
+        def flush_text():
+            if buffer:
+                html_parts.append(
+                    f"<p>{linkify_html_text(chr(10).join(buffer)).replace(chr(10), '<br>')}</p>"
+                )
+                buffer.clear()
+
+        def flush_list():
+            if items:
+                tag = "ol" if ordered else "ul"
+                rendered = "".join(
+                    f'<li style="margin:0 0 6px 0;">{linkify_html_text(item)}</li>' for item in items
+                )
+                html_parts.append(
+                    f'<{tag} style="margin:0 0 12px 0;padding-left:22px;">{rendered}</{tag}>'
+                )
+                items.clear()
+
+        for line in normalized.split("\n"):
+            bullet = BULLET_LINE.match(line)
+            numbered = NUMBERED_LINE.match(line)
+            if bullet or numbered:
+                is_ordered = bool(numbered)
+                if items and is_ordered != ordered:
+                    flush_list()
+                ordered = is_ordered
+                flush_text()
+                items.append((numbered or bullet).group(1).strip())
+            else:
+                flush_list()
+                buffer.append(line)
+        flush_list()
+        flush_text()
     return "".join(html_parts)
 
 
@@ -5098,6 +5158,9 @@ Rules:
 - Return only the email body text.
 - Start with "Hi,".
 - Use short paragraphs with blank lines between them.
+- When you list several things - questions, work terms, required details - put
+  each on its own line starting with "- ". A list of questions run together in
+  one sentence is hard to answer.
 - Be warm, concise, and professional.
 - Do not sound automated.
 
@@ -5877,19 +5940,41 @@ class AIRecruiterAgent:
         application: dict[str, Any] | None = None,
     ):
         role = requirement["position_title"] if requirement else None
+        terms = screening_work_terms()
+        term_lines = "\n".join(
+            f"- {label}: {value}"
+            for label, value in [
+                ("Shift", terms.get("shift")),
+                ("Work mode", terms.get("work_mode")),
+                ("Office location", terms.get("office_location")),
+                ("Working days", terms.get("working_days")),
+                ("Cab facility", terms.get("cab_facility")),
+            ]
+            if value
+        )
         fallback_body = recruiter_email_body(
             "Thanks for applying and sharing your CV.",
-            f"Your profile looks relevant for {role}. Before we move ahead, please confirm if you are comfortable with night shift, work from office in Mohali, 5 days working, and cab facility available.",
-            "Also please share your current salary, expected salary, current location, and how soon you can join.",
+            f"Your profile looks relevant for {role}. Before we move ahead, please confirm you are "
+            "comfortable with the following:" if role else
+            "Before we move ahead, please confirm you are comfortable with the following:",
+            term_lines,
+            "And please share:",
+            "- Your current salary\n"
+            "- Your expected salary\n"
+            "- Your current location\n"
+            "- How soon you can join",
         )
         body = self.ai.draft_reply(
             inbox_email,
-            "candidate CV passed the initial ATS/JD screen; ask pre-interview screening questions",
+            "candidate CV passed the initial ATS/JD screen; ask pre-interview screening questions. "
+            "Put the work terms and the questions on their own lines as a bulleted list, each line "
+            "starting with '- ', rather than running them together in a sentence",
             {
                 "application_received": True,
                 "role": role,
-                "work_terms": screening_work_terms(),
+                "work_terms": terms,
                 "ask_for": ["current salary", "expected salary", "current location", "joining time"],
+                "format_questions_as_bullets": True,
             },
             fallback_body,
         )
@@ -5919,11 +6004,18 @@ class AIRecruiterAgent:
         ]
         if joining_days_from_answers(answers) is None:
             missing.append("joining time")
+        if missing:
+            fallback_body = recruiter_email_body(
+                "Thanks for sharing the details.",
+                "To move your application forward I still need:",
+                "\n".join(f"- {item[0].upper()}{item[1:]}" for item in missing),
+            )
+        else:
+            fallback_body = recruiter_email_body(
+                "Thanks for sharing the details.",
+                "I still need a few remaining details to move your application forward.",
+            )
         missing_text = ", ".join(missing) if missing else "a few remaining details"
-        fallback_body = recruiter_email_body(
-            "Thanks for sharing the details.",
-            f"I still need {missing_text} to move your application forward.",
-        )
         body = self.ai.draft_reply(
             inbox_email,
             "candidate replied to screening questions but some required details are still missing; "
