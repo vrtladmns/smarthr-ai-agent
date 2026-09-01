@@ -771,8 +771,41 @@ def test_a_joining_date_answers_the_joining_question():
 
 
 def test_joining_dates_in_various_shapes_are_understood():
-    for text in ["4 sep", "2026-09-04", "3 or 4 Sep", "September 4", "after 31 August"]:
+    """Built relative to today: "after 31 August" passed on 1 September and the
+    test started failing on a date rather than on a change."""
+    from datetime import timedelta
+
+    today = ra.recruiter_now().date()
+    soon = today + timedelta(days=3)
+    month = soon.strftime("%b")
+    for text in [
+        f"{soon.day} {month.lower()}",
+        soon.isoformat(),
+        f"{soon.day - 1} or {soon.day} {month}",
+        f"{soon.strftime('%B')} {soon.day}",
+    ]:
         assert ra.parse_joining_date(text) is not None, text
+
+
+def test_a_date_that_has_just_gone_by_means_available_now():
+    """A candidate who said "after 31 August" is free on 1 September. Reading
+    that as unparseable made the agent ask the same question again."""
+    from datetime import timedelta
+
+    today = ra.recruiter_now().date()
+    yesterday = today - timedelta(days=1)
+    parsed = ra.parse_joining_date(f"after {yesterday.day} {yesterday.strftime('%B')}")
+    assert parsed == today, parsed
+    assert ra.joining_days_from_answers({"joining_date": parsed.isoformat()}) == 0
+
+
+def test_a_long_past_date_is_still_not_invented_into_next_year():
+    from datetime import timedelta
+
+    today = ra.recruiter_now().date()
+    long_ago = today - timedelta(days=ra.JOINING_DATE_RECENT_PAST_DAYS + 30)
+    parsed = ra.parse_joining_date(f"{long_ago.day} {long_ago.strftime('%B')}")
+    assert parsed is None or parsed >= today
 
 
 def test_joining_date_converts_to_days():
