@@ -127,3 +127,43 @@ def fine(rows):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_the_scoring_block_cannot_read_an_unset_application_id():
+    """The crash that reached production, with a traceback from the server:
+
+        File "recruiter_agent.py", line 7863, in process_email
+          application_id=application_id,
+        UnboundLocalError: cannot access local variable 'application_id'
+
+    Five candidates, eleven attempts: mandhadivya13, g.rishitha66, mohitsikhan,
+    sachitjamwal19 and gokulsarasan1999. The near-miss scoring block logs
+    application_id, and it runs before the application row is inserted.
+    """
+    import ast
+
+    tree = ast.parse((ROOT / "recruiter_agent.py").read_text())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "process_email")
+    stores = sorted({n.lineno for n in ast.walk(fn)
+                     if isinstance(n, ast.Name) and n.id == "application_id"
+                     and isinstance(n.ctx, ast.Store)})
+    loads = sorted({n.lineno for n in ast.walk(fn)
+                    if isinstance(n, ast.Name) and n.id == "application_id"
+                    and isinstance(n.ctx, ast.Load)})
+    assert stores and loads
+    assert stores[0] < loads[0], (
+        f"application_id is read at line {loads[0]} before its first assignment "
+        f"at line {stores[0]}"
+    )
+
+
+def test_the_binding_is_inside_the_attachment_loop():
+    """Per attachment, not per call: bound once for the method, a second
+    attachment that failed early would report the first attachment's row."""
+    source = (ROOT / "recruiter_agent.py").read_text()
+    loop = source.index("for filename, payload in cv_attachments:")
+    following = source[loop : loop + 900]
+    assert "application_id = None" in following, (
+        "the reset must be the first thing each attachment does"
+    )
