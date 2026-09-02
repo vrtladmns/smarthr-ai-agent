@@ -322,3 +322,24 @@ def test_a_deliberate_cycle_is_not_treated_as_a_failure():
 def test_a_failed_start_retries_instead_of_giving_up():
     assert "RECOGNITION_RESTART_LIMIT" in SOURCE
     assert "recognition_start_failed" in SOURCE
+
+
+def test_recording_uploads_yield_to_the_turn_request():
+    """Application 48 uploaded 76 MB of recording chunks to the server while not
+    one turn request arrived. The recording is about a megabit a second of
+    upload; the turn queues behind it and the candidate sees "Processing your
+    answer..." forever."""
+    body = js_block("uploadRecordingChunk")
+    assert "isSubmitting" in body, "chunks must stand aside while a turn is in flight"
+    assert "heldRecordingChunks" in body
+    assert "function flushHeldRecordingChunks" in SOURCE
+    # and they must actually be sent afterwards, on success and on failure
+    i = SOURCE.index("const turnAbort")
+    window = SOURCE[i : i + 2000]
+    assert window.count("flushHeldRecordingChunks()") >= 2, "flush after success and failure"
+
+
+def test_the_recording_bitrate_leaves_room_for_the_interview():
+    import re as _re
+    video = int(_re.search(r"videoBitsPerSecond: (\d+)", SOURCE).group(1))
+    assert video <= 500000, f"{video} bps competes with the turn request"

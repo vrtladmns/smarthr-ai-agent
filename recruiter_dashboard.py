@@ -5103,9 +5103,32 @@ Conversation so far:
       return '';
     }}
 
+    // The recording is roughly a megabit a second of upload. On a home or office
+    // uplink that is enough to keep the connection busy, and the turn request -
+    // the one the candidate is actually waiting on - then queues behind chunks
+    // and never arrives. Application 48 uploaded 76 MB of chunks successfully
+    // while not one turn reached the server. So the recording yields: chunks
+    // captured during a turn wait until the turn is done.
+    const heldRecordingChunks = [];
+
+    function flushHeldRecordingChunks() {{
+      while (heldRecordingChunks.length) {{
+        const held = heldRecordingChunks.shift();
+        sendRecordingChunk(held.blob, held.index);
+      }}
+    }}
+
     function uploadRecordingChunk(blob) {{
       if (!blob || !blob.size) return;
       const chunkIndex = recordingChunkIndex++;
+      if (isSubmitting) {{
+        heldRecordingChunks.push({{blob: blob, index: chunkIndex}});
+        return;
+      }}
+      sendRecordingChunk(blob, chunkIndex);
+    }}
+
+    function sendRecordingChunk(blob, chunkIndex) {{
       const upload = fetch(`/api/interview/${{token}}/recording-chunk?index=${{chunkIndex}}`, {{
         method: 'POST',
         headers: {{'Content-Type': recordingMimeType || blob.type || 'video/webm'}},
@@ -5181,7 +5204,7 @@ Conversation so far:
         const mimeType = preferredRecordingMimeType();
         recordingMimeType = mimeType || 'video/webm';
         interviewRecorder = mimeType
-          ? new MediaRecorder(recordingStream, {{mimeType, videoBitsPerSecond: 900000, audioBitsPerSecond: 64000}})
+          ? new MediaRecorder(recordingStream, {{mimeType, videoBitsPerSecond: 400000, audioBitsPerSecond: 48000}})
           : new MediaRecorder(recordingStream);
       }} catch (error) {{
         setMessage('Could not start screen recording in this browser. Please use Google Chrome.', true);
@@ -5694,8 +5717,10 @@ Conversation so far:
         }});
         data = await response.json();
         window.clearTimeout(turnTimer);
+        flushHeldRecordingChunks();
       }} catch (error) {{
         window.clearTimeout(turnTimer);
+        flushHeldRecordingChunks();
         clearProcessingNudge();
         isSubmitting = false;
         // They are about to be asked to answer again, so start them clean
