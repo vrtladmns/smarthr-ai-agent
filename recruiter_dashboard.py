@@ -1699,7 +1699,15 @@ Conversation so far:
                 "transcript": stored.get("transcript") or [],
                 "camera_monitoring": {},
                 "followup_for_current": bool(stored.get("followup_for_current")),
-                "last_client_turn_id": int(stored.get("last_client_turn_id") or 0),
+                # Deliberately 0, not the stored value. The browser's turn
+                # counter starts again at 1 on every page load, so carrying the
+                # old high-water mark across a resume made the first real answer
+                # look like a duplicate: the server returned "ignored", the page
+                # silently dropped it and sat on "Processing your answer..."
+                # forever. Application 48 was stuck at 18 and every attempt died
+                # on its first turn. The guard still does its job within a page
+                # load, which is the only place a duplicate can come from.
+                "last_client_turn_id": 0,
                 "role_context": stored.get("role_context") or interview_role_context(application),
                 "started_at": stored.get("started_at") or time.time(),
             }
@@ -5746,8 +5754,14 @@ Conversation so far:
       }}
       const action = data.action || 'next_question';
       if (action === 'ignored') {{
+        // The server discarded this turn as a duplicate. Whatever the reason,
+        // the candidate must not be left staring at "Processing your answer...".
         isSubmitting = false;
         aiStatus.textContent = 'Ready';
+        reportClient('turn_ignored', {{question_number: index + 1, turn_id: turnId}});
+        setMessage('Listening. Please continue.');
+        flushHeldRecordingChunks();
+        beginListening();
         return;
       }}
       const reply = data.reply || transitionAcknowledgement();
