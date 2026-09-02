@@ -264,3 +264,61 @@ def test_a_failed_turn_leaves_the_room_usable():
     assert "isSubmitting = false;" in catch
     assert "answerEl.value = '';" in catch, "the retry must not append to the lost attempt"
     assert "beginListening()" in catch, "the candidate must be listened to again"
+
+
+# --- found by taking the interview (2026-09-03) -------------------------------
+
+def test_incomplete_endings_match_whole_words_not_substrings():
+    """endsWith() matched 'is' inside "analysis", 'on' inside "reconciliation",
+    'or' inside "vendor" and 'a' inside "data". answerCanAutoSubmit() then
+    refused to submit, so a turn ending on the commonest words of the job could
+    never end. Reported as "not responding"."""
+    body = js_block("answerLooksIncomplete")
+    assert "text.endsWith(ending)" not in body, "substring matching blocked real answers"
+    assert "split(" in body and "tails" in body
+
+
+def test_a_request_is_always_deliverable():
+    """"could you repeat that" ends on 'that', a listed ending. The server is
+    what decides whether something was an answer; the browser must deliver it."""
+    assert "function answerLooksLikeRequest" in SOURCE
+    gate = js_block("answerCanAutoSubmit")
+    assert "answerLooksLikeRequest()" in gate
+    assert gate.index("answerLooksLikeRequest") < gate.index("answerLooksIncomplete")
+
+
+def test_the_interview_javascript_has_no_unescaped_word_boundaries():
+    """The page is built inside a Python f-string, so a lone \\b in the source
+    renders as a backspace character and the regex silently stops matching.
+    \\s survives only because Python does not recognise it as an escape."""
+    import re as _re
+    start = SOURCE.index("function isSupportedInterviewBrowser")
+    region = SOURCE[start:]
+    lone = list(_re.finditer(r"(?<!\\)\\b", region))
+    assert not lone, f"{len(lone)} unescaped \\b in the interview JS; use \\\\b"
+
+
+def test_a_wedged_recogniser_is_cycled():
+    """Measured live: no recognition result for 7003ms while the microphone had
+    sound 1087ms earlier. The turn then either got cut off by the mic ceiling or,
+    with nothing transcribed, could never be submitted at all."""
+    assert "function startRecognitionWatchdog" in SOURCE
+    body = js_block("startRecognitionWatchdog")
+    assert "RECOGNITION_STALL_MS" in body
+    assert "recognition.stop()" in body
+    assert "RECOGNITION_CYCLE_LIMIT" in body, "a watchdog must not thrash"
+
+
+def test_a_deliberate_cycle_is_not_treated_as_a_failure():
+    """recognition.stop() fires onerror with 'aborted'. Treating that as fatal
+    set isRecording false and killed the turn the watchdog was rescuing."""
+    assert "reason === 'aborted'" in SOURCE
+    i = SOURCE.index("reason === 'aborted'")
+    branch = SOURCE[i : i + 800]
+    assert "return;" in branch, branch[-120:]
+    assert "isRecording = false" not in branch.split("return;")[0]
+
+
+def test_a_failed_start_retries_instead_of_giving_up():
+    assert "RECOGNITION_RESTART_LIMIT" in SOURCE
+    assert "recognition_start_failed" in SOURCE

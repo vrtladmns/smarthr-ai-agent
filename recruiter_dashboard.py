@@ -84,7 +84,14 @@ MAX_INTERVIEW_QUESTIONS = int(os.getenv("RECRUITER_MAX_INTERVIEW_QUESTIONS", "6"
 FINAL_HR_CHECK_SECONDS = 300
 DASHBOARD_SESSION_COOKIE = "recruiter_dashboard_session"
 DASHBOARD_SESSION_SECONDS = 12 * 60 * 60
-RECORDING_UPLOAD_DIR = Path("/tmp/recruiter-interview-recordings")
+# Not /tmp: chunks live here between the browser uploading them and the
+# assembled file reaching OneDrive. An interview whose recording-complete never
+# fires leaves them behind, and /tmp is cleared on reboot, so the recording was
+# gone before anyone noticed. Five completed interviews on the server have no
+# recording for this reason.
+RECORDING_UPLOAD_DIR = Path(
+    os.getenv("RECRUITER_RECORDING_STAGING_DIR", "storage/interview-recordings")
+)
 DASHBOARD_TTS_CACHE_DIR = Path("/tmp/recruiter-dashboard-tts")
 
 
@@ -108,6 +115,45 @@ def start_final_hr_round_monitor():
             except Exception as exc:
                 LOGGER.exception("Final HR round monitor failed: %s", exc)
             time.sleep(FINAL_HR_CHECK_SECONDS)
+
+    Thread(target=run, daemon=True).start()
+
+
+PENDING_RECORDING_SWEEP_SECONDS = int(
+    os.getenv("RECRUITER_RECORDING_SWEEP_SECONDS", "600")
+)
+PENDING_RECORDING_MIN_AGE_SECONDS = int(
+    os.getenv("RECRUITER_RECORDING_MIN_AGE_SECONDS", "600")
+)
+
+
+def start_pending_recording_monitor():
+    """Upload recordings the browser never finished sending.
+
+    A candidate who closes the tab mid-sentence stops the browser calling
+    recording-complete, and the chunks then sit on disk forever. Recovering them
+    by hand needs somebody to remember, which is not a plan, so this does it on
+    a timer. The age floor keeps it away from an interview still in progress.
+    """
+
+    def run():
+        while True:
+            time.sleep(PENDING_RECORDING_SWEEP_SECONDS)
+            try:
+                if not ONEDRIVE_RECORDINGS_ENABLED:
+                    continue
+                uploaded = upload_pending_recordings(
+                    min_age_seconds=PENDING_RECORDING_MIN_AGE_SECONDS
+                )
+                if uploaded:
+                    log_json(
+                        logging.INFO,
+                        "pending_recordings_swept",
+                        count=len(uploaded),
+                        application_ids=[item["application_id"] for item in uploaded],
+                    )
+            except Exception as exc:
+                LOGGER.exception("Pending recording sweep failed: %s", exc)
 
     Thread(target=run, daemon=True).start()
 
@@ -597,7 +643,7 @@ def interview_api_path(path: str) -> tuple[str, str] | None:
         and parts[0] == "api"
         and parts[1] == "interview"
         and re.fullmatch(r"[A-Za-z0-9_-]{20,200}", parts[2])
-        and parts[3] in {"start", "turn", "complete", "recording", "recording-chunk", "recording-complete", "speech"}
+        and parts[3] in {"start", "turn", "complete", "recording", "recording-chunk", "recording-complete", "speech", "client-log"}
     ):
         return parts[2], parts[3]
     return None
@@ -691,6 +737,128 @@ class DashboardDB:
 
     def execute(self, query: str, params: tuple = ()):
         self.db.execute(query, params)
+
+
+def pending_recording_dirs() -> list[Path]:
+    """Chunk directories left behind by an interview that never finalised."""
+    if not RECORDING_UPLOAD_DIR.exists():
+        return []
+    return [
+        directory
+        for directory in sorted(RECORDING_UPLOAD_DIR.iterdir())
+        if directory.is_dir() and any(directory.glob("chunk-*.part"))
+    ]
+
+
+def application_id_from_chunk_dir(directory: Path) -> int | None:
+    match = re.match(r"application-(\d+)-", directory.name)
+    return int(match.group(1)) if match else None
+
+
+def upload_pending_recordings(min_age_seconds: int = 900) -> list[dict]:
+    """Assemble and upload recordings whose interview never finished the job.
+
+    The browser calls recording-complete when the interview ends. If the tab is
+    closed, the network drops or that call fails, the chunks simply sit on disk
+    and the recording is lost - five completed interviews on the server have no
+    recording at all for this reason. This picks them up afterwards.
+
+    min_age_seconds keeps it away from an interview that is still running.
+    """
+    results = []
+    for directory in pending_recording_dirs():
+        application_id = application_id_from_chunk_dir(directory)
+        if not application_id:
+            continue
+        newest = max(f.stat().st_mtime for f in directory.glob("chunk-*.part"))
+        if time.time() - newest < min_age_seconds:
+            continue                     # still being written to
+        try:
+            info = finalise_recording_dir(application_id, directory)
+            results.append({"application_id": application_id, **info})
+        except Exception as exc:
+            log_json(
+                logging.WARNING,
+                "pending_recording_upload_failed",
+                application_id=application_id,
+                directory=directory.name,
+                error=str(exc)[:200],
+            )
+    return results
+
+
+def finalise_recording_dir(application_id: int, chunk_dir: Path) -> dict:
+    """Join the chunks, put the file on OneDrive, record where it went."""
+    chunk_files = sorted(chunk_dir.glob("chunk-*.part"))
+    if not chunk_files:
+        raise RuntimeError("no chunks to assemble")
+    meta = {}
+    meta_path = chunk_dir / "meta.json"
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    content_type = meta.get("content_type") or "video/webm"
+    extension = ".mp4" if "mp4" in str(content_type).lower() else ".webm"
+
+    database = RecruiterDatabase()
+    try:
+        database.init_schema()
+        application = database.application_with_requirement(application_id) or {}
+    finally:
+        database.close()
+
+    label = safe_onedrive_path_part(
+        application.get("full_name") or application.get("candidate_email") or "candidate"
+    )
+    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    filename = f"application-{application_id}-{label}-{timestamp}{extension}"
+    payload = b"".join(chunk_file.read_bytes() for chunk_file in chunk_files)
+
+    if len(payload) < MIN_INTERVIEW_RECORDING_BYTES:
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        raise RuntimeError(f"recording too short to save ({len(payload)} bytes)")
+
+    uploaded = MicrosoftGraphProvider(ONEDRIVE_RECORDINGS_USER).upload_onedrive_file(
+        payload,
+        filename,
+        folder=f"{ONEDRIVE_RECORDINGS_FOLDER}/Application {application_id}",
+        content_type=content_type,
+        user_email=ONEDRIVE_RECORDINGS_USER,
+    )
+    info = {
+        "filename": uploaded.get("name") or filename,
+        "onedrive_id": uploaded.get("id"),
+        "web_url": uploaded.get("webUrl"),
+        "size": uploaded.get("size") or len(payload),
+        "content_type": content_type,
+        "uploaded_at": datetime.utcnow().isoformat() + "Z",
+        "onedrive_user": ONEDRIVE_RECORDINGS_USER,
+        "upload_mode": "recovered",
+        "chunk_count": len(chunk_files),
+    }
+    database = RecruiterDatabase()
+    try:
+        database.execute(
+            """
+            UPDATE recruiter_applications
+            SET interview_report =
+                COALESCE(interview_report, '{}'::jsonb)
+                || jsonb_build_object('recording', %s::jsonb)
+            WHERE id = %s
+            """,
+            (json.dumps(info, default=str), application_id),
+        )
+    finally:
+        database.close()
+    shutil.rmtree(chunk_dir, ignore_errors=True)
+    log_json(
+        logging.INFO,
+        "interview_recording_recovered",
+        application_id=application_id,
+        filename=info["filename"],
+        size=info["size"],
+        web_url=info["web_url"],
+    )
+    return info
 
 
 class RecruiterDashboardHandler(BaseHTTPRequestHandler):
@@ -808,6 +976,17 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
                         self.api_interview_recording_complete(token, payload)
                     elif action == "speech":
                         self.api_interview_speech(token, payload)
+                    elif action == "client-log":
+                        # Audit instrumentation: the browser reporting a fault
+                        # it would otherwise keep to itself.
+                        log_json(
+                            logging.WARNING,
+                            "interview_client_event",
+                            token=token[:8],
+                            client_event=str(payload.get("event"))[:60],
+                            detail=payload.get("detail"),
+                        )
+                        self.send_json({"ok": True})
                     else:
                         self.api_interview_complete(token, payload)
                 except Exception as exc:
@@ -1687,18 +1866,26 @@ Conversation so far:
         return RECORDING_UPLOAD_DIR / f"application-{application_id}-{safe_token}"
 
     def save_recording_info(self, application_id: int, recording_info: dict):
+        """Attach the recording to the report without rewriting the rest of it.
+
+        This used to read the whole report, set one key and write it all back,
+        while the report generator replaced the same column wholesale. Whichever
+        landed second won: applications 49 and 184 have their recording on
+        OneDrive and no trace of it in the database, so nobody can find it from
+        the dashboard. Merging in the database means neither write can lose the
+        other.
+        """
         database = self.db()
         try:
-            application = self.application_by_id(application_id)
-            report = json_object(application.get("interview_report") if application else None)
-            report["recording"] = recording_info
             database.execute(
                 """
                 UPDATE recruiter_applications
-                SET interview_report = %s::jsonb
+                SET interview_report =
+                    COALESCE(interview_report, '{}'::jsonb)
+                    || jsonb_build_object('recording', %s::jsonb)
                 WHERE id = %s
                 """,
-                (json.dumps(report), application_id),
+                (json.dumps(recording_info, default=str), application_id),
             )
         finally:
             database.close()
@@ -1965,6 +2152,19 @@ Conversation so far:
             return
         if client_turn_id:
             session["last_client_turn_id"] = client_turn_id
+        telemetry = payload.get("turn_telemetry")
+        if isinstance(telemetry, dict):
+            # Audit instrumentation: why this turn ended, and the numbers behind
+            # it. Answer text is deliberately not logged, only its last few words
+            # so a truncation is recognisable.
+            log_json(
+                logging.INFO,
+                "interview_turn_telemetry",
+                application_id=application.get("id"),
+                answer_words=len(str(answer or "").split()),
+                **{k: v for k, v in telemetry.items() if k != "tail"},
+                tail=str(telemetry.get("tail") or "")[:120],
+            )
         decision = self.web_interview_turn_decision(application, session, answer)
         action = decision.get("action")
         # "wait" means the candidate asked for a moment or echoed the question
@@ -4418,6 +4618,7 @@ Conversation so far:
     }}
 
     function clearAutoAdvanceTimer() {{
+      stopRecognitionWatchdog();
       if (autoAdvanceTimer) {{
         window.clearTimeout(autoAdvanceTimer);
         autoAdvanceTimer = null;
@@ -4477,7 +4678,33 @@ Conversation so far:
         'also', 'my', 'our', 'their', 'his', 'her', 'its', 'about', 'into',
         'basically', 'suppose', 'means', 'plus', 'etc'
       ];
-      return incompleteEndings.some(ending => text.endsWith(ending));
+      // Whole words, not substrings. endsWith() matched 'is' inside "analysis",
+      // 'on' inside "reconciliation", 'or' inside "vendor" and 'a' inside
+      // "data", so an answer ending in the commonest words of the job was
+      // judged incomplete - and answerCanAutoSubmit() then refused to submit it
+      // at all, which is a turn that can never end.
+      const parts = text.split(/\\s+/).filter(Boolean);
+      if (!parts.length) return true;
+      const tails = [
+        parts.slice(-1).join(' '),
+        parts.slice(-2).join(' '),
+        parts.slice(-3).join(' '),
+      ];
+      return incompleteEndings.some(ending => tails.indexOf(ending) !== -1);
+    }}
+
+    // A request is never an incomplete answer, whatever word it ends on. The
+    // server decides what it was; the browser's job is to deliver it.
+    function answerLooksLikeRequest() {{
+      const text = answerEl.value.trim().toLowerCase();
+      if (!text) return false;
+      return /\\b(can|could|would|will)\\s+you\\b[^.?!]{{0,30}}\\brepeat\\b/.test(text)
+          || /\\bplease\\s+repeat\\b/.test(text)
+          || /\\brepeat\\s+(the|that|this|your)\\b/.test(text)
+          || /\\bsay\\s+(that|it)\\s+again\\b/.test(text)
+          || /\\b(one|a)\\s+(second|moment|minute)\\b/.test(text)
+          || /\\bgive\\s+me\\s+a\\s+(second|moment|minute)\\b/.test(text)
+          || /\\bcome\\s+again\\b/.test(text);
     }}
 
     function answerHasExplicitCompletion() {{
@@ -4495,12 +4722,63 @@ Conversation so far:
       if (words < 1) return false;
       if (interviewPhase === 'greeting') return true;
       if (answerHasExplicitCompletion()) return true;
+      if (answerLooksLikeRequest()) return true;
       // Short utterances are usually questions ("can you repeat?") or requests
       // for time, not incomplete answers. They must reach the server, which is
       // what decides whether something was an answer at all. The previous
       // 10-word floor made a natural repeat request impossible to deliver.
       if (answerLooksIncomplete()) return false;
       return true;
+    }}
+
+    // --- turn telemetry (audit instrumentation) --------------------------------
+    // The audit could show answers were still being truncated but not which of
+    // the turn-ending paths did it. This records the reason and the numbers
+    // behind it, and rides along on the next turn POST.
+    let recognitionRestartAttempts = 0;
+    const RECOGNITION_RESTART_LIMIT = 5;
+    let turnTelemetry = null;
+    function reportClient(event, detail) {{
+      // Fire and forget. Without this the browser half of a stall is invisible:
+      // the room stops submitting and the server simply never hears from it.
+      try {{
+        const body = JSON.stringify({{event: event, detail: detail || {{}}, at: Date.now()}});
+        if (navigator.sendBeacon) {{
+          navigator.sendBeacon(`/api/interview/${{token}}/client-log`, new Blob([body], {{type: 'application/json'}}));
+        }} else {{
+          fetch(`/api/interview/${{token}}/client-log`, {{
+            method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: body, keepalive: true
+          }});
+        }}
+      }} catch (err) {{}}
+    }}
+
+    function noteTurnEnd(reason) {{
+      // Wrapped: this is instrumentation and must never be able to stop a turn
+      // being submitted. An earlier version referenced lastTextActivity, which
+      // is a const inside currentSilenceMs and not in scope here, so every
+      // auto-submit threw before it reached stopListeningAndAdvance and the
+      // room simply stopped responding.
+      try {{
+        if (turnTelemetry && turnTelemetry.reason) return;   // first one wins
+        const now = Date.now();
+        const lastText = Math.max(lastTranscriptChangeAt || 0, lastFinalTranscriptAt || 0);
+        turnTelemetry = {{
+          reason: reason,
+          question_number: index + 1,
+          silence_ms: Math.round(currentSilenceMs()),
+          threshold_ms: answerSilenceThresholdMs(),
+          words: answerWordCount(),
+          looks_incomplete: answerLooksIncomplete(),
+          ms_since_last_text: lastText ? now - lastText : null,
+          ms_since_last_mic: lastMicActivityAt ? now - lastMicActivityAt : null,
+          ms_since_last_result: lastSpeechResultAt ? now - lastSpeechResultAt : null,
+          noise_floor: typeof noiseFloor === 'number' ? Math.round(noiseFloor * 10000) / 10000 : null,
+          tail: (answerEl.value || '').trim().split(/\\s+/).slice(-6).join(' '),
+        }};
+      }} catch (err) {{
+        turnTelemetry = {{reason: reason, telemetry_error: String(err).slice(0, 120)}};
+      }}
     }}
 
     function answerSilenceThresholdMs() {{
@@ -4522,9 +4800,58 @@ Conversation so far:
           // one does, or it simply reintroduces the cut-offs.
           currentSilenceMs() >= FINAL_TRANSCRIPT_GRACE_MS
         ) {{
+          noteTurnEnd('final_transcript_grace');
           stopListeningAndAdvance();
         }}
       }}, FINAL_TRANSCRIPT_GRACE_MS);
+    }}
+
+    // Chrome's recogniser can stop delivering results while audio is still
+    // arriving. Measured in a real session: no result for 7000ms while the
+    // microphone had sound 1087ms earlier. The turn then either gets cut off by
+    // the mic-veto ceiling or, if nothing was transcribed at all, can never be
+    // submitted, because answerCanAutoSubmit() requires at least one word.
+    const RECOGNITION_STALL_MS = 3500;
+    const RECOGNITION_CYCLE_LIMIT = 4;
+    let recognitionCycles = 0;
+    let recognitionWatchdog = null;
+    let intentionalRecognitionStop = false;
+
+    function startRecognitionWatchdog() {{
+      stopRecognitionWatchdog();
+      recognitionWatchdog = window.setInterval(() => {{
+        if (!isRecording || isSubmitting || interviewClosed) return;
+        const now = Date.now();
+        const sinceResult = now - (lastSpeechResultAt || now);
+        const sinceMic = now - (lastMicActivityAt || 0);
+        // Stalled means: nothing transcribed for a while, but the room is not
+        // silent. A genuinely quiet candidate is the auto-advance path's job.
+        if (sinceResult >= RECOGNITION_STALL_MS && sinceMic <= 2000) {{
+          if (recognitionCycles >= RECOGNITION_CYCLE_LIMIT) return;
+          recognitionCycles += 1;
+          reportClient('recognition_stalled', {{
+            ms_since_result: sinceResult,
+            ms_since_mic: sinceMic,
+            words: answerWordCount(),
+            cycle: recognitionCycles,
+            question_number: index + 1,
+          }});
+          // stop() makes onend fire, and onend restarts it while we are still
+          // recording. The transcript so far is kept in the answer box.
+          // It also fires onerror with 'aborted', which must not be read as a
+          // failure - doing so set isRecording false and killed the very turn
+          // this watchdog exists to rescue.
+          intentionalRecognitionStop = true;
+          try {{ recognition.stop(); }} catch (err) {{ intentionalRecognitionStop = false; }}
+        }}
+      }}, 1000);
+    }}
+
+    function stopRecognitionWatchdog() {{
+      if (recognitionWatchdog) {{
+        window.clearInterval(recognitionWatchdog);
+        recognitionWatchdog = null;
+      }}
     }}
 
     function scheduleAutoAdvance() {{
@@ -4539,6 +4866,7 @@ Conversation so far:
           silentFor >= threshold &&
           answerCanAutoSubmit()
         ) {{
+          noteTurnEnd(answerLooksIncomplete() ? 'silence_after_incomplete' : 'silence');
           stopListeningAndAdvance();
           return;
         }}
@@ -4791,6 +5119,18 @@ Conversation so far:
       }};
       interviewRecorder.onerror = () => setMessage('Screen recording had an issue. Please keep the interview tab open.', true);
       interviewRecorder.start(2000);
+      // A candidate who closes the tab mid-sentence never reaches the normal
+      // finish, so the chunks already uploaded would sit on the server unused.
+      // Ask for them to be assembled on the way out. requestData() flushes the
+      // current 2s slice first, so at most a moment is lost. The periodic sweep
+      // is the backstop if this never arrives.
+      if (!recordingExitHookAdded) {{
+        recordingExitHookAdded = true;
+        window.addEventListener('pagehide', finaliseRecordingOnExit);
+        document.addEventListener('visibilitychange', () => {{
+          if (document.visibilityState === 'hidden') finaliseRecordingOnExit();
+        }});
+      }}
       setMessage('Recording started with AI voice and microphone. Please keep sharing until the interview is complete.');
       return true;
     }}
@@ -4839,6 +5179,38 @@ Conversation so far:
         throw new Error(data.error || 'Could not save interview recording.');
       }}
       setMessage('Interview recording saved successfully.');
+    }}
+
+    let recordingExitHookAdded = false;
+    let recordingExitRequested = false;
+    function finaliseRecordingOnExit() {{
+      if (recordingExitRequested || interviewClosed) return;
+      recordingExitRequested = true;
+      try {{
+        if (interviewRecorder && interviewRecorder.state === 'recording') {{
+          interviewRecorder.requestData();   // flush the slice in progress
+          interviewRecorder.stop();
+        }}
+      }} catch (err) {{}}
+      try {{
+        const body = JSON.stringify({{
+          content_type: recordingMimeType || 'video/webm',
+          reason: 'tab_closed',
+        }});
+        if (navigator.sendBeacon) {{
+          navigator.sendBeacon(
+            `/api/interview/${{token}}/recording-complete`,
+            new Blob([body], {{type: 'application/json'}})
+          );
+        }} else {{
+          fetch(`/api/interview/${{token}}/recording-complete`, {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: body,
+            keepalive: true,
+          }});
+        }}
+      }} catch (err) {{}}
     }}
 
     function stopCameraMonitoring() {{
@@ -4981,12 +5353,23 @@ Conversation so far:
           setMessage('Listening. Please continue naturally.');
           return;
         }}
+        if (reason === 'aborted' && isRecording && !isSubmitting && !interviewClosed) {{
+          // Either the watchdog cycled it deliberately, or Chrome aborted on
+          // its own. Both are recoverable: onend restarts it while isRecording
+          // is still true. Treating this as fatal is what left the room saying
+          // "Listening. Please continue naturally." forever.
+          intentionalRecognitionStop = false;
+          setMessage('Listening. Please continue.');
+          return;
+        }}
+        reportClient('recognition_error', {{reason: reason, question_number: index + 1}});
         isRecording = false;
         listenBtn.textContent = 'Answer';
         nextBtn.disabled = false;
         setMessage(`Speech recognition issue: ${{reason}}. You can type the answer and continue.`, true);
       }};
       rec.onend = () => {{
+        intentionalRecognitionStop = false;
         if (isRecording && !isSubmitting && !interviewClosed) {{
           window.setTimeout(() => {{
             if (isRecording && !isSubmitting && !interviewClosed) {{
@@ -5060,6 +5443,7 @@ Conversation so far:
       answerEl.value = '';
       finalTranscript = '';
       speechStarted = false;
+      turnTelemetry = null;          // per turn, or every turn reports the first one
       clearAutoAdvanceTimer();
       nextBtn.disabled = true;
       listenBtn.disabled = false;
@@ -5091,14 +5475,42 @@ Conversation so far:
       lastFinalTranscriptAt = 0;
       aiStatus.textContent = 'Listening';
       setMessage('Listening. Please answer now.');
+      recognitionCycles = 0;
+      startRecognitionWatchdog();
       scheduleAutoAdvance();
       try {{
         recognition.start();
+        recognitionRestartAttempts = 0;
       }} catch (error) {{
+        // Chrome throws InvalidStateError when start() is called before a
+        // previous stop() has finished. Giving up here set isRecording false,
+        // and scheduleAutoAdvance then refused to submit or reschedule, so the
+        // candidate could talk indefinitely and the turn would never end.
+        reportClient('recognition_start_failed', {{
+          error: String(error && error.name || error).slice(0, 80),
+          attempt: recognitionRestartAttempts + 1,
+          question_number: index + 1,
+        }});
+        if (recognitionRestartAttempts < RECOGNITION_RESTART_LIMIT) {{
+          recognitionRestartAttempts += 1;
+          window.setTimeout(() => {{
+            if (!isRecording || isSubmitting || interviewClosed) return;
+            try {{
+              recognition.start();
+              recognitionRestartAttempts = 0;
+              setMessage('Listening. Please continue.');
+            }} catch (retryError) {{
+              reportClient('recognition_restart_failed', {{
+                error: String(retryError && retryError.name || retryError).slice(0, 80),
+              }});
+            }}
+          }}, 300);
+          return;
+        }}
         isRecording = false;
         listenBtn.textContent = 'Answer';
         nextBtn.disabled = false;
-        setMessage('Speech recognition is already active. Please continue speaking.', true);
+        setMessage('Speech recognition would not restart. Please type your answer and press Next.', true);
       }}
     }}
 
@@ -5168,6 +5580,7 @@ Conversation so far:
         beginListening();
         return;
       }}
+      if (!turnTelemetry) noteTurnEnd('manual_or_button');
       const answer = answerEl.value.trim();
       if (interviewPhase === 'greeting') {{
         transcript.push({{question: 'Opening audio check', answer, status: 'greeting'}});
@@ -5200,7 +5613,8 @@ Conversation so far:
         response = await fetch(`/api/interview/${{token}}/turn`, {{
           method: 'POST',
           headers: {{'Content-Type': 'application/json'}},
-          body: JSON.stringify({{answer, turn_id: turnId, camera_monitoring: cameraMonitoring}}),
+          body: JSON.stringify({{answer, turn_id: turnId, camera_monitoring: cameraMonitoring,
+                                 turn_telemetry: turnTelemetry}}),
           signal: turnAbort.signal
         }});
         data = await response.json();
@@ -6217,6 +6631,7 @@ code {
 
 def run(host: str, port: int):
     start_final_hr_round_monitor()
+    start_pending_recording_monitor()
     server = ThreadingHTTPServer((host, port), RecruiterDashboardHandler)
     print(f"Recruiter dashboard running at http://{host}:{port}")
     try:
@@ -6231,7 +6646,32 @@ def main():
     parser = argparse.ArgumentParser(description="Run the AI recruiter dashboard.")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--upload-pending-recordings",
+        action="store_true",
+        help="Assemble and upload interview recordings whose upload never completed, then exit",
+    )
+    parser.add_argument(
+        "--pending-recording-min-age",
+        type=int,
+        default=900,
+        help="Only touch chunk directories idle for this many seconds (default 900)",
+    )
     args = parser.parse_args()
+    if args.upload_pending_recordings:
+        pending = pending_recording_dirs()
+        if not pending:
+            print("No pending interview recordings.")
+            return
+        print(f"{len(pending)} pending recording(s) staged in {RECORDING_UPLOAD_DIR}:")
+        for directory in pending:
+            size = sum(f.stat().st_size for f in directory.glob("chunk-*.part"))
+            print(f"  {directory.name}  {size / 1e6:.1f} MB")
+        uploaded = upload_pending_recordings(min_age_seconds=args.pending_recording_min_age)
+        for info in uploaded:
+            print(f"uploaded application {info['application_id']}: {info['web_url']}")
+        print(f"{len(uploaded)} uploaded, {len(pending) - len(uploaded)} skipped or failed.")
+        return
     run(args.host, args.port)
 
 
