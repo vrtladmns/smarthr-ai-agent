@@ -84,7 +84,14 @@ MAX_INTERVIEW_QUESTIONS = int(os.getenv("RECRUITER_MAX_INTERVIEW_QUESTIONS", "6"
 FINAL_HR_CHECK_SECONDS = 300
 DASHBOARD_SESSION_COOKIE = "recruiter_dashboard_session"
 DASHBOARD_SESSION_SECONDS = 12 * 60 * 60
-RECORDING_UPLOAD_DIR = Path("/tmp/recruiter-interview-recordings")
+# Not /tmp: chunks live here between the browser uploading them and the
+# assembled file reaching OneDrive. An interview whose recording-complete never
+# fires leaves them behind, and /tmp is cleared on reboot, so the recording was
+# gone before anyone noticed. Five completed interviews on the server have no
+# recording for this reason.
+RECORDING_UPLOAD_DIR = Path(
+    os.getenv("RECRUITER_RECORDING_STAGING_DIR", "storage/interview-recordings")
+)
 DASHBOARD_TTS_CACHE_DIR = Path("/tmp/recruiter-dashboard-tts")
 
 
@@ -691,6 +698,128 @@ class DashboardDB:
 
     def execute(self, query: str, params: tuple = ()):
         self.db.execute(query, params)
+
+
+def pending_recording_dirs() -> list[Path]:
+    """Chunk directories left behind by an interview that never finalised."""
+    if not RECORDING_UPLOAD_DIR.exists():
+        return []
+    return [
+        directory
+        for directory in sorted(RECORDING_UPLOAD_DIR.iterdir())
+        if directory.is_dir() and any(directory.glob("chunk-*.part"))
+    ]
+
+
+def application_id_from_chunk_dir(directory: Path) -> int | None:
+    match = re.match(r"application-(\d+)-", directory.name)
+    return int(match.group(1)) if match else None
+
+
+def upload_pending_recordings(min_age_seconds: int = 900) -> list[dict]:
+    """Assemble and upload recordings whose interview never finished the job.
+
+    The browser calls recording-complete when the interview ends. If the tab is
+    closed, the network drops or that call fails, the chunks simply sit on disk
+    and the recording is lost - five completed interviews on the server have no
+    recording at all for this reason. This picks them up afterwards.
+
+    min_age_seconds keeps it away from an interview that is still running.
+    """
+    results = []
+    for directory in pending_recording_dirs():
+        application_id = application_id_from_chunk_dir(directory)
+        if not application_id:
+            continue
+        newest = max(f.stat().st_mtime for f in directory.glob("chunk-*.part"))
+        if time.time() - newest < min_age_seconds:
+            continue                     # still being written to
+        try:
+            info = finalise_recording_dir(application_id, directory)
+            results.append({"application_id": application_id, **info})
+        except Exception as exc:
+            log_json(
+                logging.WARNING,
+                "pending_recording_upload_failed",
+                application_id=application_id,
+                directory=directory.name,
+                error=str(exc)[:200],
+            )
+    return results
+
+
+def finalise_recording_dir(application_id: int, chunk_dir: Path) -> dict:
+    """Join the chunks, put the file on OneDrive, record where it went."""
+    chunk_files = sorted(chunk_dir.glob("chunk-*.part"))
+    if not chunk_files:
+        raise RuntimeError("no chunks to assemble")
+    meta = {}
+    meta_path = chunk_dir / "meta.json"
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    content_type = meta.get("content_type") or "video/webm"
+    extension = ".mp4" if "mp4" in str(content_type).lower() else ".webm"
+
+    database = RecruiterDatabase()
+    try:
+        database.init_schema()
+        application = database.application_with_requirement(application_id) or {}
+    finally:
+        database.close()
+
+    label = safe_onedrive_path_part(
+        application.get("full_name") or application.get("candidate_email") or "candidate"
+    )
+    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    filename = f"application-{application_id}-{label}-{timestamp}{extension}"
+    payload = b"".join(chunk_file.read_bytes() for chunk_file in chunk_files)
+
+    if len(payload) < MIN_INTERVIEW_RECORDING_BYTES:
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        raise RuntimeError(f"recording too short to save ({len(payload)} bytes)")
+
+    uploaded = MicrosoftGraphProvider(ONEDRIVE_RECORDINGS_USER).upload_onedrive_file(
+        payload,
+        filename,
+        folder=f"{ONEDRIVE_RECORDINGS_FOLDER}/Application {application_id}",
+        content_type=content_type,
+        user_email=ONEDRIVE_RECORDINGS_USER,
+    )
+    info = {
+        "filename": uploaded.get("name") or filename,
+        "onedrive_id": uploaded.get("id"),
+        "web_url": uploaded.get("webUrl"),
+        "size": uploaded.get("size") or len(payload),
+        "content_type": content_type,
+        "uploaded_at": datetime.utcnow().isoformat() + "Z",
+        "onedrive_user": ONEDRIVE_RECORDINGS_USER,
+        "upload_mode": "recovered",
+        "chunk_count": len(chunk_files),
+    }
+    database = RecruiterDatabase()
+    try:
+        database.execute(
+            """
+            UPDATE recruiter_applications
+            SET interview_report =
+                COALESCE(interview_report, '{}'::jsonb)
+                || jsonb_build_object('recording', %s::jsonb)
+            WHERE id = %s
+            """,
+            (json.dumps(info, default=str), application_id),
+        )
+    finally:
+        database.close()
+    shutil.rmtree(chunk_dir, ignore_errors=True)
+    log_json(
+        logging.INFO,
+        "interview_recording_recovered",
+        application_id=application_id,
+        filename=info["filename"],
+        size=info["size"],
+        web_url=info["web_url"],
+    )
+    return info
 
 
 class RecruiterDashboardHandler(BaseHTTPRequestHandler):
@@ -1698,18 +1827,26 @@ Conversation so far:
         return RECORDING_UPLOAD_DIR / f"application-{application_id}-{safe_token}"
 
     def save_recording_info(self, application_id: int, recording_info: dict):
+        """Attach the recording to the report without rewriting the rest of it.
+
+        This used to read the whole report, set one key and write it all back,
+        while the report generator replaced the same column wholesale. Whichever
+        landed second won: applications 49 and 184 have their recording on
+        OneDrive and no trace of it in the database, so nobody can find it from
+        the dashboard. Merging in the database means neither write can lose the
+        other.
+        """
         database = self.db()
         try:
-            application = self.application_by_id(application_id)
-            report = json_object(application.get("interview_report") if application else None)
-            report["recording"] = recording_info
             database.execute(
                 """
                 UPDATE recruiter_applications
-                SET interview_report = %s::jsonb
+                SET interview_report =
+                    COALESCE(interview_report, '{}'::jsonb)
+                    || jsonb_build_object('recording', %s::jsonb)
                 WHERE id = %s
                 """,
-                (json.dumps(report), application_id),
+                (json.dumps(recording_info, default=str), application_id),
             )
         finally:
             database.close()
@@ -6425,7 +6562,32 @@ def main():
     parser = argparse.ArgumentParser(description="Run the AI recruiter dashboard.")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--upload-pending-recordings",
+        action="store_true",
+        help="Assemble and upload interview recordings whose upload never completed, then exit",
+    )
+    parser.add_argument(
+        "--pending-recording-min-age",
+        type=int,
+        default=900,
+        help="Only touch chunk directories idle for this many seconds (default 900)",
+    )
     args = parser.parse_args()
+    if args.upload_pending_recordings:
+        pending = pending_recording_dirs()
+        if not pending:
+            print("No pending interview recordings.")
+            return
+        print(f"{len(pending)} pending recording(s) staged in {RECORDING_UPLOAD_DIR}:")
+        for directory in pending:
+            size = sum(f.stat().st_size for f in directory.glob("chunk-*.part"))
+            print(f"  {directory.name}  {size / 1e6:.1f} MB")
+        uploaded = upload_pending_recordings(min_age_seconds=args.pending_recording_min_age)
+        for info in uploaded:
+            print(f"uploaded application {info['application_id']}: {info['web_url']}")
+        print(f"{len(uploaded)} uploaded, {len(pending) - len(uploaded)} skipped or failed.")
+        return
     run(args.host, args.port)
 
 

@@ -505,3 +505,64 @@ def test_the_turn_model_is_built_to_fail_fast(server, application):
 
     assert captured.get("timeout") == rd.INTERVIEW_TURN_LLM_TIMEOUT
     assert captured.get("max_retries") == 0, "a waiting candidate must not sit through retries"
+
+
+# --- the recording must reach OneDrive and be findable afterwards -------------
+
+def test_the_recording_and_the_report_do_not_overwrite_each_other(application):
+    """Applications 49 and 184 have their recording on OneDrive and no trace of
+    it in the database. save_recording_info read the whole report, set one key
+    and wrote it back, while the report generator replaced the same column, so
+    whichever landed second won."""
+    app_id = application["id"]
+    db = ra.RecruiterDatabase()
+    try:
+        db.init_schema()
+        recording = {"filename": "application-x.webm", "web_url": "https://onedrive/x"}
+
+        for order in ("recording first", "report first"):
+            db.execute("UPDATE recruiter_applications SET interview_report='{}'::jsonb WHERE id=%s", (app_id,))
+            def save():
+                db.execute(
+                    """UPDATE recruiter_applications
+                          SET interview_report = COALESCE(interview_report,'{}'::jsonb)
+                              || jsonb_build_object('recording', %s::jsonb)
+                        WHERE id = %s""",
+                    (json.dumps(recording), app_id),
+                )
+            if order == "recording first":
+                save(); db.update_interview_report(app_id, {"overall_score": 55})
+            else:
+                db.update_interview_report(app_id, {"overall_score": 55}); save()
+            stored = db.one("SELECT interview_report FROM recruiter_applications WHERE id=%s",
+                            (app_id,))["interview_report"]
+            assert stored.get("recording"), f"{order}: recording lost"
+            assert stored.get("overall_score") == 55, f"{order}: report lost"
+    finally:
+        db.close()
+
+
+def test_recordings_are_not_staged_in_tmp():
+    """Chunks waiting to be assembled lived in /tmp, which is cleared on reboot.
+    Five completed interviews on the server have no recording at all."""
+    assert "/tmp" not in str(rd.RECORDING_UPLOAD_DIR), rd.RECORDING_UPLOAD_DIR
+
+
+def test_an_unfinished_upload_can_be_recovered():
+    """The browser calls recording-complete when the interview ends. If the tab
+    closes or that call fails, the chunks just sit there."""
+    assert callable(rd.upload_pending_recordings)
+    assert callable(rd.finalise_recording_dir)
+    assert rd.application_id_from_chunk_dir(Path("application-817-abc")) == 817
+    assert rd.application_id_from_chunk_dir(Path("nonsense")) is None
+
+
+def test_the_sweeper_leaves_a_running_interview_alone(tmp_path, monkeypatch):
+    """min_age_seconds must keep it away from chunks still being written."""
+    monkeypatch.setattr(rd, "RECORDING_UPLOAD_DIR", tmp_path)
+    live = tmp_path / "application-999-token"
+    live.mkdir()
+    (live / "chunk-0001.part").write_bytes(b"x" * 1024)
+    assert rd.pending_recording_dirs() == [live]
+    assert rd.upload_pending_recordings(min_age_seconds=3600) == [], "touched a live interview"
+    assert live.exists(), "a running interview's chunks must survive"

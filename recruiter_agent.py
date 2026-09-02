@@ -3702,7 +3702,14 @@ class RecruiterDatabase:
             """
             UPDATE recruiter_applications
             SET application_status = %s,
-                interview_report = %s::jsonb,
+                -- Keep whatever the recording upload already attached. This
+                -- column is written from two places and a plain assignment
+                -- silently dropped the other one's work.
+                interview_report = %s::jsonb || COALESCE(
+                    jsonb_build_object('recording', interview_report -> 'recording')
+                        - CASE WHEN interview_report -> 'recording' IS NULL THEN 'recording' ELSE '' END,
+                    '{}'::jsonb
+                ),
                 interview_completed_at = NOW()
             WHERE id = %s
             """,
