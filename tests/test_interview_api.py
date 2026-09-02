@@ -593,3 +593,57 @@ def test_the_exit_hook_only_fires_once():
     source = Path(__file__).resolve().parent.parent.joinpath("recruiter_dashboard.py").read_text()
     hook = source[source.index("function finaliseRecordingOnExit") :][:400]
     assert "recordingExitRequested" in hook
+
+
+def test_a_resumed_session_accepts_the_first_turn_again(server, application):
+    """The bug that made the server interview unusable. The browser's turn
+    counter restarts at 1 on every page load, but the session persisted the old
+    high-water mark, so the first real answer after a resume was judged a
+    duplicate. The server returned "ignored" and the page - which handled that
+    by returning without touching the message - sat on "Processing your
+    answer..." forever. Application 48 was stuck at last_client_turn_id 18.
+    """
+    token = application["token"]
+    start(server, token)
+
+    # what the database held for application 48: a high-water mark from a page
+    # load that is long gone.
+    session = dict(rd.WEB_INTERVIEW_SESSIONS[token])
+    session["last_client_turn_id"] = 18
+    db = ra.RecruiterDatabase()
+    try:
+        db.init_schema()
+        db.save_interview_session(application["id"], session)
+    finally:
+        db.close()
+    rd.WEB_INTERVIEW_SESSIONS.clear()
+
+    start(server, token)                       # the candidate opens the link again
+    resumed = rd.WEB_INTERVIEW_SESSIONS[token]
+    assert resumed.get("questions"), "precondition: the session must have resumed, not restarted"
+    source = Path(__file__).resolve().parent.parent.joinpath("recruiter_dashboard.py").read_text()
+    assert '"last_client_turn_id": 0,' in source, (
+        "the resume branch must reset the counter, not restore the stored one"
+    )
+    assert int(resumed.get("last_client_turn_id") or 0) == 0, (
+        "a resumed session must not carry the previous page's turn counter"
+    )
+    body = turn(server, token, "I reconcile every bank account at month end.", 1).json()
+    assert body["action"] != "ignored", "the first answer after a reload was discarded"
+
+
+def test_a_duplicate_within_one_page_load_is_still_ignored(server, application):
+    """The guard still has to do its job; it just must not outlive the page."""
+    token = application["token"]
+    start(server, token)
+    turn(server, token, "First answer about reconciliations.", 5)
+    again = turn(server, token, "First answer about reconciliations.", 5).json()
+    assert again["action"] == "ignored"
+
+
+def test_an_ignored_turn_leaves_the_room_usable():
+    source = Path(__file__).resolve().parent.parent.joinpath("recruiter_dashboard.py").read_text()
+    i = source.index("if (action === 'ignored')")
+    branch = source[i : i + 700]
+    assert "setMessage(" in branch, "must not leave 'Processing your answer...' on screen"
+    assert "beginListening()" in branch, "must start listening again"
