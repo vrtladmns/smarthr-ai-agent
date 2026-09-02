@@ -597,7 +597,7 @@ def interview_api_path(path: str) -> tuple[str, str] | None:
         and parts[0] == "api"
         and parts[1] == "interview"
         and re.fullmatch(r"[A-Za-z0-9_-]{20,200}", parts[2])
-        and parts[3] in {"start", "turn", "complete", "recording", "recording-chunk", "recording-complete", "speech"}
+        and parts[3] in {"start", "turn", "complete", "recording", "recording-chunk", "recording-complete", "speech", "client-log"}
     ):
         return parts[2], parts[3]
     return None
@@ -808,6 +808,17 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
                         self.api_interview_recording_complete(token, payload)
                     elif action == "speech":
                         self.api_interview_speech(token, payload)
+                    elif action == "client-log":
+                        # Audit instrumentation: the browser reporting a fault
+                        # it would otherwise keep to itself.
+                        log_json(
+                            logging.WARNING,
+                            "interview_client_event",
+                            token=token[:8],
+                            client_event=str(payload.get("event"))[:60],
+                            detail=payload.get("detail"),
+                        )
+                        self.send_json({"ok": True})
                     else:
                         self.api_interview_complete(token, payload)
                 except Exception as exc:
@@ -1965,6 +1976,19 @@ Conversation so far:
             return
         if client_turn_id:
             session["last_client_turn_id"] = client_turn_id
+        telemetry = payload.get("turn_telemetry")
+        if isinstance(telemetry, dict):
+            # Audit instrumentation: why this turn ended, and the numbers behind
+            # it. Answer text is deliberately not logged, only its last few words
+            # so a truncation is recognisable.
+            log_json(
+                logging.INFO,
+                "interview_turn_telemetry",
+                application_id=application.get("id"),
+                answer_words=len(str(answer or "").split()),
+                **{k: v for k, v in telemetry.items() if k != "tail"},
+                tail=str(telemetry.get("tail") or "")[:120],
+            )
         decision = self.web_interview_turn_decision(application, session, answer)
         action = decision.get("action")
         # "wait" means the candidate asked for a moment or echoed the question
@@ -4418,6 +4442,7 @@ Conversation so far:
     }}
 
     function clearAutoAdvanceTimer() {{
+      stopRecognitionWatchdog();
       if (autoAdvanceTimer) {{
         window.clearTimeout(autoAdvanceTimer);
         autoAdvanceTimer = null;
@@ -4477,7 +4502,33 @@ Conversation so far:
         'also', 'my', 'our', 'their', 'his', 'her', 'its', 'about', 'into',
         'basically', 'suppose', 'means', 'plus', 'etc'
       ];
-      return incompleteEndings.some(ending => text.endsWith(ending));
+      // Whole words, not substrings. endsWith() matched 'is' inside "analysis",
+      // 'on' inside "reconciliation", 'or' inside "vendor" and 'a' inside
+      // "data", so an answer ending in the commonest words of the job was
+      // judged incomplete - and answerCanAutoSubmit() then refused to submit it
+      // at all, which is a turn that can never end.
+      const parts = text.split(/\\s+/).filter(Boolean);
+      if (!parts.length) return true;
+      const tails = [
+        parts.slice(-1).join(' '),
+        parts.slice(-2).join(' '),
+        parts.slice(-3).join(' '),
+      ];
+      return incompleteEndings.some(ending => tails.indexOf(ending) !== -1);
+    }}
+
+    // A request is never an incomplete answer, whatever word it ends on. The
+    // server decides what it was; the browser's job is to deliver it.
+    function answerLooksLikeRequest() {{
+      const text = answerEl.value.trim().toLowerCase();
+      if (!text) return false;
+      return /\\b(can|could|would|will)\\s+you\\b[^.?!]{{0,30}}\\brepeat\\b/.test(text)
+          || /\\bplease\\s+repeat\\b/.test(text)
+          || /\\brepeat\\s+(the|that|this|your)\\b/.test(text)
+          || /\\bsay\\s+(that|it)\\s+again\\b/.test(text)
+          || /\\b(one|a)\\s+(second|moment|minute)\\b/.test(text)
+          || /\\bgive\\s+me\\s+a\\s+(second|moment|minute)\\b/.test(text)
+          || /\\bcome\\s+again\\b/.test(text);
     }}
 
     function answerHasExplicitCompletion() {{
@@ -4495,12 +4546,63 @@ Conversation so far:
       if (words < 1) return false;
       if (interviewPhase === 'greeting') return true;
       if (answerHasExplicitCompletion()) return true;
+      if (answerLooksLikeRequest()) return true;
       // Short utterances are usually questions ("can you repeat?") or requests
       // for time, not incomplete answers. They must reach the server, which is
       // what decides whether something was an answer at all. The previous
       // 10-word floor made a natural repeat request impossible to deliver.
       if (answerLooksIncomplete()) return false;
       return true;
+    }}
+
+    // --- turn telemetry (audit instrumentation) --------------------------------
+    // The audit could show answers were still being truncated but not which of
+    // the turn-ending paths did it. This records the reason and the numbers
+    // behind it, and rides along on the next turn POST.
+    let recognitionRestartAttempts = 0;
+    const RECOGNITION_RESTART_LIMIT = 5;
+    let turnTelemetry = null;
+    function reportClient(event, detail) {{
+      // Fire and forget. Without this the browser half of a stall is invisible:
+      // the room stops submitting and the server simply never hears from it.
+      try {{
+        const body = JSON.stringify({{event: event, detail: detail || {{}}, at: Date.now()}});
+        if (navigator.sendBeacon) {{
+          navigator.sendBeacon(`/api/interview/${{token}}/client-log`, new Blob([body], {{type: 'application/json'}}));
+        }} else {{
+          fetch(`/api/interview/${{token}}/client-log`, {{
+            method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: body, keepalive: true
+          }});
+        }}
+      }} catch (err) {{}}
+    }}
+
+    function noteTurnEnd(reason) {{
+      // Wrapped: this is instrumentation and must never be able to stop a turn
+      // being submitted. An earlier version referenced lastTextActivity, which
+      // is a const inside currentSilenceMs and not in scope here, so every
+      // auto-submit threw before it reached stopListeningAndAdvance and the
+      // room simply stopped responding.
+      try {{
+        if (turnTelemetry && turnTelemetry.reason) return;   // first one wins
+        const now = Date.now();
+        const lastText = Math.max(lastTranscriptChangeAt || 0, lastFinalTranscriptAt || 0);
+        turnTelemetry = {{
+          reason: reason,
+          question_number: index + 1,
+          silence_ms: Math.round(currentSilenceMs()),
+          threshold_ms: answerSilenceThresholdMs(),
+          words: answerWordCount(),
+          looks_incomplete: answerLooksIncomplete(),
+          ms_since_last_text: lastText ? now - lastText : null,
+          ms_since_last_mic: lastMicActivityAt ? now - lastMicActivityAt : null,
+          ms_since_last_result: lastSpeechResultAt ? now - lastSpeechResultAt : null,
+          noise_floor: typeof noiseFloor === 'number' ? Math.round(noiseFloor * 10000) / 10000 : null,
+          tail: (answerEl.value || '').trim().split(/\\s+/).slice(-6).join(' '),
+        }};
+      }} catch (err) {{
+        turnTelemetry = {{reason: reason, telemetry_error: String(err).slice(0, 120)}};
+      }}
     }}
 
     function answerSilenceThresholdMs() {{
@@ -4522,9 +4624,58 @@ Conversation so far:
           // one does, or it simply reintroduces the cut-offs.
           currentSilenceMs() >= FINAL_TRANSCRIPT_GRACE_MS
         ) {{
+          noteTurnEnd('final_transcript_grace');
           stopListeningAndAdvance();
         }}
       }}, FINAL_TRANSCRIPT_GRACE_MS);
+    }}
+
+    // Chrome's recogniser can stop delivering results while audio is still
+    // arriving. Measured in a real session: no result for 7000ms while the
+    // microphone had sound 1087ms earlier. The turn then either gets cut off by
+    // the mic-veto ceiling or, if nothing was transcribed at all, can never be
+    // submitted, because answerCanAutoSubmit() requires at least one word.
+    const RECOGNITION_STALL_MS = 3500;
+    const RECOGNITION_CYCLE_LIMIT = 4;
+    let recognitionCycles = 0;
+    let recognitionWatchdog = null;
+    let intentionalRecognitionStop = false;
+
+    function startRecognitionWatchdog() {{
+      stopRecognitionWatchdog();
+      recognitionWatchdog = window.setInterval(() => {{
+        if (!isRecording || isSubmitting || interviewClosed) return;
+        const now = Date.now();
+        const sinceResult = now - (lastSpeechResultAt || now);
+        const sinceMic = now - (lastMicActivityAt || 0);
+        // Stalled means: nothing transcribed for a while, but the room is not
+        // silent. A genuinely quiet candidate is the auto-advance path's job.
+        if (sinceResult >= RECOGNITION_STALL_MS && sinceMic <= 2000) {{
+          if (recognitionCycles >= RECOGNITION_CYCLE_LIMIT) return;
+          recognitionCycles += 1;
+          reportClient('recognition_stalled', {{
+            ms_since_result: sinceResult,
+            ms_since_mic: sinceMic,
+            words: answerWordCount(),
+            cycle: recognitionCycles,
+            question_number: index + 1,
+          }});
+          // stop() makes onend fire, and onend restarts it while we are still
+          // recording. The transcript so far is kept in the answer box.
+          // It also fires onerror with 'aborted', which must not be read as a
+          // failure - doing so set isRecording false and killed the very turn
+          // this watchdog exists to rescue.
+          intentionalRecognitionStop = true;
+          try {{ recognition.stop(); }} catch (err) {{ intentionalRecognitionStop = false; }}
+        }}
+      }}, 1000);
+    }}
+
+    function stopRecognitionWatchdog() {{
+      if (recognitionWatchdog) {{
+        window.clearInterval(recognitionWatchdog);
+        recognitionWatchdog = null;
+      }}
     }}
 
     function scheduleAutoAdvance() {{
@@ -4539,6 +4690,7 @@ Conversation so far:
           silentFor >= threshold &&
           answerCanAutoSubmit()
         ) {{
+          noteTurnEnd(answerLooksIncomplete() ? 'silence_after_incomplete' : 'silence');
           stopListeningAndAdvance();
           return;
         }}
@@ -4981,12 +5133,23 @@ Conversation so far:
           setMessage('Listening. Please continue naturally.');
           return;
         }}
+        if (reason === 'aborted' && isRecording && !isSubmitting && !interviewClosed) {{
+          // Either the watchdog cycled it deliberately, or Chrome aborted on
+          // its own. Both are recoverable: onend restarts it while isRecording
+          // is still true. Treating this as fatal is what left the room saying
+          // "Listening. Please continue naturally." forever.
+          intentionalRecognitionStop = false;
+          setMessage('Listening. Please continue.');
+          return;
+        }}
+        reportClient('recognition_error', {{reason: reason, question_number: index + 1}});
         isRecording = false;
         listenBtn.textContent = 'Answer';
         nextBtn.disabled = false;
         setMessage(`Speech recognition issue: ${{reason}}. You can type the answer and continue.`, true);
       }};
       rec.onend = () => {{
+        intentionalRecognitionStop = false;
         if (isRecording && !isSubmitting && !interviewClosed) {{
           window.setTimeout(() => {{
             if (isRecording && !isSubmitting && !interviewClosed) {{
@@ -5060,6 +5223,7 @@ Conversation so far:
       answerEl.value = '';
       finalTranscript = '';
       speechStarted = false;
+      turnTelemetry = null;          // per turn, or every turn reports the first one
       clearAutoAdvanceTimer();
       nextBtn.disabled = true;
       listenBtn.disabled = false;
@@ -5091,14 +5255,42 @@ Conversation so far:
       lastFinalTranscriptAt = 0;
       aiStatus.textContent = 'Listening';
       setMessage('Listening. Please answer now.');
+      recognitionCycles = 0;
+      startRecognitionWatchdog();
       scheduleAutoAdvance();
       try {{
         recognition.start();
+        recognitionRestartAttempts = 0;
       }} catch (error) {{
+        // Chrome throws InvalidStateError when start() is called before a
+        // previous stop() has finished. Giving up here set isRecording false,
+        // and scheduleAutoAdvance then refused to submit or reschedule, so the
+        // candidate could talk indefinitely and the turn would never end.
+        reportClient('recognition_start_failed', {{
+          error: String(error && error.name || error).slice(0, 80),
+          attempt: recognitionRestartAttempts + 1,
+          question_number: index + 1,
+        }});
+        if (recognitionRestartAttempts < RECOGNITION_RESTART_LIMIT) {{
+          recognitionRestartAttempts += 1;
+          window.setTimeout(() => {{
+            if (!isRecording || isSubmitting || interviewClosed) return;
+            try {{
+              recognition.start();
+              recognitionRestartAttempts = 0;
+              setMessage('Listening. Please continue.');
+            }} catch (retryError) {{
+              reportClient('recognition_restart_failed', {{
+                error: String(retryError && retryError.name || retryError).slice(0, 80),
+              }});
+            }}
+          }}, 300);
+          return;
+        }}
         isRecording = false;
         listenBtn.textContent = 'Answer';
         nextBtn.disabled = false;
-        setMessage('Speech recognition is already active. Please continue speaking.', true);
+        setMessage('Speech recognition would not restart. Please type your answer and press Next.', true);
       }}
     }}
 
@@ -5168,6 +5360,7 @@ Conversation so far:
         beginListening();
         return;
       }}
+      if (!turnTelemetry) noteTurnEnd('manual_or_button');
       const answer = answerEl.value.trim();
       if (interviewPhase === 'greeting') {{
         transcript.push({{question: 'Opening audio check', answer, status: 'greeting'}});
@@ -5200,7 +5393,8 @@ Conversation so far:
         response = await fetch(`/api/interview/${{token}}/turn`, {{
           method: 'POST',
           headers: {{'Content-Type': 'application/json'}},
-          body: JSON.stringify({{answer, turn_id: turnId, camera_monitoring: cameraMonitoring}}),
+          body: JSON.stringify({{answer, turn_id: turnId, camera_monitoring: cameraMonitoring,
+                                 turn_telemetry: turnTelemetry}}),
           signal: turnAbort.signal
         }});
         data = await response.json();
