@@ -119,6 +119,45 @@ def start_final_hr_round_monitor():
     Thread(target=run, daemon=True).start()
 
 
+PENDING_RECORDING_SWEEP_SECONDS = int(
+    os.getenv("RECRUITER_RECORDING_SWEEP_SECONDS", "600")
+)
+PENDING_RECORDING_MIN_AGE_SECONDS = int(
+    os.getenv("RECRUITER_RECORDING_MIN_AGE_SECONDS", "600")
+)
+
+
+def start_pending_recording_monitor():
+    """Upload recordings the browser never finished sending.
+
+    A candidate who closes the tab mid-sentence stops the browser calling
+    recording-complete, and the chunks then sit on disk forever. Recovering them
+    by hand needs somebody to remember, which is not a plan, so this does it on
+    a timer. The age floor keeps it away from an interview still in progress.
+    """
+
+    def run():
+        while True:
+            time.sleep(PENDING_RECORDING_SWEEP_SECONDS)
+            try:
+                if not ONEDRIVE_RECORDINGS_ENABLED:
+                    continue
+                uploaded = upload_pending_recordings(
+                    min_age_seconds=PENDING_RECORDING_MIN_AGE_SECONDS
+                )
+                if uploaded:
+                    log_json(
+                        logging.INFO,
+                        "pending_recordings_swept",
+                        count=len(uploaded),
+                        application_ids=[item["application_id"] for item in uploaded],
+                    )
+            except Exception as exc:
+                LOGGER.exception("Pending recording sweep failed: %s", exc)
+
+    Thread(target=run, daemon=True).start()
+
+
 def normalize_camera_monitoring(value, fallback=None) -> dict:
     source = value if isinstance(value, dict) else fallback if isinstance(fallback, dict) else {}
     unusual = source.get("unusual_activity") or []
@@ -5080,6 +5119,18 @@ Conversation so far:
       }};
       interviewRecorder.onerror = () => setMessage('Screen recording had an issue. Please keep the interview tab open.', true);
       interviewRecorder.start(2000);
+      // A candidate who closes the tab mid-sentence never reaches the normal
+      // finish, so the chunks already uploaded would sit on the server unused.
+      // Ask for them to be assembled on the way out. requestData() flushes the
+      // current 2s slice first, so at most a moment is lost. The periodic sweep
+      // is the backstop if this never arrives.
+      if (!recordingExitHookAdded) {{
+        recordingExitHookAdded = true;
+        window.addEventListener('pagehide', finaliseRecordingOnExit);
+        document.addEventListener('visibilitychange', () => {{
+          if (document.visibilityState === 'hidden') finaliseRecordingOnExit();
+        }});
+      }}
       setMessage('Recording started with AI voice and microphone. Please keep sharing until the interview is complete.');
       return true;
     }}
@@ -5128,6 +5179,38 @@ Conversation so far:
         throw new Error(data.error || 'Could not save interview recording.');
       }}
       setMessage('Interview recording saved successfully.');
+    }}
+
+    let recordingExitHookAdded = false;
+    let recordingExitRequested = false;
+    function finaliseRecordingOnExit() {{
+      if (recordingExitRequested || interviewClosed) return;
+      recordingExitRequested = true;
+      try {{
+        if (interviewRecorder && interviewRecorder.state === 'recording') {{
+          interviewRecorder.requestData();   // flush the slice in progress
+          interviewRecorder.stop();
+        }}
+      }} catch (err) {{}}
+      try {{
+        const body = JSON.stringify({{
+          content_type: recordingMimeType || 'video/webm',
+          reason: 'tab_closed',
+        }});
+        if (navigator.sendBeacon) {{
+          navigator.sendBeacon(
+            `/api/interview/${{token}}/recording-complete`,
+            new Blob([body], {{type: 'application/json'}})
+          );
+        }} else {{
+          fetch(`/api/interview/${{token}}/recording-complete`, {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: body,
+            keepalive: true,
+          }});
+        }}
+      }} catch (err) {{}}
     }}
 
     function stopCameraMonitoring() {{
@@ -6548,6 +6631,7 @@ code {
 
 def run(host: str, port: int):
     start_final_hr_round_monitor()
+    start_pending_recording_monitor()
     server = ThreadingHTTPServer((host, port), RecruiterDashboardHandler)
     print(f"Recruiter dashboard running at http://{host}:{port}")
     try:

@@ -566,3 +566,30 @@ def test_the_sweeper_leaves_a_running_interview_alone(tmp_path, monkeypatch):
     assert rd.pending_recording_dirs() == [live]
     assert rd.upload_pending_recordings(min_age_seconds=3600) == [], "touched a live interview"
     assert live.exists(), "a running interview's chunks must survive"
+
+
+def test_an_abandoned_interview_is_swept_up_automatically(monkeypatch, tmp_path):
+    """A candidate who closes the tab mid-sentence never triggers
+    recording-complete. Recovering that by hand needs somebody to remember."""
+    assert callable(rd.start_pending_recording_monitor)
+    assert rd.PENDING_RECORDING_SWEEP_SECONDS > 0
+    assert rd.PENDING_RECORDING_MIN_AGE_SECONDS >= 60, "must not race a live interview"
+    source = Path(__file__).resolve().parent.parent.joinpath("recruiter_dashboard.py").read_text()
+    assert "start_pending_recording_monitor()" in source.split("def run(host: str, port: int):")[1][:300]
+
+
+def test_the_page_finalises_the_recording_on_the_way_out():
+    source = Path(__file__).resolve().parent.parent.joinpath("recruiter_dashboard.py").read_text()
+    assert "finaliseRecordingOnExit" in source
+    assert "'pagehide'" in source
+    assert "visibilitychange" in source
+    hook = source[source.index("function finaliseRecordingOnExit") :][:900]
+    assert "requestData()" in hook, "flush the slice in progress before stopping"
+    assert "recording-complete" in hook
+    assert "sendBeacon" in hook, "a closing tab will not wait for fetch"
+
+
+def test_the_exit_hook_only_fires_once():
+    source = Path(__file__).resolve().parent.parent.joinpath("recruiter_dashboard.py").read_text()
+    hook = source[source.index("function finaliseRecordingOnExit") :][:400]
+    assert "recordingExitRequested" in hook
