@@ -2180,6 +2180,23 @@ Conversation so far:
             return
         if client_turn_id:
             session["last_client_turn_id"] = client_turn_id
+        # Recorded before any work happens. A turn that hangs never reaches its
+        # own completion log, so without this a stall on the server leaves no
+        # trace whatsoever - which is exactly what happened: "Processing your
+        # answer..." forever and nothing in the database to say the request had
+        # even arrived.
+        turn_started_at = time.monotonic()
+        self.record_interview_client_event(
+            token,
+            {
+                "event": "turn_received",
+                "detail": {
+                    "client_turn_id": client_turn_id,
+                    "question_number": int(session.get("current_index") or 0) + 1,
+                    "answer_words": len(str(answer or "").split()),
+                },
+            },
+        )
         telemetry = payload.get("turn_telemetry")
         if not str(answer or "").strip():
             # The turn that keeps happening on the server: 18 turn ids and two
@@ -2211,6 +2228,20 @@ Conversation so far:
             )
         decision = self.web_interview_turn_decision(application, session, answer)
         action = decision.get("action")
+        elapsed_ms = round((time.monotonic() - turn_started_at) * 1000)
+        if elapsed_ms > 8000:
+            # A slow turn is the thing the candidate experiences as a stall.
+            self.record_interview_client_event(
+                token,
+                {"event": "turn_slow", "detail": {"elapsed_ms": elapsed_ms, "action": action}},
+            )
+        log_json(
+            logging.INFO,
+            "interview_turn_decided",
+            application_id=application.get("id"),
+            action=action,
+            elapsed_ms=elapsed_ms,
+        )
         # "wait" means the candidate asked for a moment or echoed the question
         # back. Neither is an answer, so nothing is recorded and the question
         # stays open - this is the failure that cost application 91 a question.
