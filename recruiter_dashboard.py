@@ -977,15 +977,11 @@ class RecruiterDashboardHandler(BaseHTTPRequestHandler):
                     elif action == "speech":
                         self.api_interview_speech(token, payload)
                     elif action == "client-log":
-                        # Audit instrumentation: the browser reporting a fault
-                        # it would otherwise keep to itself.
-                        log_json(
-                            logging.WARNING,
-                            "interview_client_event",
-                            token=token[:8],
-                            client_event=str(payload.get("event"))[:60],
-                            detail=payload.get("detail"),
-                        )
+                        # The browser reporting a fault it would otherwise keep
+                        # to itself. Written to the database as well as the log,
+                        # because when this matters the log is on a machine
+                        # nobody is reading.
+                        self.record_interview_client_event(token, payload)
                         self.send_json({"ok": True})
                     else:
                         self.api_interview_complete(token, payload)
@@ -1865,6 +1861,38 @@ Conversation so far:
         safe_token = re.sub(r"[^A-Za-z0-9_-]+", "_", token)[:80]
         return RECORDING_UPLOAD_DIR / f"application-{application_id}-{safe_token}"
 
+    def record_interview_client_event(self, token: str, payload: dict):
+        event = str(payload.get("event") or "")[:60]
+        detail = payload.get("detail") if isinstance(payload.get("detail"), dict) else {}
+        log_json(logging.WARNING, "interview_client_event", token=token[:8],
+                 client_event=event, detail=detail)
+        application = self.application_for_interview_token(token)
+        if not application:
+            return
+        database = self.db()
+        try:
+            database.execute(
+                """
+                INSERT INTO recruiter_email_events
+                    (email_message_id, source_email, email_subject, event_type, details)
+                VALUES (%s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    f"interview-client-{application['id']}-{int(time.time() * 1000)}",
+                    application.get("candidate_email") or application.get("source_email") or "interview",
+                    f"Interview client event on application {application['id']}",
+                    "interview_client_event",
+                    json.dumps(
+                        {"application_id": application["id"], "event": event, "detail": detail},
+                        default=str,
+                    ),
+                ),
+            )
+        except Exception as exc:
+            LOGGER.warning("Could not record interview client event: %s", exc)
+        finally:
+            database.close()
+
     def save_recording_info(self, application_id: int, recording_info: dict):
         """Attach the recording to the report without rewriting the rest of it.
 
@@ -2153,6 +2181,22 @@ Conversation so far:
         if client_turn_id:
             session["last_client_turn_id"] = client_turn_id
         telemetry = payload.get("turn_telemetry")
+        if not str(answer or "").strip():
+            # The turn that keeps happening on the server: 18 turn ids and two
+            # recorded answers, because nothing was transcribed and the server
+            # kept replying "I could not hear that clearly". Recorded where it
+            # can actually be read.
+            self.record_interview_client_event(
+                token,
+                {
+                    "event": "empty_answer_submitted",
+                    "detail": {
+                        "question_number": int(session.get("current_index") or 0) + 1,
+                        "client_turn_id": client_turn_id,
+                        "telemetry": telemetry if isinstance(telemetry, dict) else None,
+                    },
+                },
+            )
         if isinstance(telemetry, dict):
             # Audit instrumentation: why this turn ended, and the numbers behind
             # it. Answer text is deliberately not logged, only its last few words
